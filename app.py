@@ -104,3 +104,61 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 if __name__ == "__main__":
+@app.route("/privacy", methods=["GET"])
+def privacy_policy():
+    return """
+    <html>
+    <head><title>IBROWS AI Business Assistant - Privacy Policy</title></head>
+    <body>
+        <h1>Privacy Policy</h1>
+        <p><strong>IBROWS AI Business Assistant</strong></p>
+
+        <p>IBROWS Enterprise uses this WhatsApp Business service to
+        communicate with customers, respond to enquiries, and provide
+        information about our services.</p>
+
+        <p>When you communicate with us through WhatsApp, we may process
+        information you provide voluntarily, including your WhatsApp phone
+        number, profile information made available by WhatsApp, and the
+        contents of messages you send to us.</p>
+
+        <p>This information is used to respond to customer enquiries,
+        provide requested services, improve customer support, and operate
+        the IBROWS AI Business Assistant.</p>
+
+        <p>Some responses may be generated or assisted by artificial
+        intelligence. Customers should not send passwords, banking PINs,
+        or other highly sensitive information through the assistant.</p>
+
+        <p>We do not sell customer personal information.</p>
+
+        <p>Customers may request access to or deletion of information
+        associated with their interactions with IBROWS Enterprise by
+        contacting us at ibrowsenterprise@gmail.com.</p>
+
+        <p>Last updated: 20 September 2026.</p>
+    </body>
+    </html>
+    """, 200
+
+
+@app.route("/data-deletion", methods=["GET"])
+def data_deletion():
+    return """
+    <html>
+    <head><title>IBROWS - Data Deletion</title></head>
+    <body>
+        <h1>User Data Deletion</h1>
+
+        <p>You may request deletion of personal information associated
+        with your interactions with the IBROWS AI Business Assistant.</p>
+
+        <p>Send your request to <strong>ibrowsenterprise@gmail.com</strong>
+        and state that you are requesting deletion of your IBROWS
+        WhatsApp Assistant data.</p>
+
+        <p>We may ask for reasonable information necessary to identify
+        the relevant records before completing the request.</p>
+    </body>
+    </html>
+    """, 200
