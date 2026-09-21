@@ -1,6 +1,10 @@
 import os
 import json
 import secrets
+import time
+import threading
+from datetime import timedelta
+
 import requests
 import psycopg
 
@@ -45,7 +49,16 @@ app.config.update(
     SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=30),
 )
+
+# Admin login throttling is intentionally lightweight and in-memory.
+# It protects this single-worker Render service without storing passwords or attempts in the database.
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_LOCKOUT_SECONDS = 15 * 60
+_login_attempts = {}
+_login_attempts_lock = threading.Lock()
 
 client = OpenAI(
     api_key=OPENAI_API_KEY,
@@ -519,15 +532,75 @@ def health():
 # ADMIN AUTHENTICATION
 # =========================================================
 
+def _login_client_key():
+    # request.remote_addr is intentionally used instead of trusting a user-supplied
+    # forwarding header. On this small single-worker service it provides a safe,
+    # conservative throttle key.
+    return request.remote_addr or "unknown"
+
+
+def _login_is_locked(client_key):
+    now = time.monotonic()
+    with _login_attempts_lock:
+        record = _login_attempts.get(client_key)
+        if not record:
+            return False
+        attempts = [t for t in record.get("attempts", []) if now - t <= LOGIN_WINDOW_SECONDS]
+        locked_until = record.get("locked_until", 0)
+        if locked_until and now < locked_until:
+            record["attempts"] = attempts
+            return True
+        if locked_until and now >= locked_until:
+            _login_attempts.pop(client_key, None)
+            return False
+        record["attempts"] = attempts
+        if not attempts:
+            _login_attempts.pop(client_key, None)
+        return False
+
+
+def _record_failed_login(client_key):
+    now = time.monotonic()
+    with _login_attempts_lock:
+        record = _login_attempts.setdefault(client_key, {"attempts": [], "locked_until": 0})
+        record["attempts"] = [t for t in record["attempts"] if now - t <= LOGIN_WINDOW_SECONDS]
+        record["attempts"].append(now)
+        if len(record["attempts"]) >= LOGIN_MAX_ATTEMPTS:
+            record["locked_until"] = now + LOGIN_LOCKOUT_SECONDS
+
+
+def _clear_failed_logins(client_key):
+    with _login_attempts_lock:
+        _login_attempts.pop(client_key, None)
+
+
 def admin_required(function):
     @wraps(function)
     def wrapper(*args, **kwargs):
         if not session.get("admin_authenticated"):
             return redirect(url_for("admin_login"))
 
+        session.permanent = True
         return function(*args, **kwargs)
 
     return wrapper
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+    )
+    if request.path.startswith("/admin"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 
 def get_csrf_token():
@@ -714,6 +787,15 @@ def admin_login():
 
         validate_csrf()
 
+        client_key = _login_client_key()
+        if _login_is_locked(client_key):
+            error = "Too many sign-in attempts. Please wait 15 minutes and try again."
+            return render_template_string(
+                LOGIN_TEMPLATE,
+                error=error,
+                csrf_token=get_csrf_token()
+            ), 429
+
         username = request.form.get("username", "")
         password = request.form.get("password", "")
 
@@ -734,12 +816,15 @@ def admin_login():
         )
 
         if username_ok and password_ok:
+            _clear_failed_logins(client_key)
             session.clear()
+            session.permanent = True
             session["admin_authenticated"] = True
             session["csrf_token"] = secrets.token_urlsafe(32)
 
             return redirect(url_for("admin_leads"))
 
+        _record_failed_login(client_key)
         error = "Incorrect username or password."
 
     return render_template_string(
