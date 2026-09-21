@@ -193,6 +193,48 @@ def claim_whatsapp_message(message_id, customer_number):
     return claimed
 
 
+def canonicalize_service(service):
+    """Normalize AI service labels so one enquiry updates the right open lead."""
+    value = " ".join(str(service or "General Enquiry").strip().lower().split())
+
+    aliases = {
+        "landscaping": "Landscaping",
+        "landscaping service": "Landscaping",
+        "landscaping services": "Landscaping",
+        "fumigation": "Fumigation",
+        "fumigation service": "Fumigation",
+        "fumigation services": "Fumigation",
+        "cleaning": "Cleaning Services",
+        "cleaning service": "Cleaning Services",
+        "cleaning services": "Cleaning Services",
+        "car wash": "Car Wash",
+        "carwash": "Car Wash",
+        "construction": "Construction",
+        "construction services": "Construction",
+        "agro": "Agro Services",
+        "agro services": "Agro Services",
+        "agriculture": "Agro Services",
+        "website": "Website Development",
+        "website development": "Website Development",
+        "web development": "Website Development",
+        "whatsapp ai assistant": "WhatsApp AI Assistant",
+        "ai business assistant": "WhatsApp AI Assistant",
+        "career assist": "Career Assist",
+        "scholarship search": "Scholarship Search",
+        "cv and cover letter": "CV & Cover Letter",
+        "cv & cover letter": "CV & Cover Letter",
+        "business services": "Business Services",
+        "business registration": "Business Registration",
+        "graphic design": "Graphic Design",
+        "branding": "Branding",
+        "social media": "Social Media Management",
+        "social media management": "Social Media Management",
+        "photo restoration": "Photo Restoration",
+    }
+
+    return aliases.get(value, str(service or "General Enquiry").strip() or "General Enquiry")
+
+
 def create_or_update_lead(
     customer_number,
     customer_name,
@@ -200,6 +242,8 @@ def create_or_update_lead(
     summary,
     handover_reason
 ):
+    service = canonicalize_service(service)
+
     with get_db() as conn:
         with conn.cursor() as cur:
 
@@ -244,8 +288,7 @@ def create_or_update_lead(
                 )
 
                 print(
-                    f"LEAD UPDATED: {lead_id} "
-                    f"for {customer_number}",
+                    f"LEAD UPDATED: {lead_id}",
                     flush=True
                 )
 
@@ -274,8 +317,7 @@ def create_or_update_lead(
                 lead_id = cur.fetchone()[0]
 
                 print(
-                    f"NEW LEAD CREATED: {lead_id} "
-                    f"for {customer_number}",
+                    f"NEW LEAD CREATED: {lead_id}",
                     flush=True
                 )
 
@@ -1286,11 +1328,7 @@ def receive_webhook():
                 .get("name", "")
             )
 
-        print(
-            f"Customer: {customer_name} "
-            f"({customer_number})",
-            flush=True
-        )
+        print("TEXT MESSAGE ACCEPTED", flush=True)
 
         result = generate_ai_reply(
             customer_number,
@@ -1299,18 +1337,14 @@ def receive_webhook():
 
         reply = result["reply"]
 
-        print(
-            f"AI reply: {reply}",
-            flush=True
-        )
+        print("AI REPLY GENERATED", flush=True)
 
         if result.get("lead_required"):
 
             try:
 
-                service = result.get(
-                    "service",
-                    "General Enquiry"
+                service = canonicalize_service(
+                    result.get("service", "General Enquiry")
                 )
                 summary = result.get(
                     "lead_summary",
@@ -1447,7 +1481,12 @@ asks a general question.
 When lead_required is true:
 
 service:
-Give the appropriate IBROWS service category.
+Use ONE stable IBROWS service category. Prefer these exact labels when applicable:
+Career Assist, Scholarship Search, CV & Cover Letter, Business Registration,
+Business Services, Website Development, WhatsApp AI Assistant, Graphic Design,
+Branding, Social Media Management, Photo Restoration, Cleaning Services, Car Wash,
+Fumigation, Landscaping, Construction, Agro Services, General Enquiry.
+Do not add words such as "services" to a label unless they are part of the exact label above.
 
 lead_summary:
 Summarize what the customer wants and important information
@@ -1877,12 +1916,14 @@ Return ONLY the required JSON object.
 
         raw_output = response.output_text.strip()
 
+        result = json.loads(raw_output)
+
         print(
-            f"AI structured output: {raw_output}",
+            "AI STRUCTURED OUTPUT OK: "
+            f"lead_required={bool(result.get('lead_required', False))}, "
+            f"service={canonicalize_service(result.get('service', ''))}",
             flush=True
         )
-
-        result = json.loads(raw_output)
 
         reply = str(
             result.get(
@@ -1981,10 +2022,6 @@ def send_whatsapp_message(recipient, message):
             flush=True
         )
 
-        print(
-            response.text,
-            flush=True
-        )
 
     except requests.RequestException as error:
 
