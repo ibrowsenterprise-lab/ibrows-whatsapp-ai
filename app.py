@@ -1,7 +1,6 @@
 import os
 import json
 import secrets
-import smtplib
 import requests
 import psycopg
 
@@ -15,7 +14,6 @@ from flask import (
     render_template_string,
     abort,
 )
-from email.message import EmailMessage
 from openai import OpenAI
 
 
@@ -35,9 +33,10 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY")
 
-SMTP_EMAIL = os.environ.get("SMTP_EMAIL")
-SMTP_APP_PASSWORD = os.environ.get("SMTP_APP_PASSWORD")
-NOTIFICATION_EMAIL = os.environ.get("NOTIFICATION_EMAIL")
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
+NOTIFICATION_EMAIL = os.environ.get("NOTIFICATION_EMAIL") or "ibrowsenterprise@gmail.com"
+BREVO_SENDER_EMAIL = os.environ.get("BREVO_SENDER_EMAIL") or "ibrowsenterprise@gmail.com"
+BREVO_SENDER_NAME = os.environ.get("BREVO_SENDER_NAME") or "IBROWS Enterprise"
 LEAD_DASHBOARD_URL = "https://ibrows-whatsapp-ai-1.onrender.com/admin/leads"
 
 app.secret_key = FLASK_SECRET_KEY
@@ -293,22 +292,16 @@ def send_new_lead_email(
     summary,
     handover_reason
 ):
-    if not SMTP_EMAIL or not SMTP_APP_PASSWORD or not NOTIFICATION_EMAIL:
+    if not BREVO_API_KEY or not NOTIFICATION_EMAIL or not BREVO_SENDER_EMAIL:
         print(
-            "Lead email skipped: SMTP settings are not fully configured.",
+            "Lead email skipped: Brevo API settings are not fully configured.",
             flush=True
         )
         return False
 
-    try:
-        message = EmailMessage()
-        message["Subject"] = f"New IBROWS Lead #{lead_id}: {service}"
-        message["From"] = SMTP_EMAIL
-        message["To"] = NOTIFICATION_EMAIL
-
-        display_name = customer_name or "Not provided"
-        message.set_content(
-            f"""A new qualified lead has been captured by the IBROWS AI Business Assistant.
+    display_name = customer_name or "Not provided"
+    subject = f"New IBROWS Lead #{lead_id}: {service}"
+    body = f"""A new qualified lead has been captured by the IBROWS AI Business Assistant.
 
 Lead ID: {lead_id}
 Customer: {display_name}
@@ -327,23 +320,47 @@ Lead dashboard:
 IBROWS Enterprise
 Kupanga zofanana, mosiyana
 """
+
+    payload = {
+        "sender": {
+            "name": BREVO_SENDER_NAME,
+            "email": BREVO_SENDER_EMAIL,
+        },
+        "to": [
+            {"email": NOTIFICATION_EMAIL}
+        ],
+        "subject": subject,
+        "textContent": body,
+    }
+
+    try:
+        response = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "accept": "application/json",
+                "api-key": BREVO_API_KEY,
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=8,
         )
 
-        with smtplib.SMTP_SSL(
-            "smtp.gmail.com",
-            465,
-            timeout=8
-        ) as smtp:
-            smtp.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
-            smtp.send_message(message)
+        if 200 <= response.status_code < 300:
+            print(
+                f"NEW LEAD EMAIL SENT: {lead_id}",
+                flush=True
+            )
+            return True
 
+        safe_error = response.text[:500]
         print(
-            f"NEW LEAD EMAIL SENT: {lead_id}",
+            f"Lead email error for lead {lead_id}: "
+            f"Brevo HTTP {response.status_code} - {safe_error}",
             flush=True
         )
-        return True
+        return False
 
-    except Exception as error:
+    except requests.RequestException as error:
         print(
             f"Lead email error for lead {lead_id}: {error}",
             flush=True
