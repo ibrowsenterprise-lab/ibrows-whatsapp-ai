@@ -1,5 +1,6 @@
 import os
 import requests
+from collections import defaultdict, deque
 from flask import Flask, request
 from openai import OpenAI
 
@@ -16,6 +17,18 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# =========================================================
+# CONVERSATION MEMORY
+# =========================================================
+
+# Keeps recent conversation separately for each WhatsApp number.
+# This is temporary in-memory storage for the testing stage.
+#
+# Each customer can have up to 12 stored messages
+# (6 customer messages + 6 assistant replies).
+conversation_memory = defaultdict(lambda: deque(maxlen=12))
 
 
 # =========================================================
@@ -73,8 +86,12 @@ def receive_webhook():
 
         print(f"Customer message: {customer_message}")
 
-        # Generate response using OpenAI.
-        reply = generate_ai_reply(customer_message)
+        # Generate an AI response using this customer's
+        # recent conversation history.
+        reply = generate_ai_reply(
+            customer_number,
+            customer_message
+        )
 
         print(f"AI reply: {reply}")
 
@@ -91,8 +108,22 @@ def receive_webhook():
 # OPENAI BUSINESS ASSISTANT
 # =========================================================
 
-def generate_ai_reply(customer_message):
+def generate_ai_reply(customer_number, customer_message):
     try:
+
+        # Add the latest customer message to this customer's memory.
+        conversation_memory[customer_number].append(
+            {
+                "role": "user",
+                "content": customer_message
+            }
+        )
+
+        # Send recent conversation history to OpenAI.
+        conversation = list(
+            conversation_memory[customer_number]
+        )
+
         response = client.responses.create(
             model="gpt-5.6-luna",
 
@@ -105,6 +136,27 @@ identify what they need, collect useful enquiry information,
 and guide them toward the correct next step.
 
 You are an AI assistant. Never pretend to be a human employee.
+
+
+============================================================
+CONVERSATION CONTEXT
+============================================================
+
+You may receive recent messages from the same customer's
+WhatsApp conversation.
+
+Use that conversation history to understand follow-up messages.
+
+For example, if a customer previously said they need a website
+and you asked what type of business they operate, a later reply
+such as "construction company" should be understood in the
+context of the website enquiry.
+
+Do not unnecessarily repeat questions the customer has already
+answered.
+
+Do not claim to remember information that is not actually
+included in the conversation supplied to you.
 
 
 ============================================================
@@ -660,16 +712,24 @@ Do not fabricate information.
 Respond directly to the customer's latest WhatsApp message.
 """,
 
-            input=customer_message
+            input=conversation
         )
 
         reply = response.output_text.strip()
 
         if not reply:
-            return (
+            reply = (
                 "Thank you for contacting IBROWS Enterprise. "
                 "Please tell me how we can assist you."
             )
+
+        # Store the AI response in this customer's conversation.
+        conversation_memory[customer_number].append(
+            {
+                "role": "assistant",
+                "content": reply
+            }
+        )
 
         return reply
 
