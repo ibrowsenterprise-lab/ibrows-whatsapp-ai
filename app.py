@@ -48,7 +48,11 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
 )
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=12.0,
+    max_retries=0,
+)
 
 
 # =========================================================
@@ -108,6 +112,16 @@ def init_database():
                 ON leads(customer_number, created_at DESC)
             """)
 
+            # Prevent Meta webhook retries from processing the same
+            # incoming WhatsApp message more than once.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS processed_whatsapp_messages (
+                    message_id TEXT PRIMARY KEY,
+                    customer_number TEXT,
+                    processed_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
         conn.commit()
 
     print("DATABASE READY", flush=True)
@@ -155,6 +169,31 @@ def get_recent_conversation(customer_number, limit=12):
     ]
 
 
+def claim_whatsapp_message(message_id, customer_number):
+    """Return True only for the first delivery of a WhatsApp message ID."""
+    if not message_id:
+        return True
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO processed_whatsapp_messages (
+                    message_id,
+                    customer_number
+                )
+                VALUES (%s, %s)
+                ON CONFLICT (message_id) DO NOTHING
+                RETURNING message_id
+                """,
+                (message_id, customer_number)
+            )
+            claimed = cur.fetchone() is not None
+        conn.commit()
+
+    return claimed
+
+
 def create_or_update_lead(
     customer_number,
     customer_name,
@@ -171,10 +210,11 @@ def create_or_update_lead(
                 FROM leads
                 WHERE customer_number = %s
                   AND status = 'NEW'
+                  AND LOWER(COALESCE(service, '')) = LOWER(%s)
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                (customer_number,)
+                (customer_number, service)
             )
 
             existing = cur.fetchone()
@@ -285,14 +325,14 @@ Lead dashboard:
 {LEAD_DASHBOARD_URL}
 
 IBROWS Enterprise
-Opportunity Without Borders.
+Kupanga zofanana, mosiyana
 """
         )
 
         with smtplib.SMTP_SSL(
             "smtp.gmail.com",
             465,
-            timeout=20
+            timeout=8
         ) as smtp:
             smtp.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
             smtp.send_message(message)
@@ -592,7 +632,7 @@ button {
 </form>
 
 <div class="footer">
-Opportunity Without Borders.
+Kupanga zofanana, mosiyana
 </div>
 
 </div>
@@ -878,7 +918,7 @@ h1 {
 
 <div>
 <div class="brand">IBROWS Lead Dashboard</div>
-<div class="tagline">Opportunity Without Borders.</div>
+<div class="tagline">Kupanga zofanana, mosiyana</div>
 </div>
 
 <form method="POST" action="{{ url_for('admin_logout') }}">
@@ -1191,8 +1231,7 @@ def receive_webhook():
 
     data = request.get_json(silent=True)
 
-    print("INCOMING WHATSAPP WEBHOOK:", flush=True)
-    print(data, flush=True)
+    print("INCOMING WHATSAPP WEBHOOK", flush=True)
 
     try:
 
@@ -1210,6 +1249,14 @@ def receive_webhook():
 
         customer_number = message["from"]
         customer_message = message["text"]["body"]
+        message_id = message.get("id", "")
+
+        if not claim_whatsapp_message(message_id, customer_number):
+            print(
+                f"DUPLICATE WHATSAPP MESSAGE IGNORED: {message_id}",
+                flush=True
+            )
+            return "EVENT_RECEIVED", 200
 
         customer_name = ""
 
@@ -1225,11 +1272,6 @@ def receive_webhook():
         print(
             f"Customer: {customer_name} "
             f"({customer_number})",
-            flush=True
-        )
-
-        print(
-            f"Customer message: {customer_message}",
             flush=True
         )
 
@@ -1453,11 +1495,20 @@ Please choose your preferred language:
 IBROWS ENTERPRISE
 ============================================================
 
-IBROWS Enterprise is a multi-service business operating
-in Malawi.
+IBROWS Enterprise is a multi-service business based in
+Lilongwe and serving clients countrywide across Malawi.
 
-Location:
+Base:
 Lilongwe, Malawi
+
+Service coverage:
+Countrywide across Malawi. Never assume a customer must be
+in Lilongwe. When location matters, ask for the customer's
+town, district, or project location. Continue assisting
+customers elsewhere in Malawi normally. For services where
+travel, logistics, or availability may affect the quotation,
+refer those details to the IBROWS team for confirmation and
+do not invent extra charges or restrictions.
 
 WhatsApp:
 +265 882 242 594
@@ -1466,7 +1517,7 @@ Email:
 ibrowsenterprise@gmail.com
 
 Business line:
-"Opportunity Without Borders."
+"Kupanga zofanana, mosiyana"
 
 
 ============================================================
@@ -1600,7 +1651,7 @@ Services include:
 Useful information may include:
 
 - Property type
-- General location
+- General location (town/district anywhere in Malawi)
 - Approximate size
 - Cleaning required
 - Preferred date
@@ -1636,7 +1687,7 @@ IBROWS provides fumigation services.
 Useful information may include:
 
 - Type of premises
-- General location
+- General location (town/district anywhere in Malawi)
 - Approximate size
 - Pest problem
 - Preferred date
@@ -1655,7 +1706,7 @@ IBROWS provides landscaping services.
 Useful information may include:
 
 - Property/site type
-- General location
+- General location (town/district anywhere in Malawi)
 - Approximate size
 - Work required
 - New landscaping or maintenance
@@ -1680,7 +1731,7 @@ IBROWS provides construction-related services including:
 Useful information may include:
 
 - Project type
-- General location
+- Project location (town/district anywhere in Malawi)
 - Current stage
 - Work required
 
@@ -1905,7 +1956,7 @@ def send_whatsapp_message(recipient, message):
             url,
             headers=headers,
             json=payload,
-            timeout=20,
+            timeout=8,
         )
 
         print(
