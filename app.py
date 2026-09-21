@@ -5,8 +5,6 @@ import smtplib
 import requests
 import psycopg
 
-from email.message import EmailMessage
-
 from functools import wraps
 from flask import (
     Flask,
@@ -17,6 +15,7 @@ from flask import (
     render_template_string,
     abort,
 )
+from email.message import EmailMessage
 from openai import OpenAI
 
 
@@ -243,7 +242,73 @@ def create_or_update_lead(
 
         conn.commit()
 
-    return lead_id
+    return lead_id, existing is None
+
+
+def send_new_lead_email(
+    lead_id,
+    customer_name,
+    customer_number,
+    service,
+    summary,
+    handover_reason
+):
+    if not SMTP_EMAIL or not SMTP_APP_PASSWORD or not NOTIFICATION_EMAIL:
+        print(
+            "Lead email skipped: SMTP settings are not fully configured.",
+            flush=True
+        )
+        return False
+
+    try:
+        message = EmailMessage()
+        message["Subject"] = f"New IBROWS Lead #{lead_id}: {service}"
+        message["From"] = SMTP_EMAIL
+        message["To"] = NOTIFICATION_EMAIL
+
+        display_name = customer_name or "Not provided"
+        message.set_content(
+            f"""A new qualified lead has been captured by the IBROWS AI Business Assistant.
+
+Lead ID: {lead_id}
+Customer: {display_name}
+WhatsApp: +{customer_number}
+Service: {service}
+
+Lead summary:
+{summary}
+
+Human follow-up reason:
+{handover_reason}
+
+Lead dashboard:
+{LEAD_DASHBOARD_URL}
+
+IBROWS Enterprise
+Opportunity Without Borders.
+"""
+        )
+
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com",
+            465,
+            timeout=20
+        ) as smtp:
+            smtp.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
+            smtp.send_message(message)
+
+        print(
+            f"NEW LEAD EMAIL SENT: {lead_id}",
+            flush=True
+        )
+        return True
+
+    except Exception as error:
+        print(
+            f"Lead email error for lead {lead_id}: {error}",
+            flush=True
+        )
+        return False
 
 
 def get_all_leads():
@@ -1188,12 +1253,10 @@ def receive_webhook():
                     "service",
                     "General Enquiry"
                 )
-
                 summary = result.get(
                     "lead_summary",
                     customer_message
                 )
-
                 handover_reason = result.get(
                     "handover_reason",
                     "Human assistance required"
@@ -1210,8 +1273,8 @@ def receive_webhook():
                 if is_new_lead:
                     send_new_lead_email(
                         lead_id=lead_id,
-                        customer_number=customer_number,
                         customer_name=customer_name,
+                        customer_number=customer_number,
                         service=service,
                         summary=summary,
                         handover_reason=handover_reason
