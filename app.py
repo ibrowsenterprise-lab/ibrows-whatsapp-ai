@@ -1,8 +1,19 @@
 import os
 import json
+import secrets
 import requests
 import psycopg
-from flask import Flask, request
+
+from functools import wraps
+from flask import (
+    Flask,
+    request,
+    session,
+    redirect,
+    url_for,
+    render_template_string,
+    abort,
+)
 from openai import OpenAI
 
 
@@ -17,6 +28,18 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY")
+
+app.secret_key = FLASK_SECRET_KEY
+
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -56,6 +79,7 @@ def init_database():
                 CREATE TABLE IF NOT EXISTS leads (
                     id BIGSERIAL PRIMARY KEY,
                     customer_number TEXT NOT NULL,
+                    customer_name TEXT,
                     service TEXT,
                     summary TEXT,
                     handover_reason TEXT,
@@ -63,6 +87,12 @@ def init_database():
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
+            """)
+
+            # Upgrade older leads table without deleting existing leads.
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS customer_name TEXT
             """)
 
             cur.execute("""
@@ -82,7 +112,7 @@ def save_message(customer_number, role, content):
             cur.execute(
                 """
                 INSERT INTO conversations
-                (customer_number, role, content)
+                    (customer_number, role, content)
                 VALUES (%s, %s, %s)
                 """,
                 (customer_number, role, content)
@@ -118,17 +148,13 @@ def get_recent_conversation(customer_number, limit=12):
     ]
 
 
-def create_lead(
+def create_or_update_lead(
     customer_number,
+    customer_name,
     service,
     summary,
     handover_reason
 ):
-    """
-    Avoid creating multiple NEW leads for the same customer
-    in a short period. If a NEW lead already exists, update it.
-    """
-
     with get_db() as conn:
         with conn.cursor() as cur:
 
@@ -152,13 +178,18 @@ def create_lead(
                 cur.execute(
                     """
                     UPDATE leads
-                    SET service = %s,
+                    SET customer_name = COALESCE(
+                            NULLIF(%s, ''),
+                            customer_name
+                        ),
+                        service = %s,
                         summary = %s,
                         handover_reason = %s,
                         updated_at = NOW()
                     WHERE id = %s
                     """,
                     (
+                        customer_name,
                         service,
                         summary,
                         handover_reason,
@@ -177,15 +208,17 @@ def create_lead(
                     """
                     INSERT INTO leads (
                         customer_number,
+                        customer_name,
                         service,
                         summary,
                         handover_reason
                     )
-                    VALUES (%s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
                         customer_number,
+                        customer_name,
                         service,
                         summary,
                         handover_reason
@@ -202,19 +235,91 @@ def create_lead(
 
         conn.commit()
 
+    return lead_id
+
+
+def get_all_leads():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    id,
+                    customer_number,
+                    customer_name,
+                    service,
+                    summary,
+                    handover_reason,
+                    status,
+                    created_at,
+                    updated_at
+                FROM leads
+                ORDER BY
+                    CASE status
+                        WHEN 'NEW' THEN 1
+                        WHEN 'CONTACTED' THEN 2
+                        WHEN 'CLOSED' THEN 3
+                        ELSE 4
+                    END,
+                    updated_at DESC
+            """)
+
+            return cur.fetchall()
+
+
+def get_lead_counts():
+    counts = {
+        "ALL": 0,
+        "NEW": 0,
+        "CONTACTED": 0,
+        "CLOSED": 0
+    }
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT status, COUNT(*)
+                FROM leads
+                GROUP BY status
+            """)
+
+            for status, count in cur.fetchall():
+                counts["ALL"] += count
+
+                if status in counts:
+                    counts[status] = count
+
+    return counts
+
+
+def update_lead_status(lead_id, status):
+    allowed = {"NEW", "CONTACTED", "CLOSED"}
+
+    if status not in allowed:
+        raise ValueError("Invalid lead status.")
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET status = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (status, lead_id)
+            )
+
+        conn.commit()
+
 
 # =========================================================
-# HOME PAGE
+# HOME / HEALTH
 # =========================================================
 
 @app.route("/", methods=["GET"])
 def home():
     return "IBROWS WhatsApp AI Business Assistant is running.", 200
 
-
-# =========================================================
-# HEALTH CHECK
-# =========================================================
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -239,11 +344,760 @@ def health():
 
 
 # =========================================================
+# ADMIN AUTHENTICATION
+# =========================================================
+
+def admin_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin_authenticated"):
+            return redirect(url_for("admin_login"))
+
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
+def get_csrf_token():
+    token = session.get("csrf_token")
+
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+
+    return token
+
+
+def validate_csrf():
+    supplied = request.form.get("csrf_token", "")
+    stored = session.get("csrf_token", "")
+
+    if (
+        not supplied
+        or not stored
+        or not secrets.compare_digest(supplied, stored)
+    ):
+        abort(403)
+
+
+# =========================================================
+# ADMIN LOGIN
+# =========================================================
+
+LOGIN_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
+
+<title>IBROWS Admin Login</title>
+
+<style>
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    background: #f4f6f8;
+    color: #17202a;
+}
+
+.wrapper {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+
+.card {
+    width: 100%;
+    max-width: 430px;
+    background: white;
+    border-radius: 18px;
+    padding: 34px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.10);
+}
+
+.brand {
+    font-size: 28px;
+    font-weight: 800;
+    margin-bottom: 4px;
+}
+
+.subtitle {
+    color: #667085;
+    margin-bottom: 28px;
+}
+
+label {
+    display: block;
+    font-weight: 700;
+    margin-top: 16px;
+    margin-bottom: 7px;
+}
+
+input {
+    width: 100%;
+    padding: 13px;
+    border: 1px solid #d0d5dd;
+    border-radius: 9px;
+    font-size: 16px;
+}
+
+button {
+    width: 100%;
+    margin-top: 22px;
+    padding: 13px;
+    border: 0;
+    border-radius: 9px;
+    background: #111827;
+    color: white;
+    font-size: 16px;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.error {
+    background: #fee4e2;
+    color: #b42318;
+    padding: 11px;
+    border-radius: 8px;
+    margin-bottom: 15px;
+}
+
+.footer {
+    text-align: center;
+    color: #98a2b3;
+    margin-top: 24px;
+    font-size: 13px;
+}
+</style>
+</head>
+
+<body>
+<div class="wrapper">
+<div class="card">
+
+<div class="brand">IBROWS</div>
+<div class="subtitle">AI Business Assistant — Administration</div>
+
+{% if error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+<form method="POST">
+
+<input
+    type="hidden"
+    name="csrf_token"
+    value="{{ csrf_token }}"
+>
+
+<label>Username</label>
+<input
+    name="username"
+    type="text"
+    autocomplete="username"
+    required
+>
+
+<label>Password</label>
+<input
+    name="password"
+    type="password"
+    autocomplete="current-password"
+    required
+>
+
+<button type="submit">Sign in</button>
+
+</form>
+
+<div class="footer">
+Opportunity Without Borders.
+</div>
+
+</div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+
+    if session.get("admin_authenticated"):
+        return redirect(url_for("admin_leads"))
+
+    error = None
+    csrf_token = get_csrf_token()
+
+    if request.method == "POST":
+
+        validate_csrf()
+
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+
+        username_ok = (
+            ADMIN_USERNAME
+            and secrets.compare_digest(
+                username,
+                ADMIN_USERNAME
+            )
+        )
+
+        password_ok = (
+            ADMIN_PASSWORD
+            and secrets.compare_digest(
+                password,
+                ADMIN_PASSWORD
+            )
+        )
+
+        if username_ok and password_ok:
+            session.clear()
+            session["admin_authenticated"] = True
+            session["csrf_token"] = secrets.token_urlsafe(32)
+
+            return redirect(url_for("admin_leads"))
+
+        error = "Incorrect username or password."
+
+    return render_template_string(
+        LOGIN_TEMPLATE,
+        error=error,
+        csrf_token=csrf_token
+    )
+
+
+@app.route("/admin/logout", methods=["POST"])
+@admin_required
+def admin_logout():
+    validate_csrf()
+    session.clear()
+
+    return redirect(url_for("admin_login"))
+
+
+# =========================================================
+# ADMIN LEAD DASHBOARD
+# =========================================================
+
+DASHBOARD_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+
+<head>
+<meta charset="utf-8">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1"
+>
+
+<title>IBROWS Lead Dashboard</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #f4f6f8;
+    font-family: Arial, Helvetica, sans-serif;
+    color: #17202a;
+}
+
+header {
+    background: #111827;
+    color: white;
+    padding: 18px 24px;
+}
+
+.header-inner {
+    max-width: 1250px;
+    margin: auto;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 15px;
+}
+
+.brand {
+    font-size: 22px;
+    font-weight: 800;
+}
+
+.tagline {
+    font-size: 12px;
+    opacity: .7;
+    margin-top: 3px;
+}
+
+.logout {
+    background: transparent;
+    border: 1px solid rgba(255,255,255,.4);
+    color: white;
+    border-radius: 7px;
+    padding: 8px 12px;
+    cursor: pointer;
+}
+
+.container {
+    max-width: 1250px;
+    margin: 25px auto;
+    padding: 0 18px 40px;
+}
+
+h1 {
+    margin-bottom: 5px;
+}
+
+.description {
+    color: #667085;
+    margin-top: 0;
+}
+
+.stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin: 24px 0;
+}
+
+.stat {
+    background: white;
+    padding: 20px;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.05);
+}
+
+.stat-number {
+    font-size: 30px;
+    font-weight: 800;
+}
+
+.stat-label {
+    color: #667085;
+    margin-top: 4px;
+}
+
+.lead {
+    background: white;
+    border-radius: 14px;
+    margin-bottom: 16px;
+    padding: 20px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.05);
+}
+
+.lead-top {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: flex-start;
+}
+
+.customer {
+    font-size: 20px;
+    font-weight: 800;
+}
+
+.number {
+    margin-top: 4px;
+}
+
+.number a {
+    color: #175cd3;
+    text-decoration: none;
+}
+
+.service {
+    margin-top: 12px;
+    font-weight: 700;
+}
+
+.summary {
+    margin-top: 10px;
+    line-height: 1.5;
+}
+
+.reason {
+    margin-top: 10px;
+    color: #667085;
+    line-height: 1.5;
+}
+
+.meta {
+    margin-top: 13px;
+    color: #98a2b3;
+    font-size: 13px;
+}
+
+.status {
+    font-weight: 800;
+    font-size: 12px;
+    padding: 7px 10px;
+    border-radius: 20px;
+    background: #eef2f6;
+    white-space: nowrap;
+}
+
+.actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 18px;
+}
+
+.actions form {
+    margin: 0;
+}
+
+.actions button {
+    border: 1px solid #d0d5dd;
+    background: white;
+    border-radius: 8px;
+    padding: 8px 11px;
+    cursor: pointer;
+    font-weight: 700;
+}
+
+.actions button:hover {
+    background: #f2f4f7;
+}
+
+.empty {
+    background: white;
+    padding: 30px;
+    border-radius: 12px;
+    text-align: center;
+    color: #667085;
+}
+
+@media (max-width: 700px) {
+
+    .stats {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .lead-top {
+        flex-direction: column;
+    }
+
+}
+
+</style>
+</head>
+
+<body>
+
+<header>
+<div class="header-inner">
+
+<div>
+<div class="brand">IBROWS Lead Dashboard</div>
+<div class="tagline">Opportunity Without Borders.</div>
+</div>
+
+<form method="POST" action="{{ url_for('admin_logout') }}">
+
+<input
+    type="hidden"
+    name="csrf_token"
+    value="{{ csrf_token }}"
+>
+
+<button class="logout" type="submit">
+Logout
+</button>
+
+</form>
+
+</div>
+</header>
+
+
+<div class="container">
+
+<h1>Business Leads</h1>
+
+<p class="description">
+Qualified enquiries captured by the IBROWS AI Business Assistant.
+</p>
+
+
+<div class="stats">
+
+<div class="stat">
+<div class="stat-number">{{ counts.ALL }}</div>
+<div class="stat-label">All Leads</div>
+</div>
+
+<div class="stat">
+<div class="stat-number">{{ counts.NEW }}</div>
+<div class="stat-label">New</div>
+</div>
+
+<div class="stat">
+<div class="stat-number">{{ counts.CONTACTED }}</div>
+<div class="stat-label">Contacted</div>
+</div>
+
+<div class="stat">
+<div class="stat-number">{{ counts.CLOSED }}</div>
+<div class="stat-label">Closed</div>
+</div>
+
+</div>
+
+
+{% if leads %}
+
+{% for lead in leads %}
+
+<div class="lead">
+
+<div class="lead-top">
+
+<div>
+
+<div class="customer">
+{{ lead.customer_name or "WhatsApp Customer" }}
+</div>
+
+<div class="number">
+
+<a
+href="https://wa.me/{{ lead.customer_number }}"
+target="_blank"
+rel="noopener noreferrer"
+>
++{{ lead.customer_number }}
+</a>
+
+</div>
+
+</div>
+
+<div class="status">
+{{ lead.status }}
+</div>
+
+</div>
+
+
+<div class="service">
+{{ lead.service or "General Enquiry" }}
+</div>
+
+
+<div class="summary">
+{{ lead.summary or "No summary available." }}
+</div>
+
+
+{% if lead.handover_reason %}
+
+<div class="reason">
+<strong>Human follow-up:</strong>
+{{ lead.handover_reason }}
+</div>
+
+{% endif %}
+
+
+<div class="meta">
+
+Created:
+{{ lead.created_at.strftime("%d %b %Y %H:%M") }}
+
+&nbsp; | &nbsp;
+
+Updated:
+{{ lead.updated_at.strftime("%d %b %Y %H:%M") }}
+
+</div>
+
+
+<div class="actions">
+
+{% if lead.status != "NEW" %}
+
+<form
+method="POST"
+action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"
+>
+
+<input
+type="hidden"
+name="csrf_token"
+value="{{ csrf_token }}"
+>
+
+<input
+type="hidden"
+name="status"
+value="NEW"
+>
+
+<button type="submit">
+Mark New
+</button>
+
+</form>
+
+{% endif %}
+
+
+{% if lead.status != "CONTACTED" %}
+
+<form
+method="POST"
+action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"
+>
+
+<input
+type="hidden"
+name="csrf_token"
+value="{{ csrf_token }}"
+>
+
+<input
+type="hidden"
+name="status"
+value="CONTACTED"
+>
+
+<button type="submit">
+Mark Contacted
+</button>
+
+</form>
+
+{% endif %}
+
+
+{% if lead.status != "CLOSED" %}
+
+<form
+method="POST"
+action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"
+>
+
+<input
+type="hidden"
+name="csrf_token"
+value="{{ csrf_token }}"
+>
+
+<input
+type="hidden"
+name="status"
+value="CLOSED"
+>
+
+<button type="submit">
+Close Lead
+</button>
+
+</form>
+
+{% endif %}
+
+</div>
+
+</div>
+
+{% endfor %}
+
+{% else %}
+
+<div class="empty">
+No business leads have been captured yet.
+</div>
+
+{% endif %}
+
+</div>
+
+</body>
+</html>
+"""
+
+
+@app.route("/admin/leads", methods=["GET"])
+@admin_required
+def admin_leads():
+
+    rows = get_all_leads()
+
+    leads = []
+
+    for row in rows:
+        leads.append({
+            "id": row[0],
+            "customer_number": row[1],
+            "customer_name": row[2],
+            "service": row[3],
+            "summary": row[4],
+            "handover_reason": row[5],
+            "status": row[6],
+            "created_at": row[7],
+            "updated_at": row[8]
+        })
+
+    counts = get_lead_counts()
+
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        leads=leads,
+        counts=counts,
+        csrf_token=get_csrf_token()
+    )
+
+
+@app.route(
+    "/admin/leads/<int:lead_id>/status",
+    methods=["POST"]
+)
+@admin_required
+def admin_lead_status(lead_id):
+
+    validate_csrf()
+
+    status = request.form.get("status", "")
+
+    if status not in {
+        "NEW",
+        "CONTACTED",
+        "CLOSED"
+    }:
+        abort(400)
+
+    update_lead_status(
+        lead_id,
+        status
+    )
+
+    return redirect(url_for("admin_leads"))
+
+
+# =========================================================
 # META WEBHOOK VERIFICATION
 # =========================================================
 
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
+
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
@@ -261,12 +1115,14 @@ def verify_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def receive_webhook():
+
     data = request.get_json(silent=True)
 
     print("INCOMING WHATSAPP WEBHOOK:", flush=True)
     print(data, flush=True)
 
     try:
+
         value = data["entry"][0]["changes"][0]["value"]
 
         # Ignore sent/read/delivered status events.
@@ -282,6 +1138,23 @@ def receive_webhook():
         customer_number = message["from"]
         customer_message = message["text"]["body"]
 
+        customer_name = ""
+
+        contacts = value.get("contacts", [])
+
+        if contacts:
+            customer_name = (
+                contacts[0]
+                .get("profile", {})
+                .get("name", "")
+            )
+
+        print(
+            f"Customer: {customer_name} "
+            f"({customer_number})",
+            flush=True
+        )
+
         print(
             f"Customer message: {customer_message}",
             flush=True
@@ -294,12 +1167,18 @@ def receive_webhook():
 
         reply = result["reply"]
 
-        print(f"AI reply: {reply}", flush=True)
+        print(
+            f"AI reply: {reply}",
+            flush=True
+        )
 
         if result.get("lead_required"):
+
             try:
-                create_lead(
+
+                create_or_update_lead(
                     customer_number=customer_number,
+                    customer_name=customer_name,
                     service=result.get(
                         "service",
                         "General Enquiry"
@@ -315,8 +1194,7 @@ def receive_webhook():
                 )
 
             except Exception as lead_error:
-                # We do NOT tell the customer a lead was
-                # successfully created if the DB operation failed.
+
                 print(
                     f"Lead creation error: {lead_error}",
                     flush=True
@@ -336,6 +1214,7 @@ def receive_webhook():
         )
 
     except Exception as error:
+
         print(
             f"Webhook processing error: {error}",
             flush=True
@@ -348,10 +1227,13 @@ def receive_webhook():
 # OPENAI BUSINESS ASSISTANT
 # =========================================================
 
-def generate_ai_reply(customer_number, customer_message):
+def generate_ai_reply(
+    customer_number,
+    customer_message
+):
 
     try:
-        # Store incoming customer message permanently.
+
         save_message(
             customer_number,
             "user",
@@ -364,33 +1246,31 @@ def generate_ai_reply(customer_number, customer_message):
         )
 
         response = client.responses.create(
+
             model="gpt-5.6-luna",
 
             instructions="""
 You are the official WhatsApp AI Business Assistant for
 IBROWS Enterprise, a multi-service business operating in Malawi.
 
-Your job is to:
-1. Help customers understand IBROWS services.
-2. Understand what they need.
-3. Ask useful follow-up questions.
-4. Provide accurate approved information.
-5. Identify genuine business leads.
-6. Determine when human assistance is required.
+You help customers understand IBROWS services, understand
+their needs, ask useful follow-up questions, provide accurate
+approved information, identify genuine business leads, and
+determine when human assistance is required.
 
 You are an AI assistant.
 Never pretend to be a human employee.
 
 
 ============================================================
-OUTPUT FORMAT - VERY IMPORTANT
+OUTPUT FORMAT
 ============================================================
 
 Return ONLY a valid JSON object.
 
-Never place the JSON inside markdown code fences.
+Do not place the JSON inside markdown code fences.
 
-Use exactly these fields:
+Use exactly:
 
 {
   "reply": "WhatsApp response shown to customer",
@@ -403,55 +1283,55 @@ Use exactly these fields:
 lead_required must be true or false.
 
 Set lead_required to TRUE when:
+
 - The customer asks for a quotation.
 - The customer asks how to pay.
 - The customer wants to proceed with purchasing a service.
 - The customer asks to speak with a person.
-- The customer requests management or staff assistance.
+- Management or staff assistance is requested.
 - Price negotiation is required.
-- The customer has provided enough information for IBROWS
-  staff to continue the enquiry.
-- A complaint needs human attention.
+- Enough information has been supplied for staff to continue.
+- A complaint requires human attention.
 - A custom project needs assessment.
 - Product availability requires human confirmation.
 
-Do NOT create a lead merely because somebody says hello,
-asks a general question, or is still casually exploring.
+Do not create a lead merely because someone says hello or
+asks a general question.
 
 When lead_required is true:
 
 service:
-Give the most appropriate IBROWS service category.
+Give the appropriate IBROWS service category.
 
 lead_summary:
-Briefly summarize what the customer wants and important
-information already collected from the conversation.
+Summarize what the customer wants and important information
+already collected.
 
 handover_reason:
-Briefly explain why human follow-up is required.
+Explain briefly why human follow-up is appropriate.
 
-IMPORTANT:
-When lead_required is true, you may tell the customer that
-their enquiry is being referred to the IBROWS team because
-the system is configured to create a lead.
+You may say the enquiry will be referred to the IBROWS team
+when lead_required is true.
 
-Do not claim payment, booking, registration, purchase,
-application or any other transaction has been completed.
+Never claim that payment, booking, registration, purchase,
+application, reservation, or another transaction has been
+completed unless the system explicitly confirms it.
 
 
 ============================================================
 CONVERSATION CONTEXT
 ============================================================
 
-You receive recent messages from the same WhatsApp customer.
+You receive recent messages belonging to the same WhatsApp
+customer.
 
-Use the conversation history to understand follow-up answers.
+Use them to understand follow-up answers.
 
-Do not unnecessarily ask for information the customer has
-already supplied.
+Do not ask again for information already supplied unless
+clarification is genuinely required.
 
-The conversation history may contain only recent messages.
-Do not invent older conversation details.
+Do not invent conversation history beyond the supplied
+messages.
 
 
 ============================================================
@@ -464,12 +1344,11 @@ You communicate in:
 2. Chichewa
 3. Tumbuka / Chitumbuka
 
-Normally respond in the language being used by the customer.
+Normally respond in the customer's language.
 
-Use natural Malawian Chichewa where Chichewa is appropriate.
+Use natural Malawian Chichewa when appropriate.
 
-Use natural Malawian Tumbuka/Chitumbuka where Tumbuka is
-appropriate.
+Use natural Malawian Tumbuka/Chitumbuka when appropriate.
 
 Customers may mix languages naturally.
 
@@ -592,7 +1471,7 @@ may include:
 - Languages required
 - Existing systems
 
-Do not ask all questions at once.
+Ask only one or two useful questions at a time.
 
 Do not invent development prices.
 
@@ -763,7 +1642,7 @@ WhatsApp replies should normally be short.
 
 Do not send the complete service catalogue unless asked.
 
-If somebody simply says hello, greet them naturally and ask
+If someone simply says hello, greet them naturally and ask
 how IBROWS can assist.
 
 Ask only one or two useful follow-up questions at a time.
@@ -780,7 +1659,7 @@ PRICING
 Only quote prices explicitly approved above.
 
 For services without approved prices, explain that pricing
-depends on requirements and needs confirmation from the
+depends on requirements and requires confirmation from the
 IBROWS team.
 
 Never guess.
@@ -811,7 +1690,7 @@ Accuracy is more important than answering everything.
 
 
 ============================================================
-SAFETY & PRIVACY
+SAFETY AND PRIVACY
 ============================================================
 
 Never request:
@@ -829,11 +1708,11 @@ Do not expose information belonging to another customer.
 FINAL RULE
 ============================================================
 
-Help the customer move toward the correct next step while
-remaining accurate.
+Help the customer move toward the appropriate next step
+while remaining accurate.
 
-Respond to the customer's latest message in the context of
-their recent conversation.
+Respond to the latest message in the context of the recent
+conversation.
 
 Return ONLY the required JSON object.
 """,
@@ -857,13 +1736,11 @@ Return ONLY the required JSON object.
             )
         ).strip()
 
-        lead_required = bool(
-            result.get("lead_required", False)
-        )
-
         final_result = {
             "reply": reply,
-            "lead_required": lead_required,
+            "lead_required": bool(
+                result.get("lead_required", False)
+            ),
             "service": str(
                 result.get("service", "")
             ).strip(),
@@ -875,7 +1752,6 @@ Return ONLY the required JSON object.
             ).strip()
         }
 
-        # Save only the customer-facing reply in conversation history.
         save_message(
             customer_number,
             "assistant",
@@ -885,6 +1761,7 @@ Return ONLY the required JSON object.
         return final_result
 
     except Exception as error:
+
         print(
             f"OpenAI/database error: {error}",
             flush=True
@@ -893,8 +1770,8 @@ Return ONLY the required JSON object.
         return {
             "reply": (
                 "Thank you for contacting IBROWS Enterprise. "
-                "Our AI assistant is temporarily unable to process "
-                "your request. Please try again shortly."
+                "Our AI assistant is temporarily unable to "
+                "process your request. Please try again shortly."
             ),
             "lead_required": False,
             "service": "",
@@ -908,6 +1785,7 @@ Return ONLY the required JSON object.
 # =========================================================
 
 def send_whatsapp_message(recipient, message):
+
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         print(
             "WhatsApp credentials not configured.",
@@ -934,18 +1812,31 @@ def send_whatsapp_message(recipient, message):
         },
     }
 
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=20,
-    )
+    try:
 
-    print(
-        f"WhatsApp send status: {response.status_code}",
-        flush=True
-    )
-    print(response.text, flush=True)
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+
+        print(
+            f"WhatsApp send status: {response.status_code}",
+            flush=True
+        )
+
+        print(
+            response.text,
+            flush=True
+        )
+
+    except requests.RequestException as error:
+
+        print(
+            f"WhatsApp send error: {error}",
+            flush=True
+        )
 
 
 # =========================================================
@@ -954,15 +1845,22 @@ def send_whatsapp_message(recipient, message):
 
 @app.route("/privacy", methods=["GET"])
 def privacy_policy():
+
     return """
     <html>
     <head>
-        <title>IBROWS AI Business Assistant - Privacy Policy</title>
+        <title>
+        IBROWS AI Business Assistant - Privacy Policy
+        </title>
     </head>
+
     <body>
+
         <h1>Privacy Policy</h1>
 
-        <p><strong>IBROWS AI Business Assistant</strong></p>
+        <p>
+        <strong>IBROWS AI Business Assistant</strong>
+        </p>
 
         <p>
         IBROWS Enterprise uses this WhatsApp Business service
@@ -981,8 +1879,8 @@ def privacy_policy():
         <p>
         This information may be used to respond to enquiries,
         provide requested services, maintain conversation
-        context, improve customer support, and manage legitimate
-        business enquiries.
+        context, improve customer support, and manage
+        legitimate business enquiries.
         </p>
 
         <p>
@@ -1010,6 +1908,7 @@ def privacy_policy():
         <p>
         Last updated: 21 September 2026.
         </p>
+
     </body>
     </html>
     """, 200
@@ -1021,12 +1920,16 @@ def privacy_policy():
 
 @app.route("/data-deletion", methods=["GET"])
 def data_deletion():
+
     return """
     <html>
+
     <head>
         <title>IBROWS - Data Deletion</title>
     </head>
+
     <body>
+
         <h1>User Data Deletion</h1>
 
         <p>
@@ -1047,7 +1950,9 @@ def data_deletion():
         identify the relevant records before completing the
         request.
         </p>
+
     </body>
+
     </html>
     """, 200
 
@@ -1058,7 +1963,9 @@ def data_deletion():
 
 try:
     init_database()
+
 except Exception as error:
+
     print(
         f"DATABASE INITIALIZATION ERROR: {error}",
         flush=True
@@ -1070,7 +1977,14 @@ except Exception as error:
 # =========================================================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
+
     app.run(
         host="0.0.0.0",
         port=port
