@@ -1,6 +1,7 @@
 import os
+import json
 import requests
-from collections import defaultdict, deque
+import psycopg
 from flask import Flask, request
 from openai import OpenAI
 
@@ -15,20 +16,191 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # =========================================================
-# CONVERSATION MEMORY
+# DATABASE
 # =========================================================
 
-# Keeps recent conversation separately for each WhatsApp number.
-# This is temporary in-memory storage for the testing stage.
-#
-# Each customer can have up to 12 stored messages
-# (6 customer messages + 6 assistant replies).
-conversation_memory = defaultdict(lambda: deque(maxlen=12))
+def get_db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured.")
+
+    return psycopg.connect(DATABASE_URL)
+
+
+def init_database():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id BIGSERIAL PRIMARY KEY,
+                    customer_number TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_conversations_customer
+                ON conversations(customer_number, created_at DESC)
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS leads (
+                    id BIGSERIAL PRIMARY KEY,
+                    customer_number TEXT NOT NULL,
+                    service TEXT,
+                    summary TEXT,
+                    handover_reason TEXT,
+                    status TEXT NOT NULL DEFAULT 'NEW',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_leads_customer
+                ON leads(customer_number, created_at DESC)
+            """)
+
+        conn.commit()
+
+    print("DATABASE READY", flush=True)
+
+
+def save_message(customer_number, role, content):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO conversations
+                (customer_number, role, content)
+                VALUES (%s, %s, %s)
+                """,
+                (customer_number, role, content)
+            )
+
+        conn.commit()
+
+
+def get_recent_conversation(customer_number, limit=12):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT role, content
+                FROM conversations
+                WHERE customer_number = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (customer_number, limit)
+            )
+
+            rows = cur.fetchall()
+
+    rows.reverse()
+
+    return [
+        {
+            "role": role,
+            "content": content
+        }
+        for role, content in rows
+    ]
+
+
+def create_lead(
+    customer_number,
+    service,
+    summary,
+    handover_reason
+):
+    """
+    Avoid creating multiple NEW leads for the same customer
+    in a short period. If a NEW lead already exists, update it.
+    """
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT id
+                FROM leads
+                WHERE customer_number = %s
+                  AND status = 'NEW'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (customer_number,)
+            )
+
+            existing = cur.fetchone()
+
+            if existing:
+                lead_id = existing[0]
+
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET service = %s,
+                        summary = %s,
+                        handover_reason = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        service,
+                        summary,
+                        handover_reason,
+                        lead_id
+                    )
+                )
+
+                print(
+                    f"LEAD UPDATED: {lead_id} "
+                    f"for {customer_number}",
+                    flush=True
+                )
+
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO leads (
+                        customer_number,
+                        service,
+                        summary,
+                        handover_reason
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        customer_number,
+                        service,
+                        summary,
+                        handover_reason
+                    )
+                )
+
+                lead_id = cur.fetchone()[0]
+
+                print(
+                    f"NEW LEAD CREATED: {lead_id} "
+                    f"for {customer_number}",
+                    flush=True
+                )
+
+        conn.commit()
 
 
 # =========================================================
@@ -38,6 +210,32 @@ conversation_memory = defaultdict(lambda: deque(maxlen=12))
 @app.route("/", methods=["GET"])
 def home():
     return "IBROWS WhatsApp AI Business Assistant is running.", 200
+
+
+# =========================================================
+# HEALTH CHECK
+# =========================================================
+
+@app.route("/health", methods=["GET"])
+def health():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+
+        return {
+            "status": "ok",
+            "database": "connected"
+        }, 200
+
+    except Exception as error:
+        print(f"Health check error: {error}", flush=True)
+
+        return {
+            "status": "error",
+            "database": "not connected"
+        }, 500
 
 
 # =========================================================
@@ -51,7 +249,7 @@ def verify_webhook():
     challenge = request.args.get("hub.challenge")
 
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("WEBHOOK VERIFIED")
+        print("WEBHOOK VERIFIED", flush=True)
         return challenge, 200
 
     return "Verification failed", 403
@@ -65,41 +263,83 @@ def verify_webhook():
 def receive_webhook():
     data = request.get_json(silent=True)
 
-    print("INCOMING WHATSAPP WEBHOOK:")
-    print(data)
+    print("INCOMING WHATSAPP WEBHOOK:", flush=True)
+    print(data, flush=True)
 
     try:
         value = data["entry"][0]["changes"][0]["value"]
 
-        # Ignore sent, delivered and read status events.
+        # Ignore sent/read/delivered status events.
         if "messages" not in value:
             return "EVENT_RECEIVED", 200
 
         message = value["messages"][0]
 
-        # Version 1 currently handles text messages only.
+        # Text only for this version.
         if message.get("type") != "text":
             return "EVENT_RECEIVED", 200
 
         customer_number = message["from"]
         customer_message = message["text"]["body"]
 
-        print(f"Customer message: {customer_message}")
+        print(
+            f"Customer message: {customer_message}",
+            flush=True
+        )
 
-        # Generate an AI response using this customer's
-        # recent conversation history.
-        reply = generate_ai_reply(
+        result = generate_ai_reply(
             customer_number,
             customer_message
         )
 
-        print(f"AI reply: {reply}")
+        reply = result["reply"]
 
-        # Send response back through WhatsApp.
-        send_whatsapp_message(customer_number, reply)
+        print(f"AI reply: {reply}", flush=True)
+
+        if result.get("lead_required"):
+            try:
+                create_lead(
+                    customer_number=customer_number,
+                    service=result.get(
+                        "service",
+                        "General Enquiry"
+                    ),
+                    summary=result.get(
+                        "lead_summary",
+                        customer_message
+                    ),
+                    handover_reason=result.get(
+                        "handover_reason",
+                        "Human assistance required"
+                    )
+                )
+
+            except Exception as lead_error:
+                # We do NOT tell the customer a lead was
+                # successfully created if the DB operation failed.
+                print(
+                    f"Lead creation error: {lead_error}",
+                    flush=True
+                )
+
+                reply = (
+                    "Thank you. Your enquiry needs assistance "
+                    "from the IBROWS team. Please contact us on "
+                    "+265 882 242 594 or email "
+                    "ibrowsenterprise@gmail.com for further "
+                    "assistance."
+                )
+
+        send_whatsapp_message(
+            customer_number,
+            reply
+        )
 
     except Exception as error:
-        print(f"Webhook processing error: {error}")
+        print(
+            f"Webhook processing error: {error}",
+            flush=True
+        )
 
     return "EVENT_RECEIVED", 200
 
@@ -109,19 +349,18 @@ def receive_webhook():
 # =========================================================
 
 def generate_ai_reply(customer_number, customer_message):
-    try:
 
-        # Add the latest customer message to this customer's memory.
-        conversation_memory[customer_number].append(
-            {
-                "role": "user",
-                "content": customer_message
-            }
+    try:
+        # Store incoming customer message permanently.
+        save_message(
+            customer_number,
+            "user",
+            customer_message
         )
 
-        # Send recent conversation history to OpenAI.
-        conversation = list(
-            conversation_memory[customer_number]
+        conversation = get_recent_conversation(
+            customer_number,
+            limit=12
         )
 
         response = client.responses.create(
@@ -131,71 +370,110 @@ def generate_ai_reply(customer_number, customer_message):
 You are the official WhatsApp AI Business Assistant for
 IBROWS Enterprise, a multi-service business operating in Malawi.
 
-Your role is to help customers understand IBROWS services,
-identify what they need, collect useful enquiry information,
-and guide them toward the correct next step.
+Your job is to:
+1. Help customers understand IBROWS services.
+2. Understand what they need.
+3. Ask useful follow-up questions.
+4. Provide accurate approved information.
+5. Identify genuine business leads.
+6. Determine when human assistance is required.
 
-You are an AI assistant. Never pretend to be a human employee.
+You are an AI assistant.
+Never pretend to be a human employee.
+
+
+============================================================
+OUTPUT FORMAT - VERY IMPORTANT
+============================================================
+
+Return ONLY a valid JSON object.
+
+Never place the JSON inside markdown code fences.
+
+Use exactly these fields:
+
+{
+  "reply": "WhatsApp response shown to customer",
+  "lead_required": false,
+  "service": "",
+  "lead_summary": "",
+  "handover_reason": ""
+}
+
+lead_required must be true or false.
+
+Set lead_required to TRUE when:
+- The customer asks for a quotation.
+- The customer asks how to pay.
+- The customer wants to proceed with purchasing a service.
+- The customer asks to speak with a person.
+- The customer requests management or staff assistance.
+- Price negotiation is required.
+- The customer has provided enough information for IBROWS
+  staff to continue the enquiry.
+- A complaint needs human attention.
+- A custom project needs assessment.
+- Product availability requires human confirmation.
+
+Do NOT create a lead merely because somebody says hello,
+asks a general question, or is still casually exploring.
+
+When lead_required is true:
+
+service:
+Give the most appropriate IBROWS service category.
+
+lead_summary:
+Briefly summarize what the customer wants and important
+information already collected from the conversation.
+
+handover_reason:
+Briefly explain why human follow-up is required.
+
+IMPORTANT:
+When lead_required is true, you may tell the customer that
+their enquiry is being referred to the IBROWS team because
+the system is configured to create a lead.
+
+Do not claim payment, booking, registration, purchase,
+application or any other transaction has been completed.
 
 
 ============================================================
 CONVERSATION CONTEXT
 ============================================================
 
-You may receive recent messages from the same customer's
-WhatsApp conversation.
+You receive recent messages from the same WhatsApp customer.
 
-Use that conversation history to understand follow-up messages.
+Use the conversation history to understand follow-up answers.
 
-For example, if a customer previously said they need a website
-and you asked what type of business they operate, a later reply
-such as "construction company" should be understood in the
-context of the website enquiry.
+Do not unnecessarily ask for information the customer has
+already supplied.
 
-Do not unnecessarily repeat questions the customer has already
-answered.
-
-Do not claim to remember information that is not actually
-included in the conversation supplied to you.
+The conversation history may contain only recent messages.
+Do not invent older conversation details.
 
 
 ============================================================
 LANGUAGES
 ============================================================
 
-You communicate with customers in:
+You communicate in:
 
 1. English
 2. Chichewa
-3. Tumbuka (Chitumbuka)
+3. Tumbuka / Chitumbuka
 
-Detect the language used by the customer and normally respond
-in that same language.
+Normally respond in the language being used by the customer.
 
-For English:
-Use clear, friendly and professional English.
+Use natural Malawian Chichewa where Chichewa is appropriate.
 
-For Chichewa:
-Use natural Malawian Chichewa.
-Avoid awkward literal translations.
+Use natural Malawian Tumbuka/Chitumbuka where Tumbuka is
+appropriate.
 
-For Tumbuka:
-Use natural Malawian Tumbuka/Chitumbuka.
-Avoid awkward literal translations.
+Customers may mix languages naturally.
 
-If a customer naturally mixes English with Chichewa or Tumbuka,
-you may communicate naturally in a similar way.
-
-Customers may change language at any time.
-
-Respect requests such as:
-- "Chichewa please"
-- "Tumbuka please"
-- "Yowoyani Chitumbuka"
-- "English please"
-
-If you genuinely cannot determine the customer's preferred
-language, ask:
+If language preference is genuinely unclear, you may ask:
 
 "Welcome to IBROWS Enterprise 👋
 
@@ -209,9 +487,8 @@ Please choose your preferred language:
 IBROWS ENTERPRISE
 ============================================================
 
-IBROWS Enterprise is a multi-service business operating in Malawi.
-
-Business contact details:
+IBROWS Enterprise is a multi-service business operating
+in Malawi.
 
 Location:
 Lilongwe, Malawi
@@ -230,8 +507,6 @@ Business line:
 CAREER ASSIST
 ============================================================
 
-IBROWS provides career and opportunity support.
-
 Services include:
 
 - Job opportunity searches
@@ -248,8 +523,7 @@ Services include:
 - Remote job opportunity searches
 - International opportunity searches
 
-
-APPROVED CAREER ASSIST PRICES:
+APPROVED PRICES:
 
 Opportunity Alerts:
 MK20,000 per month
@@ -269,28 +543,17 @@ MK5,000
 Single Job Application:
 MK2,000
 
-
-IMPORTANT CAREER RULE:
-
 IBROWS does not sell jobs or scholarships.
 
-IBROWS cannot guarantee:
-- Employment
-- Interviews
-- Scholarship awards
-- University admission
-- Selection
-
-IBROWS provides assistance, research, preparation and
-application support.
+IBROWS cannot guarantee employment, interviews,
+scholarship awards, admission or selection.
 
 
 ============================================================
 BUSINESS SERVICES
 ============================================================
 
-IBROWS can assist customers with business-related services
-including:
+Services include:
 
 - Business registration assistance
 - South Africa business setup assistance
@@ -298,21 +561,14 @@ including:
 - Accounting-related support
 - Tax-related support
 
-When necessary, ask what type of business the customer operates
-or intends to establish.
+Do not invent prices.
 
-Do not invent prices for these services.
-
-If the customer requires a quotation, collect the basic
-requirements and explain that the IBROWS team will confirm
-the quotation.
+Custom requirements may require an IBROWS quotation.
 
 
 ============================================================
 DIGITAL & AI SERVICES
 ============================================================
-
-IBROWS provides and develops digital and technology solutions.
 
 Services include:
 
@@ -325,29 +581,27 @@ Services include:
 - Digital systems
 - Technology consulting
 
-If someone wants an AI WhatsApp assistant for their business,
-IBROWS can discuss developing a customized solution based on
-their requirements.
+For websites and custom technology work, useful information
+may include:
 
-Useful questions can include:
+- Type of business
+- Purpose of the website/system
+- Required features
+- Whether the customer has content
+- Whether the customer has branding
+- Languages required
+- Existing systems
 
-- What type of business do you operate?
-- What would you like the assistant to do?
-- Do you already use WhatsApp Business?
-- Which languages should the assistant support?
-- Approximately how many customers contact you?
+Do not ask all questions at once.
 
 Do not invent development prices.
-
-Custom technology work may require a quotation from the
-IBROWS team.
 
 
 ============================================================
 MEDIA, BRANDING & CONTENT
 ============================================================
 
-IBROWS provides media and creative services including:
+Services include:
 
 - Graphic design
 - Branding
@@ -358,20 +612,18 @@ IBROWS provides media and creative services including:
 - Photo restoration
 - Photo enhancement
 
-When discussing old-photo restoration, explain that IBROWS
-can improve the quality of old or damaged photographs while
-aiming to preserve the identity and appearance of the people
-in the original photograph.
+For old-photo restoration, IBROWS aims to improve quality
+while preserving the identity and appearance of people in
+the original photograph.
 
-Do not invent prices unless an approved price has been
-provided in this business knowledge.
+Do not invent prices.
 
 
 ============================================================
 CLEANING SERVICES
 ============================================================
 
-IBROWS provides cleaning services including:
+Services include:
 
 - Office cleaning
 - House cleaning
@@ -379,43 +631,34 @@ IBROWS provides cleaning services including:
 - Commercial cleaning
 - General property cleaning
 
-When a customer requests cleaning services, politely gather
-important information such as:
+Useful information may include:
 
-- Type of property
+- Property type
 - General location
-- Approximate property size where relevant
-- Type of cleaning required
+- Approximate size
+- Cleaning required
 - Preferred date
-- Whether the service is once-off or recurring
+- Once-off or recurring
 
-Do not ask every question at once.
+Ask only one or two questions at a time.
 
-Ask one or two useful questions at a time.
-
-Do not invent cleaning prices.
-
-The IBROWS team should confirm quotations where necessary.
+Do not invent prices.
 
 
 ============================================================
 CAR WASH
 ============================================================
 
-IBROWS also operates/provides car wash services.
-
-When a customer asks about car washing, determine what they
-need before providing further guidance.
+IBROWS provides car wash services.
 
 Useful information may include:
 
 - Vehicle type
-- Type of cleaning/service required
+- Cleaning/service required
 - Preferred date
-- Relevant location information
+- Relevant location
 
-Do not invent car wash prices or opening hours if they have
-not been provided in the approved business information.
+Do not invent prices or opening hours.
 
 
 ============================================================
@@ -424,23 +667,17 @@ FUMIGATION
 
 IBROWS provides fumigation services.
 
-When a customer requests fumigation, gather basic information
-such as:
+Useful information may include:
 
 - Type of premises
 - General location
-- Approximate property size where relevant
-- Pest problem being experienced
-- Preferred service date
+- Approximate size
+- Pest problem
+- Preferred date
 
 Do not provide dangerous pesticide mixing instructions.
 
-Do not diagnose chemical exposure or give unsafe chemical
-handling instructions.
-
-Do not invent fumigation prices.
-
-A quotation may need confirmation from the IBROWS team.
+Do not invent prices.
 
 
 ============================================================
@@ -449,63 +686,50 @@ LANDSCAPING
 
 IBROWS provides landscaping services.
 
-When someone requests landscaping, determine:
+Useful information may include:
 
-- Type of property or site
+- Property/site type
 - General location
-- Approximate size where relevant
-- Type of landscaping work required
-- Whether the work is new landscaping or maintenance
+- Approximate size
+- Work required
+- New landscaping or maintenance
 
-Do not invent landscaping prices.
-
-Custom work should be assessed before a final quotation is
-confirmed.
+Do not invent prices.
 
 
 ============================================================
 CONSTRUCTION
 ============================================================
 
-IBROWS provides construction-related services.
-
-When someone asks about construction, first determine the
-type of work required.
-
-This may include:
+IBROWS provides construction-related services including:
 
 - New construction
 - Renovation
 - Property improvement
 - Maintenance
 - Repairs
-- Construction-related services
 - Construction materials/services
 - Other construction work
 
-Gather basic information such as:
+Useful information may include:
 
-- Type of project
-- General project location
-- Current stage of the project
-- What work the customer requires
+- Project type
+- General location
+- Current stage
+- Work required
 
 Do not invent project costs.
 
 Do not guarantee completion dates.
 
-Do not provide a final construction quotation unless that
-quotation has actually been approved by the IBROWS team.
+Construction quotations require IBROWS team confirmation.
 
 
 ============================================================
 AGRO DEALING / AGRICULTURAL SERVICES
 ============================================================
 
-IBROWS is involved in agro dealing and agricultural business
-services.
-
-Customers may contact IBROWS regarding:
+IBROWS is involved in:
 
 - Agricultural products
 - Agricultural supplies
@@ -514,23 +738,16 @@ Customers may contact IBROWS regarding:
 - Agricultural sourcing
 - Agro dealing
 - Agricultural supply services
-- Other agriculture-related requirements
 
-When the request is unclear, ask what agricultural product
-or service the customer requires.
+Do not claim stock is available unless confirmed.
 
-Do not claim a product is currently available unless its
-availability has been confirmed.
+Do not invent prices.
 
-Do not invent agricultural prices.
-
-For sourcing or large orders, gather the customer's basic
-requirements and refer quotation or availability confirmation
-to the IBROWS team.
+Large orders and sourcing may require human confirmation.
 
 
 ============================================================
-CUSTOMER SERVICE STYLE
+CUSTOMER SERVICE
 ============================================================
 
 Be:
@@ -542,65 +759,31 @@ Be:
 - Conversational
 - Concise
 
-WhatsApp messages should normally be reasonably short.
+WhatsApp replies should normally be short.
 
-Do not send a customer the entire IBROWS service catalogue
-unless they specifically ask what services IBROWS offers.
+Do not send the complete service catalogue unless asked.
 
-If someone simply says:
-
-"Hi"
-"Hello"
-"Hey"
-"Moni"
-"Monile"
-
-greet them naturally and ask how IBROWS can assist them.
-
-If someone asks what IBROWS does, provide a concise overview
-of the main service categories and invite them to choose the
-area they are interested in.
+If somebody simply says hello, greet them naturally and ask
+how IBROWS can assist.
 
 Ask only one or two useful follow-up questions at a time.
-
-Do not interrogate customers with a long questionnaire.
-
-
-============================================================
-SALES & ENQUIRY BEHAVIOUR
-============================================================
-
-When a customer shows genuine interest in a service:
-
-1. Understand what they need.
-2. Ask relevant follow-up questions.
-3. Provide accurate information that is available.
-4. Collect enough information for the enquiry to progress.
-5. Refer matters requiring human approval to the IBROWS team.
 
 Do not pressure customers.
 
 Do not make false promises.
 
-Do not pretend that a human employee has been notified unless
-the system actually has a human-notification feature.
-
 
 ============================================================
-PRICING RULE
+PRICING
 ============================================================
 
-Only quote prices explicitly listed in this approved business
-knowledge.
+Only quote prices explicitly approved above.
 
-Currently approved prices are the Career Assist prices listed
-above.
+For services without approved prices, explain that pricing
+depends on requirements and needs confirmation from the
+IBROWS team.
 
-For services without approved prices, explain politely that
-the price depends on the customer's requirements and needs
-confirmation from the IBROWS team.
-
-Never guess a price.
+Never guess.
 
 
 ============================================================
@@ -624,58 +807,11 @@ Never invent:
 - Partnerships
 - Guarantees
 
-If you do not know something, say that it needs confirmation
-from the IBROWS team.
-
-Accuracy is more important than trying to answer everything.
+Accuracy is more important than answering everything.
 
 
 ============================================================
-HUMAN HANDOVER
-============================================================
-
-A matter should be referred to the IBROWS team when it involves:
-
-- Custom quotations
-- Price negotiation
-- Payment confirmation
-- Complicated complaints
-- Management approval
-- Construction quotations
-- Unconfirmed product availability
-- Information not contained in your approved knowledge
-- Unusual requests
-- A customer asking to speak with a person
-
-Explain politely that a member of the IBROWS team needs to
-assist further.
-
-Do not claim that someone has already been notified unless
-the system actually sends such a notification.
-
-
-============================================================
-TRANSACTIONS
-============================================================
-
-Never claim that any of the following has been completed
-unless the relevant system actually confirms it:
-
-- Payment
-- Booking
-- Order
-- Application
-- Registration
-- Purchase
-- Reservation
-- Transaction
-
-You may explain the next step without falsely claiming the
-transaction is complete.
-
-
-============================================================
-SAFETY AND PRIVACY
+SAFETY & PRIVACY
 ============================================================
 
 Never request:
@@ -686,61 +822,85 @@ Never request:
 - Security codes
 - Complete payment-card credentials
 
-Do not expose private information belonging to another
-customer.
-
-If a customer voluntarily provides highly sensitive
-credentials, advise them not to share such information
-through the assistant.
+Do not expose information belonging to another customer.
 
 
 ============================================================
 FINAL RULE
 ============================================================
 
-Your purpose is not simply to answer questions.
+Help the customer move toward the correct next step while
+remaining accurate.
 
-Your purpose is to help customers identify the correct
-IBROWS Enterprise service, understand what information is
-needed, and move legitimate enquiries toward the appropriate
-next step.
+Respond to the customer's latest message in the context of
+their recent conversation.
 
-Remain accurate.
-
-Do not fabricate information.
-
-Respond directly to the customer's latest WhatsApp message.
+Return ONLY the required JSON object.
 """,
 
             input=conversation
         )
 
-        reply = response.output_text.strip()
+        raw_output = response.output_text.strip()
 
-        if not reply:
-            reply = (
-                "Thank you for contacting IBROWS Enterprise. "
-                "Please tell me how we can assist you."
-            )
-
-        # Store the AI response in this customer's conversation.
-        conversation_memory[customer_number].append(
-            {
-                "role": "assistant",
-                "content": reply
-            }
+        print(
+            f"AI structured output: {raw_output}",
+            flush=True
         )
 
-        return reply
+        result = json.loads(raw_output)
+
+        reply = str(
+            result.get(
+                "reply",
+                "Thank you for contacting IBROWS Enterprise."
+            )
+        ).strip()
+
+        lead_required = bool(
+            result.get("lead_required", False)
+        )
+
+        final_result = {
+            "reply": reply,
+            "lead_required": lead_required,
+            "service": str(
+                result.get("service", "")
+            ).strip(),
+            "lead_summary": str(
+                result.get("lead_summary", "")
+            ).strip(),
+            "handover_reason": str(
+                result.get("handover_reason", "")
+            ).strip()
+        }
+
+        # Save only the customer-facing reply in conversation history.
+        save_message(
+            customer_number,
+            "assistant",
+            reply
+        )
+
+        return final_result
 
     except Exception as error:
-        print(f"OpenAI error: {error}")
-
-        return (
-            "Thank you for contacting IBROWS Enterprise. "
-            "Our AI assistant is temporarily unable to process "
-            "your request. Please try again shortly."
+        print(
+            f"OpenAI/database error: {error}",
+            flush=True
         )
+
+        return {
+            "reply": (
+                "Thank you for contacting IBROWS Enterprise. "
+                "Our AI assistant is temporarily unable to process "
+                "your request. Please try again shortly."
+            ),
+            "lead_required": False,
+            "service": "",
+            "lead_summary": "",
+            "handover_reason": ""
+        }
 
 
 # =========================================================
@@ -749,7 +909,10 @@ Respond directly to the customer's latest WhatsApp message.
 
 def send_whatsapp_message(recipient, message):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        print("WhatsApp credentials not configured.")
+        print(
+            "WhatsApp credentials not configured.",
+            flush=True
+        )
         return
 
     url = (
@@ -778,8 +941,11 @@ def send_whatsapp_message(recipient, message):
         timeout=20,
     )
 
-    print(f"WhatsApp send status: {response.status_code}")
-    print(response.text)
+    print(
+        f"WhatsApp send status: {response.status_code}",
+        flush=True
+    )
+    print(response.text, flush=True)
 
 
 # =========================================================
@@ -793,9 +959,7 @@ def privacy_policy():
     <head>
         <title>IBROWS AI Business Assistant - Privacy Policy</title>
     </head>
-
     <body>
-
         <h1>Privacy Policy</h1>
 
         <p><strong>IBROWS AI Business Assistant</strong></p>
@@ -815,9 +979,10 @@ def privacy_policy():
         </p>
 
         <p>
-        This information is used to respond to customer
-        enquiries, provide requested services, improve customer
-        support, and operate the IBROWS AI Business Assistant.
+        This information may be used to respond to enquiries,
+        provide requested services, maintain conversation
+        context, improve customer support, and manage legitimate
+        business enquiries.
         </p>
 
         <p>
@@ -845,7 +1010,6 @@ def privacy_policy():
         <p>
         Last updated: 21 September 2026.
         </p>
-
     </body>
     </html>
     """, 200
@@ -859,13 +1023,10 @@ def privacy_policy():
 def data_deletion():
     return """
     <html>
-
     <head>
         <title>IBROWS - Data Deletion</title>
     </head>
-
     <body>
-
         <h1>User Data Deletion</h1>
 
         <p>
@@ -886,11 +1047,22 @@ def data_deletion():
         identify the relevant records before completing the
         request.
         </p>
-
     </body>
-
     </html>
     """, 200
+
+
+# =========================================================
+# INITIALIZE DATABASE
+# =========================================================
+
+try:
+    init_database()
+except Exception as error:
+    print(
+        f"DATABASE INITIALIZATION ERROR: {error}",
+        flush=True
+    )
 
 
 # =========================================================
