@@ -130,7 +130,38 @@ def init_database():
                 CREATE TABLE IF NOT EXISTS processed_whatsapp_messages (
                     message_id TEXT PRIMARY KEY,
                     customer_number TEXT,
-                    processed_at TIMESTAMPTZ DEFAULT NOW()
+                    status TEXT NOT NULL DEFAULT 'PROCESSING',
+                    reply_text TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 1,
+                    processed_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                ALTER TABLE processed_whatsapp_messages
+                ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'COMPLETED'
+            """)
+            cur.execute("""
+                ALTER TABLE processed_whatsapp_messages
+                ADD COLUMN IF NOT EXISTS reply_text TEXT
+            """)
+            cur.execute("""
+                ALTER TABLE processed_whatsapp_messages
+                ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 1
+            """)
+            cur.execute("""
+                ALTER TABLE processed_whatsapp_messages
+                ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lead_notification_status (
+                    lead_id BIGINT PRIMARY KEY REFERENCES leads(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
 
@@ -192,29 +223,105 @@ def get_recent_conversation(customer_number, limit=12):
 
 
 def claim_whatsapp_message(message_id, customer_number):
-    """Return True only for the first delivery of a WhatsApp message ID."""
+    """Return (action, saved_reply). action is PROCESS, RETRY_REPLY, or IGNORE."""
     if not message_id:
-        return True
+        return "PROCESS", None
 
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO processed_whatsapp_messages (
-                    message_id,
-                    customer_number
+                    message_id, customer_number, status, attempts, updated_at
                 )
-                VALUES (%s, %s)
+                VALUES (%s, %s, 'PROCESSING', 1, NOW())
                 ON CONFLICT (message_id) DO NOTHING
                 RETURNING message_id
                 """,
                 (message_id, customer_number)
             )
-            claimed = cur.fetchone() is not None
+            if cur.fetchone() is not None:
+                conn.commit()
+                return "PROCESS", None
+
+            cur.execute(
+                """
+                SELECT status, reply_text, updated_at
+                FROM processed_whatsapp_messages
+                WHERE message_id = %s
+                FOR UPDATE
+                """,
+                (message_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.commit()
+                return "IGNORE", None
+
+            status, reply_text, updated_at = row
+            if status == "COMPLETED":
+                conn.commit()
+                return "IGNORE", None
+
+            if status == "FAILED" and reply_text:
+                cur.execute(
+                    """
+                    UPDATE processed_whatsapp_messages
+                    SET status='PROCESSING', attempts=attempts+1, updated_at=NOW()
+                    WHERE message_id=%s
+                    """,
+                    (message_id,)
+                )
+                conn.commit()
+                return "RETRY_REPLY", reply_text
+
+            # A worker may have died mid-processing. Reclaim only after 90 seconds.
+            cur.execute(
+                """
+                UPDATE processed_whatsapp_messages
+                SET status='PROCESSING', attempts=attempts+1, updated_at=NOW()
+                WHERE message_id=%s
+                  AND status IN ('PROCESSING','FAILED')
+                  AND updated_at < NOW() - INTERVAL '90 seconds'
+                RETURNING message_id
+                """,
+                (message_id,)
+            )
+            reclaimed = cur.fetchone() is not None
+            conn.commit()
+            return ("PROCESS", None) if reclaimed else ("IGNORE", None)
+
+
+def store_pending_reply(message_id, reply_text):
+    if not message_id:
+        return
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE processed_whatsapp_messages
+                SET reply_text=%s, updated_at=NOW()
+                WHERE message_id=%s
+                """,
+                (reply_text, message_id)
+            )
         conn.commit()
 
-    return claimed
 
+def finish_whatsapp_message(message_id, success):
+    if not message_id:
+        return
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE processed_whatsapp_messages
+                SET status=%s, updated_at=NOW()
+                WHERE message_id=%s
+                """,
+                ("COMPLETED" if success else "FAILED", message_id)
+            )
+        conn.commit()
 
 def is_ai_paused(customer_number):
     with get_db() as conn:
@@ -392,6 +499,32 @@ def create_or_update_lead(
     return lead_id, existing is None
 
 
+def record_lead_notification(lead_id, status, error=None):
+    """Persist notification delivery state without storing API secrets."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO lead_notification_status
+                        (lead_id, status, attempts, last_error, updated_at)
+                    VALUES (%s, %s, 1, %s, NOW())
+                    ON CONFLICT (lead_id) DO UPDATE SET
+                        status=EXCLUDED.status,
+                        attempts=lead_notification_status.attempts + 1,
+                        last_error=EXCLUDED.last_error,
+                        updated_at=NOW()
+                    """,
+                    (lead_id, status, error)
+                )
+            conn.commit()
+    except Exception as tracking_error:
+        print(
+            f"Lead notification tracking error: {type(tracking_error).__name__}",
+            flush=True
+        )
+
+
 def send_new_lead_email(
     lead_id,
     customer_name,
@@ -405,6 +538,7 @@ def send_new_lead_email(
             "Lead email skipped: Brevo API settings are not fully configured.",
             flush=True
         )
+        record_lead_notification(lead_id, "FAILED", "Brevo configuration incomplete")
         return False
 
     display_name = customer_name or "Not provided"
@@ -454,23 +588,26 @@ Kupanga zofanana, mosiyana
         )
 
         if 200 <= response.status_code < 300:
+            record_lead_notification(lead_id, "SENT")
             print(
                 f"NEW LEAD EMAIL SENT: {lead_id}",
                 flush=True
             )
             return True
 
-        safe_error = response.text[:500]
+        error_label = f"Brevo HTTP {response.status_code}"
+        record_lead_notification(lead_id, "FAILED", error_label)
         print(
-            f"Lead email error for lead {lead_id}: "
-            f"Brevo HTTP {response.status_code} - {safe_error}",
+            f"Lead email error for lead {lead_id}: {error_label}",
             flush=True
         )
         return False
 
     except requests.RequestException as error:
+        error_label = type(error).__name__
+        record_lead_notification(lead_id, "FAILED", error_label)
         print(
-            f"Lead email error for lead {lead_id}: {error}",
+            f"Lead email error for lead {lead_id}: {error_label}",
             flush=True
         )
         return False
@@ -1054,9 +1191,20 @@ def receive_webhook():
         customer_message = message["text"]["body"]
         message_id = message.get("id", "")
 
-        if not claim_whatsapp_message(message_id, customer_number):
+        message_action, saved_reply = claim_whatsapp_message(
+            message_id, customer_number
+        )
+
+        if message_action == "IGNORE":
+            print("DUPLICATE WHATSAPP MESSAGE IGNORED", flush=True)
+            return "EVENT_RECEIVED", 200
+
+        if message_action == "RETRY_REPLY":
+            sent = send_whatsapp_message(customer_number, saved_reply)
+            finish_whatsapp_message(message_id, sent)
             print(
-                f"DUPLICATE WHATSAPP MESSAGE IGNORED: {message_id}",
+                "RETRIED SAVED WHATSAPP REPLY" if sent
+                else "SAVED WHATSAPP REPLY RETRY FAILED",
                 flush=True
             )
             return "EVENT_RECEIVED", 200
@@ -1078,6 +1226,7 @@ def receive_webhook():
             # Keep the customer's message in conversation history so the AI
             # has context when a human later resumes automation.
             save_message(customer_number, "user", customer_message)
+            finish_whatsapp_message(message_id, True)
             print("AI PAUSED FOR CUSTOMER — HUMAN TAKEOVER ACTIVE", flush=True)
             return "EVENT_RECEIVED", 200
 
@@ -1139,10 +1288,12 @@ def receive_webhook():
                     "assistance."
                 )
 
-        send_whatsapp_message(
+        store_pending_reply(message_id, reply)
+        sent = send_whatsapp_message(
             customer_number,
             reply
         )
+        finish_whatsapp_message(message_id, sent)
 
     except Exception as error:
 
@@ -1734,52 +1885,33 @@ Return ONLY the required JSON object.
 def send_whatsapp_message(recipient, message):
 
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        print(
-            "WhatsApp credentials not configured.",
-            flush=True
-        )
-        return
+        print("WhatsApp credentials not configured.", flush=True)
+        return False
 
-    url = (
-        f"https://graph.facebook.com/v25.0/"
-        f"{PHONE_NUMBER_ID}/messages"
-    )
-
+    url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json",
     }
-
     payload = {
         "messaging_product": "whatsapp",
         "to": recipient,
         "type": "text",
-        "text": {
-            "body": message
-        },
+        "text": {"body": message},
     }
 
     try:
-
         response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=8,
+            url, headers=headers, json=payload, timeout=8
         )
-
-        print(
-            f"WhatsApp send status: {response.status_code}",
-            flush=True
-        )
-
-
+        success = 200 <= response.status_code < 300
+        print(f"WhatsApp send status: {response.status_code}", flush=True)
+        if not success:
+            print("WhatsApp send failed with non-success HTTP status.", flush=True)
+        return success
     except requests.RequestException as error:
-
-        print(
-            f"WhatsApp send error: {error}",
-            flush=True
-        )
+        print(f"WhatsApp send error: {type(error).__name__}", flush=True)
+        return False
 
 
 # =========================================================
