@@ -134,6 +134,16 @@ def init_database():
                 )
             """)
 
+            # Human takeover state. When paused, incoming customer messages
+            # are stored for context but the AI does not reply.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ai_takeover_state (
+                    customer_number TEXT PRIMARY KEY,
+                    ai_paused BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
         conn.commit()
 
     print("DATABASE READY", flush=True)
@@ -204,6 +214,49 @@ def claim_whatsapp_message(message_id, customer_number):
         conn.commit()
 
     return claimed
+
+
+def is_ai_paused(customer_number):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ai_paused
+                FROM ai_takeover_state
+                WHERE customer_number = %s
+                """,
+                (customer_number,)
+            )
+            row = cur.fetchone()
+    return bool(row and row[0])
+
+
+def set_ai_paused(customer_number, paused):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ai_takeover_state (customer_number, ai_paused, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (customer_number)
+                DO UPDATE SET ai_paused = EXCLUDED.ai_paused, updated_at = NOW()
+                """,
+                (customer_number, bool(paused))
+            )
+        conn.commit()
+
+
+def get_paused_customers():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT customer_number
+                FROM ai_takeover_state
+                WHERE ai_paused = TRUE
+                """
+            )
+            return {row[0] for row in cur.fetchall()}
 
 
 def canonicalize_service(service):
@@ -859,7 +912,7 @@ DASHBOARD_TEMPLATE = """
 header{background:#101828;color:white;padding:16px 0;position:sticky;top:0;z-index:10}.header-inner,.container{max-width:980px;margin:auto;padding:0 16px}.header-inner{display:flex;justify-content:space-between;align-items:center;gap:12px}.brand{font-size:19px;font-weight:800}.tagline{font-size:12px;color:#d0d5dd;margin-top:3px}.logout{background:transparent;color:white;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:700}
 h1{margin:24px 0 4px;font-size:26px}.description{color:#667085;margin:0 0 18px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}.stat{background:white;padding:16px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.stat-number{font-size:26px;font-weight:800}.stat-label{color:#667085;font-size:13px;margin-top:3px}
 .tools{background:white;border-radius:12px;padding:12px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.search-row{display:flex;gap:8px}.search-row input{flex:1;min-width:0;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:15px}.search-row button{border:0;background:#101828;color:white;border-radius:9px;padding:0 16px;font-weight:700}.filters{display:flex;gap:7px;overflow-x:auto;padding-top:10px}.filter{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:20px;padding:7px 11px;font-size:13px;font-weight:700}.filter.active{background:#101828;color:white;border-color:#101828}.result-note{color:#667085;font-size:13px;margin:4px 2px 12px}
-.lead{background:white;border-radius:14px;margin-bottom:14px;padding:17px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.lead-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.customer{font-size:19px;font-weight:800}.number{margin-top:4px}.number a{color:#175cd3;text-decoration:none}.status{font-weight:800;font-size:11px;padding:7px 10px;border-radius:20px;background:#eef2f6;white-space:nowrap}.service{margin-top:12px;font-weight:800}.summary,.reason{margin-top:9px;line-height:1.5}.reason{color:#667085}.meta{margin-top:12px;color:#98a2b3;font-size:12px;line-height:1.5}.quick{display:block;text-align:center;text-decoration:none;background:#157347;color:white;border-radius:9px;padding:11px 12px;margin-top:15px;font-weight:800}.actions{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:8px}.actions form{margin:0}.actions button{width:100%;height:100%;border:1px solid #d0d5dd;background:white;border-radius:8px;padding:9px 6px;font-weight:700;font-size:12px}.empty{background:white;padding:28px;border-radius:12px;text-align:center;color:#667085}.clear{display:inline-block;margin-top:10px;color:#175cd3;text-decoration:none;font-weight:700}
+.lead{background:white;border-radius:14px;margin-bottom:14px;padding:17px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.lead-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.customer{font-size:19px;font-weight:800}.number{margin-top:4px}.number a{color:#175cd3;text-decoration:none}.status{font-weight:800;font-size:11px;padding:7px 10px;border-radius:20px;background:#eef2f6;white-space:nowrap}.service{margin-top:12px;font-weight:800}.summary,.reason{margin-top:9px;line-height:1.5}.reason{color:#667085}.meta{margin-top:12px;color:#98a2b3;font-size:12px;line-height:1.5}.quick{display:block;text-align:center;text-decoration:none;background:#157347;color:white;border-radius:9px;padding:11px 12px;margin-top:15px;font-weight:800}.takeover{margin-top:8px}.takeover button{width:100%;border:1px solid #d0d5dd;background:#fff;border-radius:9px;padding:11px 12px;font-weight:800}.takeover .resume{background:#101828;color:#fff;border-color:#101828}.ai-state{margin-top:8px;font-size:12px;font-weight:800;color:#667085}.actions{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:8px}.actions form{margin:0}.actions button{width:100%;height:100%;border:1px solid #d0d5dd;background:white;border-radius:8px;padding:9px 6px;font-weight:700;font-size:12px}.empty{background:white;padding:28px;border-radius:12px;text-align:center;color:#667085}.clear{display:inline-block;margin-top:10px;color:#175cd3;text-decoration:none;font-weight:700}
 @media(max-width:700px){.stats{grid-template-columns:repeat(2,1fr)}.lead-top{align-items:flex-start}.container{padding:0 12px}.header-inner{padding:0 12px}.search-row button{padding:0 12px}.actions{grid-template-columns:1fr 1fr 1fr}}
 </style>
 </head>
@@ -870,7 +923,7 @@ h1{margin:24px 0 4px;font-size:26px}.description{color:#667085;margin:0 0 18px}.
 <div class="stats"><div class="stat"><div class="stat-number">{{ counts.ALL }}</div><div class="stat-label">All Leads</div></div><div class="stat"><div class="stat-number">{{ counts.NEW }}</div><div class="stat-label">New</div></div><div class="stat"><div class="stat-number">{{ counts.CONTACTED }}</div><div class="stat-label">Contacted</div></div><div class="stat"><div class="stat-number">{{ counts.CLOSED }}</div><div class="stat-label">Closed</div></div></div>
 <div class="tools"><form class="search-row" method="GET" action="{{ url_for('admin_leads') }}"><input name="q" value="{{ search_query }}" placeholder="Search name, number, service or enquiry"><input type="hidden" name="status" value="{{ status_filter }}"><button type="submit">Search</button></form><div class="filters">{% for item in ['ALL','NEW','CONTACTED','CLOSED'] %}<a class="filter {% if status_filter == item %}active{% endif %}" href="{{ url_for('admin_leads', status=item, q=search_query) }}">{{ item.title() }}</a>{% endfor %}</div></div>
 <div class="result-note">Showing {{ leads|length }} lead{% if leads|length != 1 %}s{% endif %}{% if search_query %} matching “{{ search_query }}”{% endif %}.</div>
-{% if leads %}{% for lead in leads %}<div class="lead"><div class="lead-top"><div><div class="customer">{{ lead.customer_name or 'WhatsApp Customer' }}</div><div class="number"><a href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">+{{ lead.customer_number }}</a></div></div><div class="status">{{ lead.status }}</div></div><div class="service">{{ lead.service or 'General Enquiry' }}</div><div class="summary">{{ lead.summary or 'No summary available.' }}</div>{% if lead.handover_reason %}<div class="reason"><strong>Human follow-up:</strong> {{ lead.handover_reason }}</div>{% endif %}<div class="meta">Created: {{ lead.created_at.strftime('%d %b %Y %H:%M') }} &nbsp;|&nbsp; Updated: {{ lead.updated_at.strftime('%d %b %Y %H:%M') }}</div><a class="quick" href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a><div class="actions">{% for target,label in [('NEW','Mark New'),('CONTACTED','Contacted'),('CLOSED','Close Lead')] %}{% if lead.status != target %}<form method="POST" action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ target }}"><button type="submit">{{ label }}</button></form>{% else %}<button type="button" disabled>{{ label }}</button>{% endif %}{% endfor %}</div></div>{% endfor %}{% else %}<div class="empty">No leads match this view.<br><a class="clear" href="{{ url_for('admin_leads') }}">Clear search and filters</a></div>{% endif %}
+{% if leads %}{% for lead in leads %}<div class="lead"><div class="lead-top"><div><div class="customer">{{ lead.customer_name or 'WhatsApp Customer' }}</div><div class="number"><a href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">+{{ lead.customer_number }}</a></div></div><div class="status">{{ lead.status }}</div></div><div class="service">{{ lead.service or 'General Enquiry' }}</div><div class="summary">{{ lead.summary or 'No summary available.' }}</div>{% if lead.handover_reason %}<div class="reason"><strong>Human follow-up:</strong> {{ lead.handover_reason }}</div>{% endif %}<div class="meta">Created: {{ lead.created_at.strftime('%d %b %Y %H:%M') }} &nbsp;|&nbsp; Updated: {{ lead.updated_at.strftime('%d %b %Y %H:%M') }}</div><a class="quick" href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a><div class="ai-state">AI: {% if lead.ai_paused %}PAUSED — human takeover active{% else %}ACTIVE{% endif %}</div><form class="takeover" method="POST" action="{{ url_for('admin_ai_takeover', customer_number=lead.customer_number) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="paused" value="{% if lead.ai_paused %}0{% else %}1{% endif %}"><button class="{% if lead.ai_paused %}resume{% endif %}" type="submit">{% if lead.ai_paused %}Resume AI Assistant{% else %}Pause AI — Human Takeover{% endif %}</button></form><div class="actions">{% for target,label in [('NEW','Mark New'),('CONTACTED','Contacted'),('CLOSED','Close Lead')] %}{% if lead.status != target %}<form method="POST" action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ target }}"><button type="submit">{{ label }}</button></form>{% else %}<button type="button" disabled>{{ label }}</button>{% endif %}{% endfor %}</div></div>{% endfor %}{% else %}<div class="empty">No leads match this view.<br><a class="clear" href="{{ url_for('admin_leads') }}">Clear search and filters</a></div>{% endif %}
 </div></body></html>
 """
 
@@ -886,6 +939,10 @@ def admin_leads():
             "service": row[3], "summary": row[4], "handover_reason": row[5],
             "status": row[6], "created_at": row[7], "updated_at": row[8]
         })
+
+    paused_customers = get_paused_customers()
+    for lead in leads:
+        lead["ai_paused"] = lead["customer_number"] in paused_customers
 
     status_filter = request.args.get("status", "ALL").strip().upper()
     if status_filter not in {"ALL", "NEW", "CONTACTED", "CLOSED"}:
@@ -912,6 +969,17 @@ def admin_leads():
         status_filter=status_filter,
         search_query=search_query
     )
+
+@app.route("/admin/customers/<customer_number>/ai", methods=["POST"])
+@admin_required
+def admin_ai_takeover(customer_number):
+    validate_csrf()
+    paused = request.form.get("paused", "")
+    if paused not in {"0", "1"}:
+        abort(400)
+    set_ai_paused(customer_number, paused == "1")
+    return redirect(url_for("admin_leads"))
+
 
 @app.route(
     "/admin/leads/<int:lead_id>/status",
@@ -1005,6 +1073,13 @@ def receive_webhook():
             )
 
         print("TEXT MESSAGE ACCEPTED", flush=True)
+
+        if is_ai_paused(customer_number):
+            # Keep the customer's message in conversation history so the AI
+            # has context when a human later resumes automation.
+            save_message(customer_number, "user", customer_message)
+            print("AI PAUSED FOR CUSTOMER — HUMAN TAKEOVER ACTIVE", flush=True)
+            return "EVENT_RECEIVED", 200
 
         result = generate_ai_reply(
             customer_number,
