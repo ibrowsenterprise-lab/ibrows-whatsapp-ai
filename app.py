@@ -68,6 +68,15 @@ client = OpenAI(
 
 
 # =========================================================
+# PRIVACY RETENTION
+# =========================================================
+CONVERSATION_RETENTION_DAYS = 90
+WHATSAPP_RETRY_RETENTION_DAYS = 30
+LEAD_RETENTION_DAYS = 365
+PRIVACY_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+_last_privacy_cleanup = 0.0
+
+# =========================================================
 # DATABASE
 # =========================================================
 
@@ -178,6 +187,44 @@ def init_database():
         conn.commit()
 
     print("DATABASE READY", flush=True)
+
+
+
+def cleanup_expired_data(force=False):
+    global _last_privacy_cleanup
+    now = time.monotonic()
+    if not force and now - _last_privacy_cleanup < PRIVACY_CLEANUP_INTERVAL_SECONDS:
+        return
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM conversations WHERE created_at < NOW() - (%s * INTERVAL '1 day')",
+                            (CONVERSATION_RETENTION_DAYS,))
+                cur.execute("DELETE FROM processed_whatsapp_messages WHERE updated_at < NOW() - (%s * INTERVAL '1 day')",
+                            (WHATSAPP_RETRY_RETENTION_DAYS,))
+                cur.execute("DELETE FROM leads WHERE updated_at < NOW() - (%s * INTERVAL '1 day')",
+                            (LEAD_RETENTION_DAYS,))
+                cur.execute("""
+                    DELETE FROM ai_takeover_state a
+                    WHERE NOT EXISTS (SELECT 1 FROM leads l WHERE l.customer_number=a.customer_number)
+                      AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.customer_number=a.customer_number)
+                """)
+            conn.commit()
+        _last_privacy_cleanup = now
+        print("PRIVACY RETENTION CLEANUP COMPLETED", flush=True)
+    except Exception as error:
+        print(f"Privacy cleanup error: {type(error).__name__}", flush=True)
+
+
+def delete_customer_data(customer_number):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM conversations WHERE customer_number=%s", (customer_number,))
+            cur.execute("DELETE FROM processed_whatsapp_messages WHERE customer_number=%s", (customer_number,))
+            cur.execute("DELETE FROM leads WHERE customer_number=%s", (customer_number,))
+            cur.execute("DELETE FROM ai_takeover_state WHERE customer_number=%s", (customer_number,))
+        conn.commit()
+    print("CUSTOMER DATA DELETION COMPLETED", flush=True)
 
 
 def save_message(customer_number, role, content):
@@ -710,7 +757,7 @@ def health():
         }, 200
 
     except Exception as error:
-        print(f"Health check error: {error}", flush=True)
+        print(f"Health check error: {type(error).__name__}", flush=True)
 
         return {
             "status": "error",
@@ -1049,7 +1096,7 @@ DASHBOARD_TEMPLATE = """
 header{background:#101828;color:white;padding:16px 0;position:sticky;top:0;z-index:10}.header-inner,.container{max-width:980px;margin:auto;padding:0 16px}.header-inner{display:flex;justify-content:space-between;align-items:center;gap:12px}.brand{font-size:19px;font-weight:800}.tagline{font-size:12px;color:#d0d5dd;margin-top:3px}.logout{background:transparent;color:white;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:700}
 h1{margin:24px 0 4px;font-size:26px}.description{color:#667085;margin:0 0 18px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}.stat{background:white;padding:16px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.stat-number{font-size:26px;font-weight:800}.stat-label{color:#667085;font-size:13px;margin-top:3px}
 .tools{background:white;border-radius:12px;padding:12px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.search-row{display:flex;gap:8px}.search-row input{flex:1;min-width:0;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:15px}.search-row button{border:0;background:#101828;color:white;border-radius:9px;padding:0 16px;font-weight:700}.filters{display:flex;gap:7px;overflow-x:auto;padding-top:10px}.filter{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:20px;padding:7px 11px;font-size:13px;font-weight:700}.filter.active{background:#101828;color:white;border-color:#101828}.result-note{color:#667085;font-size:13px;margin:4px 2px 12px}
-.lead{background:white;border-radius:14px;margin-bottom:14px;padding:17px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.lead-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.customer{font-size:19px;font-weight:800}.number{margin-top:4px}.number a{color:#175cd3;text-decoration:none}.status{font-weight:800;font-size:11px;padding:7px 10px;border-radius:20px;background:#eef2f6;white-space:nowrap}.service{margin-top:12px;font-weight:800}.summary,.reason{margin-top:9px;line-height:1.5}.reason{color:#667085}.meta{margin-top:12px;color:#98a2b3;font-size:12px;line-height:1.5}.quick{display:block;text-align:center;text-decoration:none;background:#157347;color:white;border-radius:9px;padding:11px 12px;margin-top:15px;font-weight:800}.takeover{margin-top:8px}.takeover button{width:100%;border:1px solid #d0d5dd;background:#fff;border-radius:9px;padding:11px 12px;font-weight:800}.takeover .resume{background:#101828;color:#fff;border-color:#101828}.ai-state{margin-top:8px;font-size:12px;font-weight:800;color:#667085}.actions{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:8px}.actions form{margin:0}.actions button{width:100%;height:100%;border:1px solid #d0d5dd;background:white;border-radius:8px;padding:9px 6px;font-weight:700;font-size:12px}.empty{background:white;padding:28px;border-radius:12px;text-align:center;color:#667085}.clear{display:inline-block;margin-top:10px;color:#175cd3;text-decoration:none;font-weight:700}
+.lead{background:white;border-radius:14px;margin-bottom:14px;padding:17px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.lead-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.customer{font-size:19px;font-weight:800}.number{margin-top:4px}.number a{color:#175cd3;text-decoration:none}.status{font-weight:800;font-size:11px;padding:7px 10px;border-radius:20px;background:#eef2f6;white-space:nowrap}.service{margin-top:12px;font-weight:800}.summary,.reason{margin-top:9px;line-height:1.5}.reason{color:#667085}.meta{margin-top:12px;color:#98a2b3;font-size:12px;line-height:1.5}.quick{display:block;text-align:center;text-decoration:none;background:#157347;color:white;border-radius:9px;padding:11px 12px;margin-top:15px;font-weight:800}.privacy-link{display:block;text-align:center;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:9px;padding:10px 12px;margin-top:8px;font-weight:700;font-size:13px}.takeover{margin-top:8px}.takeover button{width:100%;border:1px solid #d0d5dd;background:#fff;border-radius:9px;padding:11px 12px;font-weight:800}.takeover .resume{background:#101828;color:#fff;border-color:#101828}.ai-state{margin-top:8px;font-size:12px;font-weight:800;color:#667085}.actions{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:8px}.actions form{margin:0}.actions button{width:100%;height:100%;border:1px solid #d0d5dd;background:white;border-radius:8px;padding:9px 6px;font-weight:700;font-size:12px}.empty{background:white;padding:28px;border-radius:12px;text-align:center;color:#667085}.clear{display:inline-block;margin-top:10px;color:#175cd3;text-decoration:none;font-weight:700}
 @media(max-width:700px){.stats{grid-template-columns:repeat(2,1fr)}.lead-top{align-items:flex-start}.container{padding:0 12px}.header-inner{padding:0 12px}.search-row button{padding:0 12px}.actions{grid-template-columns:1fr 1fr 1fr}}
 </style>
 </head>
@@ -1060,7 +1107,7 @@ h1{margin:24px 0 4px;font-size:26px}.description{color:#667085;margin:0 0 18px}.
 <div class="stats"><div class="stat"><div class="stat-number">{{ counts.ALL }}</div><div class="stat-label">All Leads</div></div><div class="stat"><div class="stat-number">{{ counts.NEW }}</div><div class="stat-label">New</div></div><div class="stat"><div class="stat-number">{{ counts.CONTACTED }}</div><div class="stat-label">Contacted</div></div><div class="stat"><div class="stat-number">{{ counts.CLOSED }}</div><div class="stat-label">Closed</div></div></div>
 <div class="tools"><form class="search-row" method="GET" action="{{ url_for('admin_leads') }}"><input name="q" value="{{ search_query }}" placeholder="Search name, number, service or enquiry"><input type="hidden" name="status" value="{{ status_filter }}"><button type="submit">Search</button></form><div class="filters">{% for item in ['ALL','NEW','CONTACTED','CLOSED'] %}<a class="filter {% if status_filter == item %}active{% endif %}" href="{{ url_for('admin_leads', status=item, q=search_query) }}">{{ item.title() }}</a>{% endfor %}</div></div>
 <div class="result-note">Showing {{ leads|length }} lead{% if leads|length != 1 %}s{% endif %}{% if search_query %} matching “{{ search_query }}”{% endif %}.</div>
-{% if leads %}{% for lead in leads %}<div class="lead"><div class="lead-top"><div><div class="customer">{{ lead.customer_name or 'WhatsApp Customer' }}</div><div class="number"><a href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">+{{ lead.customer_number }}</a></div></div><div class="status">{{ lead.status }}</div></div><div class="service">{{ lead.service or 'General Enquiry' }}</div><div class="summary">{{ lead.summary or 'No summary available.' }}</div>{% if lead.handover_reason %}<div class="reason"><strong>Human follow-up:</strong> {{ lead.handover_reason }}</div>{% endif %}<div class="meta">Created: {{ lead.created_at.strftime('%d %b %Y %H:%M') }} &nbsp;|&nbsp; Updated: {{ lead.updated_at.strftime('%d %b %Y %H:%M') }}</div><a class="quick" href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a><div class="ai-state">AI: {% if lead.ai_paused %}PAUSED — human takeover active{% else %}ACTIVE{% endif %}</div><form class="takeover" method="POST" action="{{ url_for('admin_ai_takeover', customer_number=lead.customer_number) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="paused" value="{% if lead.ai_paused %}0{% else %}1{% endif %}"><button class="{% if lead.ai_paused %}resume{% endif %}" type="submit">{% if lead.ai_paused %}Resume AI Assistant{% else %}Pause AI — Human Takeover{% endif %}</button></form><div class="actions">{% for target,label in [('NEW','Mark New'),('CONTACTED','Contacted'),('CLOSED','Close Lead')] %}{% if lead.status != target %}<form method="POST" action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ target }}"><button type="submit">{{ label }}</button></form>{% else %}<button type="button" disabled>{{ label }}</button>{% endif %}{% endfor %}</div></div>{% endfor %}{% else %}<div class="empty">No leads match this view.<br><a class="clear" href="{{ url_for('admin_leads') }}">Clear search and filters</a></div>{% endif %}
+{% if leads %}{% for lead in leads %}<div class="lead"><div class="lead-top"><div><div class="customer">{{ lead.customer_name or 'WhatsApp Customer' }}</div><div class="number"><a href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">+{{ lead.customer_number }}</a></div></div><div class="status">{{ lead.status }}</div></div><div class="service">{{ lead.service or 'General Enquiry' }}</div><div class="summary">{{ lead.summary or 'No summary available.' }}</div>{% if lead.handover_reason %}<div class="reason"><strong>Human follow-up:</strong> {{ lead.handover_reason }}</div>{% endif %}<div class="meta">Created: {{ lead.created_at.strftime('%d %b %Y %H:%M') }} &nbsp;|&nbsp; Updated: {{ lead.updated_at.strftime('%d %b %Y %H:%M') }}</div><a class="quick" href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a><a class="privacy-link" href="{{ url_for('admin_customer_privacy', customer_number=lead.customer_number) }}">Customer Data & Privacy</a><div class="ai-state">AI: {% if lead.ai_paused %}PAUSED — human takeover active{% else %}ACTIVE{% endif %}</div><form class="takeover" method="POST" action="{{ url_for('admin_ai_takeover', customer_number=lead.customer_number) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="paused" value="{% if lead.ai_paused %}0{% else %}1{% endif %}"><button class="{% if lead.ai_paused %}resume{% endif %}" type="submit">{% if lead.ai_paused %}Resume AI Assistant{% else %}Pause AI — Human Takeover{% endif %}</button></form><div class="actions">{% for target,label in [('NEW','Mark New'),('CONTACTED','Contacted'),('CLOSED','Close Lead')] %}{% if lead.status != target %}<form method="POST" action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ target }}"><button type="submit">{{ label }}</button></form>{% else %}<button type="button" disabled>{{ label }}</button>{% endif %}{% endfor %}</div></div>{% endfor %}{% else %}<div class="empty">No leads match this view.<br><a class="clear" href="{{ url_for('admin_leads') }}">Clear search and filters</a></div>{% endif %}
 </div></body></html>
 """
 
@@ -1118,6 +1165,39 @@ def admin_ai_takeover(customer_number):
     return redirect(url_for("admin_leads"))
 
 
+
+CUSTOMER_PRIVACY_TEMPLATE = """
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IBROWS Customer Data</title>
+<style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif}.wrap{max-width:620px;margin:auto;padding:24px 16px}.card{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06)}.warning{background:#fff4ed;border-radius:10px;padding:13px;margin:16px 0;line-height:1.5}label{display:block;font-weight:700;margin:16px 0 7px}input{width:100%;padding:12px;border:1px solid #d0d5dd;border-radius:9px;font-size:16px}button{width:100%;padding:12px;border:0;border-radius:9px;background:#b42318;color:white;font-weight:800;margin-top:12px}.back{display:block;text-align:center;margin-top:14px;color:#175cd3;text-decoration:none;font-weight:700}.small{color:#667085;font-size:13px;line-height:1.5}</style>
+</head><body><div class="wrap"><div class="card">
+<h1>Customer Data & Privacy</h1><p><strong>+{{ customer_number }}</strong></p>
+<p class="small">Use this only after IBROWS has reasonably verified that the customer is requesting deletion.</p>
+<div class="warning"><strong>Permanent action:</strong> deletes this customer's conversations, leads, retry records, linked lead-notification records and AI takeover state. It cannot be undone from the dashboard.</div>
+<form method="POST"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label>Type DELETE to confirm</label><input name="confirmation" autocomplete="off" required>
+<button type="submit">Permanently Delete Customer Data</button></form>
+<a class="back" href="{{ url_for('admin_leads') }}">Cancel</a>
+</div></div></body></html>
+"""
+
+@app.route("/admin/customers/<customer_number>/privacy", methods=["GET", "POST"])
+@admin_required
+def admin_customer_privacy(customer_number):
+    if not customer_number.isdigit() or len(customer_number) > 20:
+        abort(400)
+    if request.method == "POST":
+        validate_csrf()
+        if request.form.get("confirmation", "").strip() != "DELETE":
+            return render_template_string(CUSTOMER_PRIVACY_TEMPLATE,
+                customer_number=customer_number, csrf_token=get_csrf_token()), 400
+        delete_customer_data(customer_number)
+        return redirect(url_for("admin_leads"))
+    return render_template_string(CUSTOMER_PRIVACY_TEMPLATE,
+        customer_number=customer_number, csrf_token=get_csrf_token())
+
+
 @app.route(
     "/admin/leads/<int:lead_id>/status",
     methods=["POST"]
@@ -1172,6 +1252,7 @@ def receive_webhook():
     data = request.get_json(silent=True)
 
     print("INCOMING WHATSAPP WEBHOOK", flush=True)
+    cleanup_expired_data()
 
     try:
 
@@ -1920,72 +2001,18 @@ def send_whatsapp_message(recipient, message):
 
 @app.route("/privacy", methods=["GET"])
 def privacy_policy():
-
     return """
-    <html>
-    <head>
-        <title>
-        IBROWS AI Business Assistant - Privacy Policy
-        </title>
-    </head>
-
-    <body>
-
-        <h1>Privacy Policy</h1>
-
-        <p>
-        <strong>IBROWS AI Business Assistant</strong>
-        </p>
-
-        <p>
-        IBROWS Enterprise uses this WhatsApp Business service
-        to communicate with customers, respond to enquiries,
-        and provide information about our services.
-        </p>
-
-        <p>
-        When you communicate with us through WhatsApp, we may
-        process information you provide voluntarily, including
-        your WhatsApp phone number, profile information made
-        available by WhatsApp, and the contents of messages
-        you send to us.
-        </p>
-
-        <p>
-        This information may be used to respond to enquiries,
-        provide requested services, maintain conversation
-        context, improve customer support, and manage
-        legitimate business enquiries.
-        </p>
-
-        <p>
-        Some responses may be generated or assisted by
-        artificial intelligence.
-        </p>
-
-        <p>
-        Customers should not send passwords, banking PINs,
-        OTP codes, or other highly sensitive information
-        through the assistant.
-        </p>
-
-        <p>
-        We do not sell customer personal information.
-        </p>
-
-        <p>
-        Customers may request access to or deletion of
-        information associated with their interactions with
-        IBROWS Enterprise by contacting:
-        ibrowsenterprise@gmail.com
-        </p>
-
-        <p>
-        Last updated: 21 September 2026.
-        </p>
-
-    </body>
-    </html>
+    <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>IBROWS Privacy Policy</title></head>
+    <body style="font-family:Arial,sans-serif;max-width:760px;margin:auto;padding:24px;line-height:1.6">
+    <h1>Privacy Policy</h1><p><strong>IBROWS AI Business Assistant</strong></p>
+    <p>IBROWS Enterprise uses WhatsApp to respond to customer enquiries and provide information about its services. Some responses are generated or assisted by artificial intelligence.</p>
+    <h2>Information we process</h2><p>We may process your WhatsApp number, WhatsApp profile name made available to us, message content, enquiry details and information needed to follow up your request.</p>
+    <h2>Why we use it</h2><p>We use this information to respond to enquiries, maintain recent conversation context, manage business leads, support human follow-up, prevent duplicate message processing, and operate and secure the service.</p>
+    <h2>Service providers</h2><p>WhatsApp/Meta carries the messages. OpenAI may process relevant conversation content to generate AI-assisted responses. Brevo is used to send qualified-lead notifications to IBROWS management. Hosting and database providers process data as necessary to operate the service.</p>
+    <h2>Retention</h2><p>Ordinary conversation history is retained for up to 90 days. Technical WhatsApp retry records are retained for up to 30 days. Inactive business leads are retained for up to 12 months, unless longer retention is reasonably required for legal, accounting, dispute-resolution, or other legitimate obligations.</p>
+    <h2>Safety</h2><p>Do not send passwords, banking PINs, OTP/security codes or full payment-card credentials through the assistant. IBROWS does not sell customer personal information.</p>
+    <h2>Your data</h2><p>You may request access to, correction of, or deletion of information associated with your interactions by contacting <strong>ibrowsenterprise@gmail.com</strong>. We may request reasonable information to verify the request before acting on it.</p>
+    <p><strong>Last updated: 22 September 2026.</strong></p></body></html>
     """, 200
 
 
@@ -1995,40 +2022,15 @@ def privacy_policy():
 
 @app.route("/data-deletion", methods=["GET"])
 def data_deletion():
-
     return """
-    <html>
-
-    <head>
-        <title>IBROWS - Data Deletion</title>
-    </head>
-
-    <body>
-
-        <h1>User Data Deletion</h1>
-
-        <p>
-        You may request deletion of personal information
-        associated with your interactions with the IBROWS
-        AI Business Assistant.
-        </p>
-
-        <p>
-        Send your request to
-        <strong>ibrowsenterprise@gmail.com</strong>
-        and state that you are requesting deletion of your
-        IBROWS WhatsApp Assistant data.
-        </p>
-
-        <p>
-        We may ask for reasonable information necessary to
-        identify the relevant records before completing the
-        request.
-        </p>
-
-    </body>
-
-    </html>
+    <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>IBROWS Data Deletion</title></head>
+    <body style="font-family:Arial,sans-serif;max-width:760px;margin:auto;padding:24px;line-height:1.6">
+    <h1>User Data Deletion</h1>
+    <p>You may request deletion of personal information associated with your interactions with the IBROWS AI Business Assistant.</p>
+    <p>Email <strong>ibrowsenterprise@gmail.com</strong> and state that you are requesting deletion of your IBROWS WhatsApp Assistant data. Include the WhatsApp number concerned, but never send passwords, PINs, OTPs or payment-card credentials.</p>
+    <p>IBROWS may request reasonable information to verify the request. After verification, applicable assistant records can be deleted. Information that must be retained for a legal, accounting, dispute-resolution, or other legitimate obligation may be retained only as necessary.</p>
+    <p>Standard retention: conversations up to 90 days; technical retry records up to 30 days; inactive business leads up to 12 months.</p>
+    </body></html>
     """, 200
 
 
@@ -2038,11 +2040,12 @@ def data_deletion():
 
 try:
     init_database()
+    cleanup_expired_data(force=True)
 
 except Exception as error:
 
     print(
-        f"DATABASE INITIALIZATION ERROR: {error}",
+        f"DATABASE INITIALIZATION ERROR: {type(error).__name__}",
         flush=True
     )
 
