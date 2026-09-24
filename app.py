@@ -1246,7 +1246,7 @@ h1{margin:24px 0 4px;font-size:26px}.description{color:#667085;margin:0 0 18px}.
 <div class="stats"><div class="stat"><div class="stat-number">{{ counts.ALL }}</div><div class="stat-label">All Leads</div></div><div class="stat"><div class="stat-number">{{ counts.NEW }}</div><div class="stat-label">New</div></div><div class="stat"><div class="stat-number">{{ counts.CONTACTED }}</div><div class="stat-label">Contacted</div></div><div class="stat"><div class="stat-number">{{ counts.CLOSED }}</div><div class="stat-label">Closed</div></div></div>
 <div class="tools"><form class="search-row" method="GET" action="{{ url_for('admin_leads') }}"><input name="q" value="{{ search_query }}" placeholder="Search name, number, service or enquiry"><input type="hidden" name="status" value="{{ status_filter }}"><button type="submit">Search</button></form><div class="filters">{% for item in ['ALL','NEW','CONTACTED','CLOSED'] %}<a class="filter {% if status_filter == item %}active{% endif %}" href="{{ url_for('admin_leads', status=item, q=search_query) }}">{{ item.title() }}</a>{% endfor %}</div></div>
 <div class="result-note">Showing {{ leads|length }} lead{% if leads|length != 1 %}s{% endif %}{% if search_query %} matching “{{ search_query }}”{% endif %}.</div>
-{% if leads %}{% for lead in leads %}<div class="lead"><div class="lead-top"><div><div class="customer">{{ lead.customer_name or 'WhatsApp Customer' }}</div><div class="number"><a href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">+{{ lead.customer_number }}</a></div></div><div class="status">{{ lead.status }}</div></div><div class="service">{{ lead.service or 'General Enquiry' }}</div><div class="summary">{{ lead.summary or 'No summary available.' }}</div>{% if lead.handover_reason %}<div class="reason"><strong>Human follow-up:</strong> {{ lead.handover_reason }}</div>{% endif %}<div class="meta">Created: {{ lead.created_at.strftime('%d %b %Y %H:%M') }} &nbsp;|&nbsp; Updated: {{ lead.updated_at.strftime('%d %b %Y %H:%M') }}</div><a class="quick" href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a><a class="privacy-link" href="{{ url_for('admin_customer_privacy', customer_number=lead.customer_number) }}">Customer Data & Privacy</a><a class="privacy-link" href="{{ url_for('admin_redaction_test', customer_number=lead.customer_number) }}">Temporary Redaction Test</a><div class="ai-state">AI: {% if lead.ai_paused %}PAUSED — human takeover active{% else %}ACTIVE{% endif %}</div><form class="takeover" method="POST" action="{{ url_for('admin_ai_takeover', customer_number=lead.customer_number) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="paused" value="{% if lead.ai_paused %}0{% else %}1{% endif %}"><button class="{% if lead.ai_paused %}resume{% endif %}" type="submit">{% if lead.ai_paused %}Resume AI Assistant{% else %}Pause AI — Human Takeover{% endif %}</button></form><div class="actions">{% for target,label in [('NEW','Mark New'),('CONTACTED','Contacted'),('CLOSED','Close Lead')] %}{% if lead.status != target %}<form method="POST" action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ target }}"><button type="submit">{{ label }}</button></form>{% else %}<button type="button" disabled>{{ label }}</button>{% endif %}{% endfor %}</div></div>{% endfor %}{% else %}<div class="empty">No leads match this view.<br><a class="clear" href="{{ url_for('admin_leads') }}">Clear search and filters</a></div>{% endif %}
+{% if leads %}{% for lead in leads %}<div class="lead"><div class="lead-top"><div><div class="customer">{{ lead.customer_name or 'WhatsApp Customer' }}</div><div class="number"><a href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">+{{ lead.customer_number }}</a></div></div><div class="status">{{ lead.status }}</div></div><div class="service">{{ lead.service or 'General Enquiry' }}</div><div class="summary">{{ lead.summary or 'No summary available.' }}</div>{% if lead.handover_reason %}<div class="reason"><strong>Human follow-up:</strong> {{ lead.handover_reason }}</div>{% endif %}<div class="meta">Created: {{ lead.created_at.strftime('%d %b %Y %H:%M') }} &nbsp;|&nbsp; Updated: {{ lead.updated_at.strftime('%d %b %Y %H:%M') }}</div><a class="quick" href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a><a class="privacy-link" href="{{ url_for('admin_customer_privacy', customer_number=lead.customer_number) }}">Customer Data & Privacy</a><div class="ai-state">AI: {% if lead.ai_paused %}PAUSED — human takeover active{% else %}ACTIVE{% endif %}</div><form class="takeover" method="POST" action="{{ url_for('admin_ai_takeover', customer_number=lead.customer_number) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="paused" value="{% if lead.ai_paused %}0{% else %}1{% endif %}"><button class="{% if lead.ai_paused %}resume{% endif %}" type="submit">{% if lead.ai_paused %}Resume AI Assistant{% else %}Pause AI — Human Takeover{% endif %}</button></form><div class="actions">{% for target,label in [('NEW','Mark New'),('CONTACTED','Contacted'),('CLOSED','Close Lead')] %}{% if lead.status != target %}<form method="POST" action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ target }}"><button type="submit">{{ label }}</button></form>{% else %}<button type="button" disabled>{{ label }}</button>{% endif %}{% endfor %}</div></div>{% endfor %}{% else %}<div class="empty">No leads match this view.<br><a class="clear" href="{{ url_for('admin_leads') }}">Clear search and filters</a></div>{% endif %}
 </div></body></html>
 """
 
@@ -1291,85 +1291,6 @@ def admin_leads():
         csrf_token=get_csrf_token(),
         status_filter=status_filter,
         search_query=search_query
-    )
-
-
-def get_recent_customer_messages(customer_number, limit=10):
-    safe_limit = max(1, min(int(limit), 20))
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT role, content, created_at
-                FROM conversations
-                WHERE customer_number = %s
-                ORDER BY id DESC
-                LIMIT %s
-                """,
-                (customer_number, safe_limit)
-            )
-            return cur.fetchall()
-
-
-REDACTION_DIAGNOSTIC_TEMPLATE = """
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IBROWS Redaction Diagnostic</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif}
-.wrap{max-width:760px;margin:auto;padding:24px 16px}
-.card{background:#fff;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
-h1{font-size:22px;margin-top:0}
-.notice{background:#fffaeb;border:1px solid #fedf89;border-radius:10px;padding:12px;line-height:1.5;margin:14px 0}
-.message{border:1px solid #eaecf0;border-radius:10px;padding:12px;margin:10px 0}
-.role{font-size:12px;font-weight:800;text-transform:uppercase;color:#475467}
-.content{white-space:pre-wrap;word-break:break-word;margin-top:7px}
-.time{font-size:12px;color:#667085;margin-top:8px}
-.back{display:inline-block;margin-top:14px;color:#175cd3;text-decoration:none;font-weight:700}
-</style>
-</head>
-<body><div class="wrap"><div class="card">
-<h1>Temporary Redaction Diagnostic</h1>
-<p><strong>Customer:</strong> +{{ customer_number }}</p>
-<div class="notice">
-Admin-only, read-only diagnostic. It shows the latest stored conversation records so IBROWS can verify that sensitive credentials were redacted before database storage. Remove this diagnostic after testing.
-</div>
-{% if messages %}
-  {% for message in messages %}
-    <div class="message">
-      <div class="role">{{ message.role }}</div>
-      <div class="content">{{ message.content }}</div>
-      <div class="time">{{ message.created_at.strftime('%d %b %Y %H:%M:%S') if message.created_at else '' }}</div>
-    </div>
-  {% endfor %}
-{% else %}
-  <p>No stored conversation records found for this customer.</p>
-{% endif %}
-<a class="back" href="{{ url_for('admin_leads') }}">← Back to Lead Dashboard</a>
-</div></div></body></html>
-"""
-
-
-@app.route("/admin/customers/<customer_number>/redaction-test", methods=["GET"])
-@admin_required
-def admin_redaction_test(customer_number):
-    if not customer_number.isdigit() or len(customer_number) > 20:
-        abort(400)
-
-    rows = get_recent_customer_messages(customer_number, limit=10)
-    messages = [
-        {"role": row[0], "content": row[1], "created_at": row[2]}
-        for row in rows
-    ]
-
-    return render_template_string(
-        REDACTION_DIAGNOSTIC_TEMPLATE,
-        customer_number=customer_number,
-        messages=messages
     )
 
 
