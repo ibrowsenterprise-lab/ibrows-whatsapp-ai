@@ -175,26 +175,6 @@ def init_database():
                 )
             """)
 
-            # Persistent service-health incidents for admin monitoring.
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS system_incidents (
-                    incident_key TEXT PRIMARY KEY,
-                    component TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'OPEN',
-                    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    occurrence_count INTEGER NOT NULL DEFAULT 1,
-                    last_error_class TEXT,
-                    alert_sent_at TIMESTAMPTZ,
-                    recovered_at TIMESTAMPTZ
-                )
-            """)
-
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_system_incidents_status
-                ON system_incidents(status, last_seen DESC)
-            """)
-
             # Human takeover state. When paused, incoming customer messages
             # are stored for context but the AI does not reply.
             cur.execute("""
@@ -631,7 +611,7 @@ def create_or_update_lead(
                 SELECT id
                 FROM leads
                 WHERE customer_number = %s
-                  AND status = 'NEW'
+                  AND status IN ('NEW', 'CONTACTED')
                   AND LOWER(COALESCE(service, '')) = LOWER(%s)
                 ORDER BY created_at DESC
                 LIMIT 1
@@ -731,107 +711,6 @@ def record_lead_notification(lead_id, status, error=None):
         )
 
 
-
-MONITORED_COMPONENTS = {"OpenAI", "WhatsApp", "Brevo"}
-
-def record_system_failure(component, error_class):
-    if component not in MONITORED_COMPONENTS:
-        return False
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO system_incidents
-                    (incident_key, component, status, first_seen, last_seen,
-                     occurrence_count, last_error_class, alert_sent_at, recovered_at)
-                    VALUES (%s,%s,'OPEN',NOW(),NOW(),1,%s,NULL,NULL)
-                    ON CONFLICT (incident_key) DO UPDATE SET
-                      status='OPEN', last_seen=NOW(),
-                      occurrence_count=CASE WHEN system_incidents.status='OPEN'
-                        THEN system_incidents.occurrence_count+1 ELSE 1 END,
-                      first_seen=CASE WHEN system_incidents.status='OPEN'
-                        THEN system_incidents.first_seen ELSE NOW() END,
-                      last_error_class=EXCLUDED.last_error_class,
-                      alert_sent_at=CASE WHEN system_incidents.status='OPEN'
-                        THEN system_incidents.alert_sent_at ELSE NULL END,
-                      recovered_at=NULL
-                """,(component.lower(),component,str(error_class)[:120]))
-            conn.commit()
-        return True
-    except Exception as exc:
-        print(f"MONITORING RECORD FAILURE: {type(exc).__name__}",flush=True)
-        return False
-
-def mark_system_recovered(component):
-    if component not in MONITORED_COMPONENTS:
-        return False
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""UPDATE system_incidents
-                    SET status='RECOVERED', recovered_at=NOW(), last_seen=NOW()
-                    WHERE incident_key=%s AND status='OPEN'""",(component.lower(),))
-                changed=cur.rowcount>0
-            conn.commit()
-        return changed
-    except Exception as exc:
-        print(f"MONITORING RECOVERY FAILURE: {type(exc).__name__}",flush=True)
-        return False
-
-def get_open_system_incidents():
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""SELECT component,first_seen,last_seen,occurrence_count,
-                    last_error_class,alert_sent_at FROM system_incidents
-                    WHERE status='OPEN' ORDER BY last_seen DESC""")
-                return cur.fetchall()
-    except Exception as exc:
-        print(f"MONITORING READ FAILURE: {type(exc).__name__}",flush=True)
-        return []
-
-def send_system_alert_email(component,error_class):
-    # Brevo cannot reliably alert us about its own outage.
-    if component=="Brevo" or not BREVO_API_KEY or not NOTIFICATION_EMAIL or not BREVO_SENDER_EMAIL:
-        return False
-    try:
-        r=requests.post("https://api.brevo.com/v3/smtp/email",
-            headers={"accept":"application/json","api-key":BREVO_API_KEY,
-                     "content-type":"application/json"},
-            json={"sender":{"name":BREVO_SENDER_NAME,"email":BREVO_SENDER_EMAIL},
-                  "to":[{"email":NOTIFICATION_EMAIL}],
-                  "subject":f"IBROWS AI System Alert: {component}",
-                  "textContent":("The IBROWS AI Business Assistant detected a service failure.\\n\\n"
-                    f"Component: {component}\\nError class: {error_class}\\n\\n"
-                    "Customer-facing safeguards remain active where available. "
-                    "Please review Render and the admin monitoring page.")},
-            timeout=8)
-        return 200<=r.status_code<300
-    except requests.RequestException:
-        return False
-
-def maybe_alert_system_failure(component,error_class):
-    if not record_system_failure(component,error_class) or component=="Brevo":
-        return
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""SELECT alert_sent_at FROM system_incidents
-                    WHERE incident_key=%s AND status='OPEN'""",(component.lower(),))
-                row=cur.fetchone()
-                if not row or row[0] is not None:
-                    return
-            if not send_system_alert_email(component,error_class):
-                return
-            with conn.cursor() as cur:
-                cur.execute("""UPDATE system_incidents SET alert_sent_at=NOW()
-                    WHERE incident_key=%s AND status='OPEN' AND alert_sent_at IS NULL""",
-                    (component.lower(),))
-            conn.commit()
-    except Exception as exc:
-        print(f"MONITORING ALERT FAILURE: {type(exc).__name__}",flush=True)
-
-
 def send_new_lead_email(
     lead_id,
     customer_name,
@@ -895,7 +774,6 @@ Kupanga zofanana, mosiyana
         )
 
         if 200 <= response.status_code < 300:
-            mark_system_recovered("Brevo")
             record_lead_notification(lead_id, "SENT")
             print(
                 f"NEW LEAD EMAIL SENT: {lead_id}",
@@ -904,7 +782,6 @@ Kupanga zofanana, mosiyana
             return True
 
         error_label = f"Brevo HTTP {response.status_code}"
-        record_system_failure("Brevo", f"HTTP{response.status_code}")
         record_lead_notification(lead_id, "FAILED", error_label)
         print(
             f"Lead email error for lead {lead_id}: {error_label}",
@@ -914,7 +791,6 @@ Kupanga zofanana, mosiyana
 
     except requests.RequestException as error:
         error_label = type(error).__name__
-        record_system_failure("Brevo", error_label)
         record_lead_notification(lead_id, "FAILED", error_label)
         print(
             f"Lead email error for lead {lead_id}: {error_label}",
@@ -1364,7 +1240,7 @@ h1{margin:24px 0 4px;font-size:26px}.description{color:#667085;margin:0 0 18px}.
 </style>
 </head>
 <body>
-<header><div class="header-inner"><div><div class="brand">IBROWS Lead Dashboard</div><div class="tagline">Kupanga zofanana, mosiyana</div><div><a href="{{ url_for('admin_monitoring') }}" style="color:white">System Monitoring</a></div></div><form method="POST" action="{{ url_for('admin_logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout" type="submit">Logout</button></form></div></header>
+<header><div class="header-inner"><div><div class="brand">IBROWS Lead Dashboard</div><div class="tagline">Kupanga zofanana, mosiyana</div></div><form method="POST" action="{{ url_for('admin_logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout" type="submit">Logout</button></form></div></header>
 <div class="container">
 <h1>Business Leads</h1><p class="description">Qualified enquiries captured by the IBROWS AI Business Assistant.</p>
 <div class="stats"><div class="stat"><div class="stat-number">{{ counts.ALL }}</div><div class="stat-label">All Leads</div></div><div class="stat"><div class="stat-number">{{ counts.NEW }}</div><div class="stat-label">New</div></div><div class="stat"><div class="stat-number">{{ counts.CONTACTED }}</div><div class="stat-label">Contacted</div></div><div class="stat"><div class="stat-number">{{ counts.CLOSED }}</div><div class="stat-label">Closed</div></div></div>
@@ -1429,31 +1305,6 @@ def admin_ai_takeover(customer_number):
     set_ai_paused(customer_number, paused == "1")
     return redirect(url_for("admin_leads"))
 
-
-
-
-MONITORING_TEMPLATE = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>IBROWS System Monitoring</title><style>
-body{font-family:Arial,sans-serif;background:#f5f7fa;color:#1f2937;margin:0}.wrap{max-width:900px;margin:auto;padding:20px}
-.card{background:#fff;border-radius:12px;padding:18px;margin:14px 0;box-shadow:0 1px 4px rgba(0,0,0,.08)}
-.ok{border-left:5px solid #198754}.bad{border-left:5px solid #dc3545}.muted{color:#6b7280}a{color:#0d6efd}
-</style></head><body><div class="wrap"><h1>IBROWS System Monitoring</h1>
-<p class="muted">Open service incidents recorded by the assistant.</p>
-<p><a href="{{ url_for('admin_leads') }}">← Back to Lead Dashboard</a></p>
-{% if incidents %}{% for i in incidents %}<div class="card bad"><strong>{{ i[0] }} — OPEN INCIDENT</strong>
-<p>Error class: {{ i[4] }}</p><p>Occurrences: {{ i[3] }}</p>
-<p>First seen: {{ i[1] }}<br>Last seen: {{ i[2] }}</p>
-<p>Alert email: {{ 'Sent' if i[5] else 'Not sent / unavailable' }}</p></div>{% endfor %}
-{% else %}<div class="card ok"><strong>No open incidents recorded.</strong>
-<p>No unresolved OpenAI, WhatsApp, or Brevo incident is currently recorded.</p></div>{% endif %}
-</div></body></html>
-"""
-
-@app.route("/admin/monitoring",methods=["GET"])
-@admin_required
-def admin_monitoring():
-    return render_template_string(MONITORING_TEMPLATE,incidents=get_open_system_incidents())
 
 
 CUSTOMER_PRIVACY_TEMPLATE = """
@@ -2293,7 +2144,6 @@ Return ONLY the required JSON object.
 
         parsed_result = json.loads(raw_output)
         final_result = validate_ai_structured_output(parsed_result)
-        mark_system_recovered("OpenAI")
 
         print(
             "AI STRUCTURED OUTPUT VALIDATED: "
@@ -2314,9 +2164,10 @@ Return ONLY the required JSON object.
 
     except Exception as error:
 
-        error_class = type(error).__name__
-        print(f"OpenAI/database error: {error_class}", flush=True)
-        maybe_alert_system_failure("OpenAI", error_class)
+        print(
+            f"OpenAI/database error: {type(error).__name__}",
+            flush=True
+        )
 
         return {
             "reply": (
@@ -2360,16 +2211,11 @@ def send_whatsapp_message(recipient, message):
         )
         success = 200 <= response.status_code < 300
         print(f"WhatsApp send status: {response.status_code}", flush=True)
-        if success:
-            mark_system_recovered("WhatsApp")
-            return True
-        print("WhatsApp send failed with non-success HTTP status.", flush=True)
-        maybe_alert_system_failure("WhatsApp", f"HTTP{response.status_code}")
-        return False
+        if not success:
+            print("WhatsApp send failed with non-success HTTP status.", flush=True)
+        return success
     except requests.RequestException as error:
-        error_class = type(error).__name__
-        print(f"WhatsApp send error: {error_class}", flush=True)
-        maybe_alert_system_failure("WhatsApp", error_class)
+        print(f"WhatsApp send error: {type(error).__name__}", flush=True)
         return False
 
 
