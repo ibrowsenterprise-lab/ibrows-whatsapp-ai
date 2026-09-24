@@ -400,6 +400,105 @@ def set_ai_paused(customer_number, paused):
         conn.commit()
 
 
+
+def detect_explicit_human_handover(customer_message):
+    """
+    Detect only clear requests to stop AI or speak to a human.
+    This deliberately uses local rules so handover still works when OpenAI
+    is unavailable or out of credits.
+    """
+    text = " ".join(str(customer_message or "").lower().split())
+
+    strong_phrases = (
+        "speak to a manager",
+        "talk to a manager",
+        "speak with a manager",
+        "talk with a manager",
+        "speak to a person",
+        "talk to a person",
+        "speak with a person",
+        "talk with a person",
+        "speak to a human",
+        "talk to a human",
+        "speak with a human",
+        "talk with a human",
+        "human please",
+        "human agent",
+        "real person",
+        "customer service agent",
+        "customer care agent",
+        "stop ai",
+        "stop the ai",
+        "pause ai",
+        "turn off ai",
+        "no more ai",
+        "don't want to talk to ai",
+        "do not want to talk to ai",
+        "dont want to talk to ai",
+        "don't want ai",
+        "do not want ai",
+        "dont want ai",
+        "ndikufuna kulankhula ndi munthu",
+        "ndikufuna munthu",
+        "ndilumikizeni ndi munthu",
+        "ndilumikizeni ndi manager",
+        "ndikufuna manager",
+        "sindikufuna kulankhula ndi ai",
+        "sindikufuna ai",
+    )
+
+    return any(phrase in text for phrase in strong_phrases)
+
+
+def handle_local_human_handover(
+    customer_number,
+    customer_name,
+    customer_message,
+):
+    """
+    Pause AI and create/update a handover lead without calling OpenAI.
+    Returns the fixed customer acknowledgement.
+    """
+    save_message(customer_number, "user", customer_message)
+
+    reply = (
+        "Thank you for letting us know. I have paused the AI assistant "
+        "for this conversation and recorded your request for human assistance. "
+        "The IBROWS team will need to assist you from here."
+    )
+
+    # Pause first so the customer's explicit preference is respected even
+    # if email notification later fails.
+    set_ai_paused(customer_number, True)
+
+    try:
+        lead_id, is_new_lead = create_or_update_lead(
+            customer_number=customer_number,
+            customer_name=customer_name,
+            service="Human Handover",
+            summary="Customer explicitly requested human assistance and asked to stop AI interaction.",
+            handover_reason="Explicit request to speak with a human/manager or stop AI."
+        )
+
+        if is_new_lead:
+            send_new_lead_email(
+                lead_id=lead_id,
+                customer_name=customer_name,
+                customer_number=customer_number,
+                service="Human Handover",
+                summary="Customer explicitly requested human assistance and asked to stop AI interaction.",
+                handover_reason="Explicit request to speak with a human/manager or stop AI."
+            )
+    except Exception as handover_error:
+        print(
+            f"Local handover lead/notification error: {type(handover_error).__name__}",
+            flush=True
+        )
+
+    save_message(customer_number, "assistant", reply)
+    return reply
+
+
 def get_paused_customers():
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -1311,6 +1410,20 @@ def receive_webhook():
             print("AI PAUSED FOR CUSTOMER — HUMAN TAKEOVER ACTIVE", flush=True)
             return "EVENT_RECEIVED", 200
 
+        # Critical fail-safe: an explicit request for a human must not depend
+        # on OpenAI being available or having API credit.
+        if detect_explicit_human_handover(customer_message):
+            reply = handle_local_human_handover(
+                customer_number=customer_number,
+                customer_name=customer_name,
+                customer_message=customer_message,
+            )
+            store_pending_reply(message_id, reply)
+            sent = send_whatsapp_message(customer_number, reply)
+            finish_whatsapp_message(message_id, sent)
+            print("LOCAL HUMAN HANDOVER ACTIVATED", flush=True)
+            return "EVENT_RECEIVED", 200
+
         result = generate_ai_reply(
             customer_number,
             customer_message
@@ -1357,7 +1470,7 @@ def receive_webhook():
             except Exception as lead_error:
 
                 print(
-                    f"Lead creation error: {lead_error}",
+                    f"Lead creation error: {type(lead_error).__name__}",
                     flush=True
                 )
 
@@ -1445,21 +1558,39 @@ Use exactly:
 
 lead_required must be true or false.
 
-Set lead_required to TRUE when:
+Set lead_required to TRUE when the enquiry is ready for useful human follow-up.
 
-- The customer asks for a quotation.
-- The customer asks how to pay.
-- The customer wants to proceed with purchasing a service.
-- The customer asks to speak with a person.
-- Management or staff assistance is requested.
-- Price negotiation is required.
-- Enough information has been supplied for staff to continue.
+A quotation request BY ITSELF is not automatically a qualified lead when essential
+scope details are still missing. First ask one or two concise questions needed for
+the relevant service. Set lead_required to TRUE once enough information has been
+collected for IBROWS staff to assess, quote, confirm availability, negotiate, or
+continue the transaction.
+
+Examples of useful qualification:
+- Landscaping: location plus approximate property/yard size and the work required.
+- Cleaning: location, property type/size or room count, and preferred date/timeframe.
+- Fumigation: location, premises type/size, pest/problem, and preferred timeframe.
+- Construction: location, project type/stage, and the work or scope requested.
+- Car Wash: location, vehicle type/service required, and preferred date when relevant.
+- Website/Digital work: what the business/project needs and the requested type of work.
+- Agro/product enquiries: product/equipment needed, location, quantity or useful scope
+  where relevant, especially when stock or sourcing must be confirmed.
+
+Set lead_required to TRUE immediately when:
+- The customer asks to speak with a person or explicitly requests human assistance.
 - A complaint requires human attention.
-- A custom project needs assessment.
-- Product availability requires human confirmation.
+- Payment confirmation, price negotiation, management approval, or another action
+  clearly requires staff involvement and asking more AI qualification questions would
+  not materially improve the handover.
 
-Do not create a lead merely because someone says hello or
-asks a general question.
+Also set lead_required to TRUE when:
+- The customer wants to proceed and enough practical information is available.
+- A custom project has enough scope information for staff assessment.
+- Product availability needs human confirmation after useful product/scope details
+  have been collected.
+
+Do not create a lead merely because someone says hello, asks a general question,
+or asks for a quotation before essential service details have been collected.
 
 When lead_required is true:
 
@@ -1478,8 +1609,10 @@ already collected.
 handover_reason:
 Explain briefly why human follow-up is appropriate.
 
-You may say the enquiry will be referred to the IBROWS team
-when lead_required is true.
+Only say that the enquiry will be referred to the IBROWS team when
+lead_required is true in the SAME JSON response. If lead_required is false, do not
+imply that staff have already been notified or that referral has already happened.
+Instead, ask for the missing qualification details.
 
 Never claim that payment, booking, registration, purchase,
 application, reservation, or another transaction has been
@@ -1942,15 +2075,16 @@ Return ONLY the required JSON object.
     except Exception as error:
 
         print(
-            f"OpenAI/database error: {error}",
+            f"OpenAI/database error: {type(error).__name__}",
             flush=True
         )
 
         return {
             "reply": (
                 "Thank you for contacting IBROWS Enterprise. "
-                "Our AI assistant is temporarily unable to "
-                "process your request. Please try again shortly."
+                "Our AI assistant is temporarily unavailable. "
+                "Please try again shortly, or ask to speak to a human "
+                "if you need assistance from the IBROWS team."
             ),
             "lead_required": False,
             "service": "",
