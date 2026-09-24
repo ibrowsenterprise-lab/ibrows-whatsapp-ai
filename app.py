@@ -227,7 +227,46 @@ def delete_customer_data(customer_number):
     print("CUSTOMER DATA DELETION COMPLETED", flush=True)
 
 
+
+def redact_sensitive_credentials_for_storage(content):
+    """
+    Redact clearly labelled authentication/payment credentials before
+    conversation text is written to PostgreSQL.
+
+    This is deliberately conservative: it targets values attached to explicit
+    credential labels and does not redact ordinary phone numbers, prices,
+    dates, quantities, room counts, dimensions, or quotation amounts.
+    """
+    text = str(content or "")
+
+    patterns = (
+        # PIN / OTP / one-time-password / verification/security codes.
+        r"(?i)\b(pin|otp|one[\s-]?time(?:\s+password|\s+pin|\s+code)?|verification\s+code|security\s+code)\b"
+        r"(\s*(?:is|=|:|-)?\s*)([A-Za-z0-9][A-Za-z0-9._\-]{2,31})",
+
+        # Passwords / passcodes / passphrases.
+        r"(?i)\b(password|passcode|passphrase)\b"
+        r"(\s*(?:is|=|:|-)?\s*)(\S{3,128})",
+
+        # CVV/CVC/CID card security values.
+        r"(?i)\b(cvv2?|cvc2?|card\s+security\s+code|card\s+verification\s+code)\b"
+        r"(\s*(?:is|=|:|-)?\s*)([0-9]{3,4})",
+    )
+
+    for pattern in patterns:
+        text = re.sub(
+            pattern,
+            lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]",
+            text
+        )
+
+    return text
+
+
+
 def save_message(customer_number, role, content):
+    safe_content = redact_sensitive_credentials_for_storage(content)
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -236,7 +275,7 @@ def save_message(customer_number, role, content):
                     (customer_number, role, content)
                 VALUES (%s, %s, %s)
                 """,
-                (customer_number, role, content)
+                (customer_number, role, safe_content)
             )
 
         conn.commit()
