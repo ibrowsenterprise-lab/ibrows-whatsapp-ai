@@ -8,9 +8,13 @@ import time
 import threading
 import socket
 import ipaddress
+import io
+import zipfile
+import textwrap
 from html.parser import HTMLParser
+from xml.sax.saxutils import escape as xml_escape
 from urllib.parse import urljoin, urlsplit, urlunsplit
-from datetime import timedelta
+from datetime import timedelta, date
 
 import requests
 import psycopg
@@ -133,6 +137,13 @@ WEB_READ_TIMEOUT_SECONDS = 12
 OPENAI_WEB_SEARCH_MODEL = os.environ.get("OPENAI_WEB_SEARCH_MODEL") or "gpt-5.5"
 MAX_HOSTED_WEB_SEARCH_CHARS = 9000
 URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>\"']+")
+
+# =========================================================
+# APPLICATION PACK BUILDER
+# =========================================================
+APPLICATION_PACK_MODEL = os.environ.get("APPLICATION_PACK_MODEL") or "gpt-5.6-luna"
+APPLICATION_PACK_MAX_REPLY = 3200
+APPLICATION_PACK_MAX_ITEMS = 20
 
 # =========================================================
 # DATABASE
@@ -262,6 +273,14 @@ def init_database():
                 )
             """)
 
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS application_pack_state (
+                    customer_number TEXT PRIMARY KEY,
+                    active BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
         conn.commit()
 
     print("DATABASE READY", flush=True)
@@ -289,6 +308,10 @@ def cleanup_expired_data(force=False):
                     WHERE NOT EXISTS (SELECT 1 FROM leads l WHERE l.customer_number=a.customer_number)
                       AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.customer_number=a.customer_number)
                 """)
+                cur.execute("""
+                    DELETE FROM application_pack_state
+                    WHERE updated_at < NOW() - (%s * INTERVAL '1 day')
+                """, (CONVERSATION_RETENTION_DAYS,))
             conn.commit()
         _last_privacy_cleanup = now
         print("PRIVACY RETENTION CLEANUP COMPLETED", flush=True)
@@ -304,6 +327,7 @@ def delete_customer_data(customer_number):
             cur.execute("DELETE FROM processed_whatsapp_messages WHERE customer_number=%s", (customer_number,))
             cur.execute("DELETE FROM leads WHERE customer_number=%s", (customer_number,))
             cur.execute("DELETE FROM ai_takeover_state WHERE customer_number=%s", (customer_number,))
+            cur.execute("DELETE FROM application_pack_state WHERE customer_number=%s", (customer_number,))
         conn.commit()
     print("CUSTOMER DATA DELETION COMPLETED", flush=True)
 
@@ -588,6 +612,514 @@ def set_ai_paused(customer_number, paused):
             )
         conn.commit()
 
+
+
+def is_application_pack_active(customer_number):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT active
+                FROM application_pack_state
+                WHERE customer_number = %s
+                """,
+                (customer_number,)
+            )
+            row = cur.fetchone()
+    return bool(row and row[0])
+
+
+def set_application_pack_active(customer_number, active):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO application_pack_state (customer_number, active, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (customer_number)
+                DO UPDATE SET active=EXCLUDED.active, updated_at=NOW()
+                """,
+                (customer_number, bool(active))
+            )
+        conn.commit()
+
+
+def detect_application_pack_request(customer_message):
+    """Detect explicit requests to prepare both a CV/resume and cover/application letter."""
+    text = " ".join(str(customer_message or "").lower().split())
+    action = any(word in text for word in (
+        "prepare", "create", "generate", "draft", "write", "make", "produce"
+    ))
+    cv = any(term in text for term in (" cv", "cv ", "resume", "curriculum vitae")) or text.startswith("cv")
+    letter = any(term in text for term in ("cover letter", "application letter", "covering letter"))
+    broad = any(phrase in text for phrase in (
+        "prepare my application", "prepare the application", "prepare both",
+        "application pack", "tailored application"
+    ))
+    return (action and cv and letter) or broad
+
+
+def _clean_pack_string(value, max_len=4000):
+    value = str(value or "").strip()
+    return value[:max_len]
+
+
+def _validate_string_list(value, field, max_items=APPLICATION_PACK_MAX_ITEMS, max_len=500):
+    if not isinstance(value, list) or len(value) > max_items:
+        raise ValueError(f"{field} must be a short list")
+    result = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{field} items must be strings")
+        item = item.strip()
+        if item:
+            result.append(item[:max_len])
+    return result
+
+
+def validate_application_pack_output(result):
+    if not isinstance(result, dict):
+        raise ValueError("Application pack output must be a JSON object")
+    required = {
+        "ready", "reply", "candidate_name", "target_role", "target_organisation",
+        "eligibility_warning", "missing_information", "cv", "cover_letter"
+    }
+    if set(result.keys()) != required:
+        raise ValueError("Application pack output has missing or unexpected fields")
+    if type(result["ready"]) is not bool:
+        raise ValueError("ready must be boolean")
+    reply = _clean_pack_string(result["reply"], APPLICATION_PACK_MAX_REPLY)
+    if not reply:
+        raise ValueError("Application pack reply is empty")
+    missing = _validate_string_list(result["missing_information"], "missing_information", 10, 500)
+    base = {
+        "ready": result["ready"],
+        "reply": reply,
+        "candidate_name": _clean_pack_string(result["candidate_name"], 140),
+        "target_role": _clean_pack_string(result["target_role"], 180),
+        "target_organisation": _clean_pack_string(result["target_organisation"], 180),
+        "eligibility_warning": _clean_pack_string(result["eligibility_warning"], 1200),
+        "missing_information": missing,
+    }
+    if not result["ready"]:
+        if not missing:
+            raise ValueError("Not-ready pack must identify missing information")
+        base["cv"] = {}
+        base["cover_letter"] = {}
+        return base
+
+    cv = result["cv"]
+    letter = result["cover_letter"]
+    if not isinstance(cv, dict) or not isinstance(letter, dict):
+        raise ValueError("CV and cover_letter must be objects")
+    cv_required = {"contact_line", "professional_profile", "core_skills", "experience", "education", "certifications", "additional_sections"}
+    if set(cv.keys()) != cv_required:
+        raise ValueError("CV object is malformed")
+    experience = cv["experience"]
+    if not isinstance(experience, list) or len(experience) > 15:
+        raise ValueError("experience must be a short list")
+    clean_exp = []
+    for item in experience:
+        if not isinstance(item, dict) or set(item.keys()) != {"role", "organisation", "dates", "bullets"}:
+            raise ValueError("experience item is malformed")
+        clean_exp.append({
+            "role": _clean_pack_string(item["role"], 180),
+            "organisation": _clean_pack_string(item["organisation"], 180),
+            "dates": _clean_pack_string(item["dates"], 120),
+            "bullets": _validate_string_list(item["bullets"], "experience bullets", 10, 700),
+        })
+    sections = cv["additional_sections"]
+    if not isinstance(sections, list) or len(sections) > 8:
+        raise ValueError("additional_sections must be a short list")
+    clean_sections = []
+    for item in sections:
+        if not isinstance(item, dict) or set(item.keys()) != {"heading", "items"}:
+            raise ValueError("additional section is malformed")
+        clean_sections.append({
+            "heading": _clean_pack_string(item["heading"], 120),
+            "items": _validate_string_list(item["items"], "additional section items", 15, 600),
+        })
+    letter_required = {"date_line", "recipient", "subject", "paragraphs", "signoff"}
+    if set(letter.keys()) != letter_required:
+        raise ValueError("cover_letter object is malformed")
+    clean_letter = {
+        "date_line": _clean_pack_string(letter["date_line"], 100),
+        "recipient": _clean_pack_string(letter["recipient"], 250),
+        "subject": _clean_pack_string(letter["subject"], 250),
+        "paragraphs": _validate_string_list(letter["paragraphs"], "cover letter paragraphs", 8, 1600),
+        "signoff": _clean_pack_string(letter["signoff"], 250),
+    }
+    if not base["candidate_name"] or not base["target_role"]:
+        raise ValueError("Ready pack needs candidate and target role")
+    if not clean_exp or not clean_letter["paragraphs"]:
+        raise ValueError("Ready pack lacks substantive content")
+    base["cv"] = {
+        "contact_line": _clean_pack_string(cv["contact_line"], 300),
+        "professional_profile": _clean_pack_string(cv["professional_profile"], 1600),
+        "core_skills": _validate_string_list(cv["core_skills"], "core_skills", 20, 250),
+        "experience": clean_exp,
+        "education": _validate_string_list(cv["education"], "education", 15, 600),
+        "certifications": _validate_string_list(cv["certifications"], "certifications", 15, 500),
+        "additional_sections": clean_sections,
+    }
+    base["cover_letter"] = clean_letter
+    return base
+
+
+def generate_application_pack(customer_number):
+    """Build a truthful tailored CV/cover-letter draft from this customer's stored context."""
+    memory_context = build_attachment_memory_context(customer_number)
+    conversation = get_recent_conversation(customer_number, limit=20)
+    input_payload = memory_context + conversation
+    instructions = """
+You are the IBROWS Enterprise Application Pack Builder. Prepare a truthful tailored CV and cover letter only from the same customer's supplied CV/document memories, verified vacancy/web-source memories, and recent conversation.
+
+Never invent or upgrade a qualification, job title, employment date, employer, achievement, metric, technical skill, certification, language level, responsibility, leadership duty, security/networking experience, or contact detail. A fact may be used only when it is directly supported by the supplied context. Treat public-source summaries as vacancy evidence, not evidence about the candidate.
+
+First decide whether enough information exists to produce submission-ready drafts. Important missing information includes: the candidate's preferred contact details when none are available; ambiguity about which person's CV to use; ambiguity about the target role; or a material eligibility/experience question where the customer has specifically asked you to ask before final drafting and their answer could change truthful tailoring. Do not block merely because the candidate has a genuine gap; instead state that gap accurately in eligibility_warning. Do not ask for home address, national ID, passport number, banking information, passwords, PINs or OTPs.
+
+If information is missing, set ready=false, keep cv and cover_letter as empty objects, and ask no more than four concise questions in reply. missing_information must list those missing facts.
+
+If ready=true, produce professional drafts. The CV must emphasize only supported, role-relevant evidence, use achievement-focused bullets only where the evidence supports the claimed result, and omit unsupported requirements rather than disguising them. The cover letter must be persuasive but factual, explicitly grounded in the candidate's supported experience. Do not claim the candidate meets a mandatory requirement unless the supplied context supports it. If an official vacancy requirement is not evidenced, eligibility_warning should say so clearly.
+
+Return ONLY valid JSON with exactly this shape:
+{
+  "ready": false,
+  "reply": "",
+  "candidate_name": "",
+  "target_role": "",
+  "target_organisation": "",
+  "eligibility_warning": "",
+  "missing_information": [],
+  "cv": {},
+  "cover_letter": {}
+}
+
+When ready=true, cv must instead be exactly:
+{
+  "contact_line": "",
+  "professional_profile": "",
+  "core_skills": [],
+  "experience": [
+    {"role":"", "organisation":"", "dates":"", "bullets":[]}
+  ],
+  "education": [],
+  "certifications": [],
+  "additional_sections": [
+    {"heading":"", "items":[]}
+  ]
+}
+and cover_letter must be exactly:
+{
+  "date_line": "",
+  "recipient": "",
+  "subject": "",
+  "paragraphs": [],
+  "signoff": ""
+}
+
+The reply for ready=true should say that draft application files have been prepared for review before submission. Do not say IBROWS submitted the application. Do not say a human reviewed the files unless the conversation explicitly confirms that.
+"""
+    response = client.responses.create(
+        model=APPLICATION_PACK_MODEL,
+        store=False,
+        instructions=instructions,
+        input=input_payload,
+    )
+    return validate_application_pack_output(json.loads(response.output_text.strip()))
+
+
+def _safe_pack_filename(text, fallback="Application"):
+    text = re.sub(r"[^A-Za-z0-9_-]+", "_", str(text or "").strip()).strip("_")
+    return (text[:60] or fallback)
+
+
+def _docx_run(text, bold=False, size=None):
+    props = []
+    if bold:
+        props.append("<w:b/>")
+    if size:
+        half_points = int(size * 2)
+        props.append(f'<w:sz w:val="{half_points}"/><w:szCs w:val="{half_points}"/>')
+    rpr = f"<w:rPr>{''.join(props)}</w:rPr>" if props else ""
+    return f'<w:r>{rpr}<w:t xml:space="preserve">{xml_escape(str(text or ""))}</w:t></w:r>'
+
+
+def _docx_paragraph(text="", bold=False, size=None, before=0, after=100, align=None):
+    ppr = [f'<w:spacing w:before="{before}" w:after="{after}"/>']
+    if align:
+        ppr.append(f'<w:jc w:val="{align}"/>')
+    return f'<w:p><w:pPr>{"".join(ppr)}</w:pPr>{_docx_run(text, bold=bold, size=size)}</w:p>'
+
+
+def build_docx_bytes(title, blocks):
+    body = [_docx_paragraph(title, bold=True, size=18, after=180, align="center")]
+    for kind, text in blocks:
+        if kind == "heading":
+            body.append(_docx_paragraph(text, bold=True, size=12, before=120, after=70))
+        elif kind == "subheading":
+            body.append(_docx_paragraph(text, bold=True, size=11, before=70, after=40))
+        elif kind == "bullet":
+            body.append(_docx_paragraph(f"• {text}", size=10.5, after=40))
+        elif kind == "spacer":
+            body.append(_docx_paragraph("", after=80))
+        else:
+            body.append(_docx_paragraph(text, size=10.5, after=80))
+    document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{''.join(body)}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1080" w:right="1080" w:bottom="1080" w:left="1080"/></w:sectPr></w:body></w:document>'''
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'''
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>'''
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", document_xml)
+    return out.getvalue()
+
+
+def _pdf_escape(text):
+    text = str(text or "").encode("latin-1", "replace").decode("latin-1")
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _wrap_pdf_text(text, width=86):
+    text = str(text or "").strip()
+    if not text:
+        return [""]
+    return textwrap.wrap(text, width=width, break_long_words=False, break_on_hyphens=False) or [""]
+
+
+def build_pdf_bytes(title, blocks):
+    lines = [(title, True, 16, 20)]
+    for kind, text in blocks:
+        if kind == "heading":
+            lines.append((text, True, 12, 17))
+        elif kind == "subheading":
+            lines.append((text, True, 10.5, 14))
+        elif kind == "bullet":
+            wrapped = _wrap_pdf_text("- " + text, 88)
+            lines.extend((line, False, 10, 13) for line in wrapped)
+        elif kind == "spacer":
+            lines.append(("", False, 10, 10))
+        else:
+            wrapped = _wrap_pdf_text(text, 92)
+            lines.extend((line, False, 10, 13) for line in wrapped)
+
+    pages, page, y = [], [], 790
+    for text, bold, size, leading in lines:
+        if y - leading < 48:
+            pages.append(page)
+            page, y = [], 790
+        page.append((text, bold, size, y))
+        y -= leading
+    if page or not pages:
+        pages.append(page)
+
+    objects = {}
+    objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    objects[3] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+    objects[4] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"
+    kids = []
+    for i, page_lines in enumerate(pages):
+        page_id = 5 + i * 2
+        content_id = page_id + 1
+        kids.append(f"{page_id} 0 R")
+        stream_parts = []
+        for text, bold, size, ypos in page_lines:
+            font = "F2" if bold else "F1"
+            stream_parts.append(
+                f"BT /{font} {size:g} Tf 50 {ypos:g} Td ({_pdf_escape(text)}) Tj ET"
+            )
+        stream = "\n".join(stream_parts).encode("latin-1", "replace")
+        objects[content_id] = b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"
+        objects[page_id] = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+            f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {content_id} 0 R >>"
+        ).encode("ascii")
+    objects[2] = f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(kids)} >>".encode("ascii")
+
+    max_id = max(objects)
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0] * (max_id + 1)
+    for obj_id in range(1, max_id + 1):
+        offsets[obj_id] = len(out)
+        out.extend(f"{obj_id} 0 obj\n".encode("ascii"))
+        out.extend(objects[obj_id])
+        out.extend(b"\nendobj\n")
+    xref = len(out)
+    out.extend(f"xref\n0 {max_id + 1}\n".encode("ascii"))
+    out.extend(b"0000000000 65535 f \n")
+    for obj_id in range(1, max_id + 1):
+        out.extend(f"{offsets[obj_id]:010d} 00000 n \n".encode("ascii"))
+    out.extend(f"trailer\n<< /Size {max_id + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode("ascii"))
+    return bytes(out)
+
+
+def application_pack_documents(pack):
+    name = pack["candidate_name"]
+    role = pack["target_role"]
+    org = pack["target_organisation"]
+    cv = pack["cv"]
+    letter = pack["cover_letter"]
+
+    cv_blocks = []
+    if cv["contact_line"]:
+        cv_blocks.append(("text", cv["contact_line"]))
+    if role:
+        cv_blocks.append(("text", f"Target role: {role}" + (f" | {org}" if org else "")))
+    cv_blocks += [("heading", "PROFESSIONAL PROFILE"), ("text", cv["professional_profile"])]
+    if cv["core_skills"]:
+        cv_blocks.append(("heading", "CORE SKILLS"))
+        cv_blocks.extend(("bullet", item) for item in cv["core_skills"])
+    cv_blocks.append(("heading", "PROFESSIONAL EXPERIENCE"))
+    for item in cv["experience"]:
+        heading = item["role"]
+        if item["organisation"]:
+            heading += f" — {item['organisation']}"
+        cv_blocks.append(("subheading", heading))
+        if item["dates"]:
+            cv_blocks.append(("text", item["dates"]))
+        cv_blocks.extend(("bullet", b) for b in item["bullets"])
+    if cv["education"]:
+        cv_blocks.append(("heading", "EDUCATION"))
+        cv_blocks.extend(("bullet", item) for item in cv["education"])
+    if cv["certifications"]:
+        cv_blocks.append(("heading", "CERTIFICATIONS / TRAINING"))
+        cv_blocks.extend(("bullet", item) for item in cv["certifications"])
+    for section in cv["additional_sections"]:
+        if section["heading"] and section["items"]:
+            cv_blocks.append(("heading", section["heading"].upper()))
+            cv_blocks.extend(("bullet", item) for item in section["items"])
+
+    letter_blocks = []
+    if letter["date_line"]:
+        letter_blocks.append(("text", letter["date_line"]))
+    if letter["recipient"]:
+        letter_blocks.append(("text", letter["recipient"]))
+    if letter["subject"]:
+        letter_blocks.append(("heading", letter["subject"]))
+    letter_blocks.extend(("text", p) for p in letter["paragraphs"])
+    if letter["signoff"]:
+        letter_blocks.append(("spacer", ""))
+        letter_blocks.append(("text", letter["signoff"]))
+
+    stem = _safe_pack_filename(name, "Candidate")
+    role_stem = _safe_pack_filename(role, "Role")[:35]
+    return [
+        {
+            "filename": f"{stem}_{role_stem}_Tailored_CV.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "bytes": build_docx_bytes(name, cv_blocks),
+        },
+        {
+            "filename": f"{stem}_{role_stem}_Tailored_CV.pdf",
+            "mime_type": "application/pdf",
+            "bytes": build_pdf_bytes(name, cv_blocks),
+        },
+        {
+            "filename": f"{stem}_{role_stem}_Cover_Letter.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "bytes": build_docx_bytes(f"Cover Letter — {name}", letter_blocks),
+        },
+        {
+            "filename": f"{stem}_{role_stem}_Cover_Letter.pdf",
+            "mime_type": "application/pdf",
+            "bytes": build_pdf_bytes(f"Cover Letter — {name}", letter_blocks),
+        },
+    ]
+
+
+def upload_whatsapp_media(file_bytes, filename, mime_type):
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        return None
+    url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/media"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            data={"messaging_product": "whatsapp"},
+            files={"file": (filename, file_bytes, mime_type)},
+            timeout=20,
+        )
+        print(f"WhatsApp media upload status: {response.status_code}", flush=True)
+        if 200 <= response.status_code < 300:
+            return (response.json() or {}).get("id")
+    except requests.RequestException as error:
+        print(f"WhatsApp media upload error: {type(error).__name__}", flush=True)
+    return None
+
+
+def send_whatsapp_document(recipient, file_bytes, filename, mime_type, caption=None):
+    media_id = upload_whatsapp_media(file_bytes, filename, mime_type)
+    if not media_id:
+        return False
+    url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    document = {"id": media_id, "filename": filename}
+    if caption:
+        document["caption"] = str(caption)[:900]
+    payload = {"messaging_product": "whatsapp", "to": recipient, "type": "document", "document": document}
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=12)
+        print(f"WhatsApp document send status: {response.status_code}", flush=True)
+        return 200 <= response.status_code < 300
+    except requests.RequestException as error:
+        print(f"WhatsApp document send error: {type(error).__name__}", flush=True)
+        return False
+
+
+def process_application_pack(customer_number, customer_name, customer_message):
+    save_message(customer_number, "user", customer_message)
+    set_application_pack_active(customer_number, True)
+    try:
+        pack = generate_application_pack(customer_number)
+    except Exception as error:
+        print(f"APPLICATION PACK ERROR: {type(error).__name__}", flush=True)
+        reply = (
+            "I could not prepare the application pack just now. Your existing CV and vacancy "
+            "context are still available. Please try again shortly, or ask for human assistance."
+        )
+        save_message(customer_number, "assistant", reply)
+        return {"reply": reply, "documents": [], "ready": False}
+
+    if not pack["ready"]:
+        print("APPLICATION PACK NEEDS INFORMATION", flush=True)
+        reply = pack["reply"]
+        save_message(customer_number, "assistant", reply)
+        return {"reply": reply, "documents": [], "ready": False}
+
+    documents = application_pack_documents(pack)
+    warning = pack.get("eligibility_warning", "").strip()
+    reply = pack["reply"]
+    if warning:
+        reply += "\n\nImportant eligibility note: " + warning
+    reply += "\n\nPlease review every detail before submitting. IBROWS has not submitted the application on your behalf."
+    reply = reply[:3900]
+    save_message(customer_number, "assistant", reply)
+
+    try:
+        lead_id, is_new_lead = create_or_update_lead(
+            customer_number=customer_number,
+            customer_name=customer_name,
+            service="CV & Cover Letter",
+            summary=f"Tailored application pack prepared for {pack['candidate_name']} — {pack['target_role']} at {pack['target_organisation'] or 'target organisation'}.",
+            handover_reason="Application pack prepared; final customer/IBROWS review is required before submission."
+        )
+        if is_new_lead:
+            send_new_lead_email(
+                lead_id=lead_id,
+                customer_name=customer_name,
+                customer_number=customer_number,
+                service="CV & Cover Letter",
+                summary=f"Tailored application pack prepared for {pack['candidate_name']} — {pack['target_role']}.",
+                handover_reason="Final review required before submission."
+            )
+    except Exception as lead_error:
+        print(f"Application pack lead update error: {type(lead_error).__name__}", flush=True)
+
+    print("APPLICATION PACK READY", flush=True)
+    return {"reply": reply, "documents": documents, "ready": True}
 
 
 def detect_explicit_human_handover(customer_message):
@@ -2167,6 +2699,38 @@ def receive_webhook():
             print("LOCAL HUMAN HANDOVER ACTIVATED", flush=True)
             return "EVENT_RECEIVED", 200
 
+        if message_type == "text" and (
+            is_application_pack_active(customer_number)
+            or detect_application_pack_request(customer_message)
+        ):
+            pack_result = process_application_pack(
+                customer_number=customer_number,
+                customer_name=customer_name,
+                customer_message=customer_message,
+            )
+            reply = pack_result["reply"]
+            store_pending_reply(message_id, reply)
+            text_sent = send_whatsapp_message(customer_number, reply)
+            documents_sent = True
+            if pack_result.get("ready"):
+                for index, document in enumerate(pack_result.get("documents", [])):
+                    caption = "IBROWS draft — review before submission" if index == 0 else None
+                    sent_doc = send_whatsapp_document(
+                        customer_number,
+                        document["bytes"],
+                        document["filename"],
+                        document["mime_type"],
+                        caption=caption,
+                    )
+                    documents_sent = documents_sent and sent_doc
+                if text_sent and documents_sent:
+                    set_application_pack_active(customer_number, False)
+                    print("APPLICATION PACK SENT", flush=True)
+                else:
+                    print("APPLICATION PACK DELIVERY INCOMPLETE", flush=True)
+            finish_whatsapp_message(message_id, text_sent and documents_sent)
+            return "EVENT_RECEIVED", 200
+
         if message_type in {"document", "image"}:
             try:
                 media_input = prepare_media_input_for_openai(message)
@@ -3200,7 +3764,7 @@ def privacy_policy():
     <p>IBROWS Enterprise uses WhatsApp to respond to customer enquiries and provide information about its services. Some responses are generated or assisted by artificial intelligence.</p>
     <h2>Information we process</h2><p>We may process your WhatsApp number, WhatsApp profile name made available to us, message content, enquiry details and information needed to follow up your request.</p>
     <h2>Why we use it</h2><p>We use this information to respond to enquiries, maintain recent conversation context, manage business leads, support human follow-up, prevent duplicate message processing, and operate and secure the service.</p>
-    <h2>Service providers</h2><p>WhatsApp/Meta carries the messages and attachments. OpenAI may process relevant conversation content, supported attachments, and public webpage content that a customer asks the assistant to review. When a customer provides a public web link, the IBROWS service may retrieve that public page and, when ordinary page retrieval is insufficient, may use OpenAI hosted web search limited to relevant public domains to answer the request. Raw attachment files and fetched webpage bodies are processed transiently and are not stored in the IBROWS database. To continue a customer's request across later messages, IBROWS may retain a concise sanitized summary of relevant source content, such as CV experience/skills or job-advert requirements. Brevo is used to send qualified-lead notifications to IBROWS management. Hosting and database providers process data as necessary to operate the service.</p>
+    <h2>Service providers</h2><p>WhatsApp/Meta carries the messages and attachments. OpenAI may process relevant conversation content, supported attachments, and public webpage content that a customer asks the assistant to review. When a customer provides a public web link, the IBROWS service may retrieve that public page and, when ordinary page retrieval is insufficient, may use OpenAI hosted web search limited to relevant public domains to answer the request. Raw attachment files and fetched webpage bodies are processed transiently and are not stored in the IBROWS database. To continue a customer's request across later messages, IBROWS may retain a concise sanitized summary of relevant source content, such as CV experience/skills or job-advert requirements. When a customer asks IBROWS to prepare a CV/cover-letter application pack, draft document files may be generated transiently and uploaded to WhatsApp/Meta for delivery; IBROWS does not store those generated document bytes in its database. Brevo is used to send qualified-lead notifications to IBROWS management. Hosting and database providers process data as necessary to operate the service.</p>
     <h2>Retention</h2><p>Ordinary conversation history and sanitized attachment/web-source summaries are retained for up to 90 days. Technical WhatsApp retry records are retained for up to 30 days. Inactive business leads are retained for up to 12 months, unless longer retention is reasonably required for legal, accounting, dispute-resolution, or other legitimate obligations.</p>
     <h2>Safety</h2><p>Do not send passwords, banking PINs, OTP/security codes or full payment-card credentials through the assistant. IBROWS does not sell customer personal information.</p>
     <h2>Your data</h2><p>You may request access to, correction of, or deletion of information associated with your interactions by contacting <strong>ibrowsenterprise@gmail.com</strong>. We may request reasonable information to verify the request before acting on it.</p>
