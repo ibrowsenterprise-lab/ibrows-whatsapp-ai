@@ -1084,8 +1084,43 @@ def process_application_pack(customer_number, customer_name, customer_message):
         return {"reply": reply, "documents": [], "ready": False}
 
     if not pack["ready"]:
-        print("APPLICATION PACK NEEDS INFORMATION", flush=True)
-        reply = pack["reply"]
+        missing = pack.get("missing_information", [])[:4]
+
+        # Never rely on the model's prose alone to expose the actual questions.
+        # The structured missing_information list is the source of truth.
+        intro = pack.get("reply", "").strip()
+        if not intro:
+            intro = (
+                "Before preparing the final CV and cover letter, please provide "
+                "the missing details below so the application remains accurate."
+            )
+
+        question_lines = []
+        for index, item in enumerate(missing, start=1):
+            item = str(item or "").strip()
+            if not item:
+                continue
+            if item.endswith("?"):
+                question = item
+            else:
+                question = f"Please provide or confirm: {item}"
+            question_lines.append(f"{index}. {question}")
+
+        if question_lines:
+            reply = intro + "\n\n" + "\n".join(question_lines)
+        else:
+            reply = intro
+
+        reply += (
+            "\n\nPlease do not send passwords, PINs, OTPs, national ID/passport "
+            "numbers, or unnecessary banking information."
+        )
+        reply = reply[:3900]
+
+        print(
+            f"APPLICATION PACK NEEDS INFORMATION: {len(question_lines)} question(s)",
+            flush=True
+        )
         save_message(customer_number, "assistant", reply)
         return {"reply": reply, "documents": [], "ready": False}
 
