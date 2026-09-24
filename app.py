@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import base64
+import mimetypes
 import secrets
 import time
 import threading
@@ -63,7 +65,7 @@ _login_attempts_lock = threading.Lock()
 
 client = OpenAI(
     api_key=OPENAI_API_KEY,
-    timeout=12.0,
+    timeout=30.0,
     max_retries=0,
 )
 
@@ -76,6 +78,44 @@ WHATSAPP_RETRY_RETENTION_DAYS = 30
 LEAD_RETENTION_DAYS = 365
 PRIVACY_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 _last_privacy_cleanup = 0.0
+
+# =========================================================
+# WHATSAPP MEDIA INPUTS
+# =========================================================
+
+# Keep media processing deliberately conservative on the small Render service.
+# Raw customer files are processed in memory only and are not written to disk or
+# stored in the database. The database stores only a short text placeholder.
+MAX_MEDIA_BYTES = 10 * 1024 * 1024
+
+SUPPORTED_IMAGE_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+
+SUPPORTED_DOCUMENT_MIME_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "text/plain",
+    "text/rtf",
+    "application/rtf",
+    "application/vnd.oasis.opendocument.text",
+}
+
+MIME_EXTENSION_FALLBACKS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/msword": ".doc",
+    "text/plain": ".txt",
+    "text/rtf": ".rtf",
+    "application/rtf": ".rtf",
+    "application/vnd.oasis.opendocument.text": ".odt",
+}
 
 # =========================================================
 # DATABASE
@@ -1366,6 +1406,149 @@ def admin_lead_status(lead_id):
 
 
 # =========================================================
+# WHATSAPP MEDIA HELPERS
+# =========================================================
+
+def _safe_media_filename(filename, fallback):
+    """Return a short filename safe to place in prompts and logs."""
+    value = os.path.basename(str(filename or "").strip())
+    value = re.sub(r"[^A-Za-z0-9._() -]+", "_", value)
+    value = value[:120].strip(" .")
+    return value or fallback
+
+
+def describe_whatsapp_media_message(message):
+    """Create the text-only history entry for a media message."""
+    message_type = message.get("type", "")
+    media = message.get(message_type, {}) or {}
+    caption = str(media.get("caption") or "").strip()
+
+    if message_type == "document":
+        filename = _safe_media_filename(
+            media.get("filename"),
+            "whatsapp_document"
+        )
+        description = f"[Customer sent a document: {filename}]"
+    else:
+        description = "[Customer sent an image]"
+
+    if caption:
+        description += f" Caption: {caption[:1000]}"
+
+    return description
+
+
+def download_whatsapp_media(media_id):
+    """
+    Download inbound WhatsApp media into memory.
+    Returns (bytes, mime_type). The temporary Meta media URL is never logged.
+    """
+    if not WHATSAPP_TOKEN:
+        raise RuntimeError("WHATSAPP_TOKEN is not configured")
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+    }
+
+    metadata_response = requests.get(
+        f"https://graph.facebook.com/v25.0/{media_id}",
+        headers=headers,
+        params={"phone_number_id": PHONE_NUMBER_ID} if PHONE_NUMBER_ID else None,
+        timeout=8,
+    )
+    metadata_response.raise_for_status()
+    metadata = metadata_response.json()
+
+    reported_size = int(metadata.get("file_size") or 0)
+    if reported_size and reported_size > MAX_MEDIA_BYTES:
+        raise ValueError("MEDIA_TOO_LARGE")
+
+    media_url = metadata.get("url")
+    if not media_url:
+        raise RuntimeError("WhatsApp media URL missing")
+
+    chunks = bytearray()
+    with requests.get(
+        media_url,
+        headers=headers,
+        stream=True,
+        timeout=(5, 20),
+    ) as media_response:
+        media_response.raise_for_status()
+        for chunk in media_response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            chunks.extend(chunk)
+            if len(chunks) > MAX_MEDIA_BYTES:
+                raise ValueError("MEDIA_TOO_LARGE")
+
+    mime_type = str(metadata.get("mime_type") or "").split(";", 1)[0].strip().lower()
+    return bytes(chunks), mime_type
+
+
+def prepare_media_input_for_openai(message):
+    """Convert a WhatsApp image/document into a Responses API input part."""
+    message_type = message.get("type", "")
+    media = message.get(message_type, {}) or {}
+    media_id = media.get("id")
+    if not media_id:
+        raise RuntimeError("WhatsApp media ID missing")
+
+    media_bytes, downloaded_mime = download_whatsapp_media(media_id)
+    declared_mime = str(media.get("mime_type") or "").split(";", 1)[0].strip().lower()
+
+    if message_type == "document":
+        filename = _safe_media_filename(
+            media.get("filename"),
+            "whatsapp_document"
+        )
+        guessed_mime, _ = mimetypes.guess_type(filename)
+        mime_type = downloaded_mime or declared_mime or guessed_mime or ""
+        if mime_type == "application/octet-stream" and guessed_mime:
+            mime_type = guessed_mime
+
+        if mime_type not in SUPPORTED_DOCUMENT_MIME_TYPES:
+            raise ValueError("UNSUPPORTED_MEDIA")
+
+        if "." not in filename:
+            filename += MIME_EXTENSION_FALLBACKS.get(mime_type, "")
+
+        encoded = base64.b64encode(media_bytes).decode("ascii")
+        part = {
+            "type": "input_file",
+            "filename": filename,
+            "file_data": f"data:{mime_type};base64,{encoded}",
+        }
+        # Keep ordinary business PDFs economical while preserving extracted text.
+        if mime_type == "application/pdf":
+            part["detail"] = "low"
+        return part
+
+    if message_type == "image":
+        mime_type = downloaded_mime or declared_mime
+        if mime_type not in SUPPORTED_IMAGE_MIME_TYPES:
+            raise ValueError("UNSUPPORTED_MEDIA")
+
+        encoded = base64.b64encode(media_bytes).decode("ascii")
+        return {
+            "type": "input_image",
+            "image_url": f"data:{mime_type};base64,{encoded}",
+            "detail": "auto",
+        }
+
+    raise ValueError("UNSUPPORTED_MEDIA")
+
+
+def send_media_problem_reply(customer_number, message_id, customer_message, reply):
+    """Persist and send a deterministic attachment error response."""
+    save_message(customer_number, "user", customer_message)
+    save_message(customer_number, "assistant", reply)
+    store_pending_reply(message_id, reply)
+    sent = send_whatsapp_message(customer_number, reply)
+    finish_whatsapp_message(message_id, sent)
+
+
+# =========================================================
 # META WEBHOOK VERIFICATION
 # =========================================================
 
@@ -1390,7 +1573,7 @@ def verify_webhook():
 @app.route("/webhook", methods=["POST"])
 def receive_webhook():
 
-    data = request.get_json(silent=True)
+    data = request.get_json(silent=True) or {}
 
     print("INCOMING WHATSAPP WEBHOOK", flush=True)
     cleanup_expired_data()
@@ -1404,13 +1587,13 @@ def receive_webhook():
             return "EVENT_RECEIVED", 200
 
         message = value["messages"][0]
+        message_type = message.get("type", "")
 
-        # Text only for this version.
-        if message.get("type") != "text":
+        # This version supports text, common business documents, and images.
+        if message_type not in {"text", "document", "image"}:
             return "EVENT_RECEIVED", 200
 
         customer_number = message["from"]
-        customer_message = message["text"]["body"]
         message_id = message.get("id", "")
 
         message_action, saved_reply = claim_whatsapp_message(
@@ -1442,18 +1625,27 @@ def receive_webhook():
                 .get("name", "")
             )
 
-        print("TEXT MESSAGE ACCEPTED", flush=True)
+        media_input = None
+
+        if message_type == "text":
+            customer_message = message["text"]["body"]
+            print("TEXT MESSAGE ACCEPTED", flush=True)
+        else:
+            customer_message = describe_whatsapp_media_message(message)
+            print(
+                f"MEDIA MESSAGE ACCEPTED: {message_type.upper()}",
+                flush=True
+            )
 
         if is_ai_paused(customer_number):
-            # Keep the customer's message in conversation history so the AI
-            # has context when a human later resumes automation.
+            # Keep a text-only record so the AI has context if automation resumes.
             save_message(customer_number, "user", customer_message)
             finish_whatsapp_message(message_id, True)
             print("AI PAUSED FOR CUSTOMER — HUMAN TAKEOVER ACTIVE", flush=True)
             return "EVENT_RECEIVED", 200
 
-        # Critical fail-safe: an explicit request for a human must not depend
-        # on OpenAI being available or having API credit.
+        # Critical fail-safe: a clear request for a human must not depend on OpenAI.
+        # Media captions are included in customer_message, so the same rule applies.
         if detect_explicit_human_handover(customer_message):
             reply = handle_local_human_handover(
                 customer_number=customer_number,
@@ -1466,9 +1658,67 @@ def receive_webhook():
             print("LOCAL HUMAN HANDOVER ACTIVATED", flush=True)
             return "EVENT_RECEIVED", 200
 
+        if message_type in {"document", "image"}:
+            try:
+                media_input = prepare_media_input_for_openai(message)
+            except ValueError as media_error:
+                if str(media_error) == "MEDIA_TOO_LARGE":
+                    reply = (
+                        "I received your attachment, but it is too large for this "
+                        "assistant to process safely. Please send a smaller file "
+                        "(10 MB or less), preferably PDF, Word, TXT, JPG, PNG or WEBP."
+                    )
+                else:
+                    reply = (
+                        "I received your attachment, but this file type is not "
+                        "supported yet. Please send PDF, Word (DOC/DOCX), TXT, "
+                        "RTF/ODT, JPG, PNG or WEBP."
+                    )
+                send_media_problem_reply(
+                    customer_number,
+                    message_id,
+                    customer_message,
+                    reply,
+                )
+                print(f"MEDIA REJECTED: {media_error}", flush=True)
+                return "EVENT_RECEIVED", 200
+            except requests.RequestException as media_error:
+                reply = (
+                    "I received your attachment but could not download it from "
+                    "WhatsApp just now. Please resend the file or image and try again."
+                )
+                send_media_problem_reply(
+                    customer_number,
+                    message_id,
+                    customer_message,
+                    reply,
+                )
+                print(
+                    f"MEDIA DOWNLOAD ERROR: {type(media_error).__name__}",
+                    flush=True
+                )
+                return "EVENT_RECEIVED", 200
+            except Exception as media_error:
+                reply = (
+                    "I received your attachment but could not process it just now. "
+                    "Please resend it, or ask to speak to the IBROWS team."
+                )
+                send_media_problem_reply(
+                    customer_number,
+                    message_id,
+                    customer_message,
+                    reply,
+                )
+                print(
+                    f"MEDIA PROCESSING ERROR: {type(media_error).__name__}",
+                    flush=True
+                )
+                return "EVENT_RECEIVED", 200
+
         result = generate_ai_reply(
             customer_number,
-            customer_message
+            customer_message,
+            media_input=media_input,
         )
 
         reply = result["reply"]
@@ -1534,7 +1784,7 @@ def receive_webhook():
     except Exception as error:
 
         print(
-            f"Webhook processing error: {error}",
+            f"Webhook processing error: {type(error).__name__}",
             flush=True
         )
 
@@ -1615,25 +1865,52 @@ def validate_ai_structured_output(result):
 
 def generate_ai_reply(
     customer_number,
-    customer_message
+    customer_message,
+    media_input=None,
 ):
 
     try:
 
-        save_message(
-            customer_number,
-            "user",
-            customer_message
-        )
+        if media_input is None:
+            save_message(
+                customer_number,
+                "user",
+                customer_message
+            )
 
-        conversation = get_recent_conversation(
-            customer_number,
-            limit=12
-        )
+            api_input = get_recent_conversation(
+                customer_number,
+                limit=12
+            )
+        else:
+            # Keep only a text placeholder in our database. The raw attachment is
+            # sent to OpenAI for this request only and is not persisted locally.
+            prior_conversation = get_recent_conversation(
+                customer_number,
+                limit=11
+            )
+            save_message(
+                customer_number,
+                "user",
+                customer_message
+            )
+            api_input = prior_conversation + [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": customer_message,
+                        },
+                        media_input,
+                    ],
+                }
+            ]
 
         response = client.responses.create(
 
             model="gpt-5.6-luna",
+            store=False,
 
             instructions="""
 You are the official WhatsApp AI Business Assistant for
@@ -2125,6 +2402,30 @@ Do not expose information belonging to another customer.
 
 
 ============================================================
+CUSTOMER ATTACHMENTS
+============================================================
+
+Customers may send images and business documents such as CVs,
+job adverts, certificates, letters, quotations, or other files.
+
+When an attachment is supplied:
+- Use the attachment together with the recent conversation and any caption.
+- Acknowledge only information actually visible or extractable from the file.
+- Do not invent missing pages, text, names, qualifications, prices, or details.
+- Do not repeat unnecessary personal information from a CV or document in the reply.
+- Do not expose a customer's document contents to another customer.
+- If the customer sent a CV for the existing CV & Cover Letter service, continue
+  that same enquiry rather than treating the document as a separate new service.
+- If a photo is sent for restoration or enhancement, you may describe what was
+  received and collect the customer's requirements, but do not claim the actual
+  restoration/edit has been completed by this WhatsApp assistant.
+- If the attachment is unclear, ask one concise clarifying question.
+
+Raw attachments are not part of long-term conversation memory. Use the attachment
+for the current response and rely on the text history afterwards.
+
+
+============================================================
 FINAL RULE
 ============================================================
 
@@ -2137,7 +2438,7 @@ conversation.
 Return ONLY the required JSON object.
 """,
 
-            input=conversation
+            input=api_input
         )
 
         raw_output = response.output_text.strip()
@@ -2232,7 +2533,7 @@ def privacy_policy():
     <p>IBROWS Enterprise uses WhatsApp to respond to customer enquiries and provide information about its services. Some responses are generated or assisted by artificial intelligence.</p>
     <h2>Information we process</h2><p>We may process your WhatsApp number, WhatsApp profile name made available to us, message content, enquiry details and information needed to follow up your request.</p>
     <h2>Why we use it</h2><p>We use this information to respond to enquiries, maintain recent conversation context, manage business leads, support human follow-up, prevent duplicate message processing, and operate and secure the service.</p>
-    <h2>Service providers</h2><p>WhatsApp/Meta carries the messages. OpenAI may process relevant conversation content to generate AI-assisted responses. Brevo is used to send qualified-lead notifications to IBROWS management. Hosting and database providers process data as necessary to operate the service.</p>
+    <h2>Service providers</h2><p>WhatsApp/Meta carries the messages and attachments. OpenAI may process relevant conversation content and supported attachments to generate AI-assisted responses. Raw attachment files are processed in memory by this service and are not stored in the IBROWS database by this version. Brevo is used to send qualified-lead notifications to IBROWS management. Hosting and database providers process data as necessary to operate the service.</p>
     <h2>Retention</h2><p>Ordinary conversation history is retained for up to 90 days. Technical WhatsApp retry records are retained for up to 30 days. Inactive business leads are retained for up to 12 months, unless longer retention is reasonably required for legal, accounting, dispute-resolution, or other legitimate obligations.</p>
     <h2>Safety</h2><p>Do not send passwords, banking PINs, OTP/security codes or full payment-card credentials through the assistant. IBROWS does not sell customer personal information.</p>
     <h2>Your data</h2><p>You may request access to, correction of, or deletion of information associated with your interactions by contacting <strong>ibrowsenterprise@gmail.com</strong>. We may request reasonable information to verify the request before acting on it.</p>
