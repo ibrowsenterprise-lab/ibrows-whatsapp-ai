@@ -1541,6 +1541,74 @@ def receive_webhook():
     return "EVENT_RECEIVED", 200
 
 
+
+AI_OUTPUT_KEYS = {
+    "reply",
+    "lead_required",
+    "service",
+    "lead_summary",
+    "handover_reason",
+}
+
+
+def validate_ai_structured_output(result):
+    """
+    Strictly validate model output before it can affect WhatsApp replies,
+    lead creation, or human-handover metadata.
+    """
+    if not isinstance(result, dict):
+        raise ValueError("AI output must be a JSON object")
+
+    if set(result.keys()) != AI_OUTPUT_KEYS:
+        raise ValueError("AI output has missing or unexpected fields")
+
+    if not isinstance(result["reply"], str):
+        raise ValueError("AI reply must be a string")
+
+    reply = result["reply"].strip()
+    if not reply or len(reply) > 4000:
+        raise ValueError("AI reply is empty or too long")
+
+    if type(result["lead_required"]) is not bool:
+        raise ValueError("lead_required must be a JSON boolean")
+
+    for field in ("service", "lead_summary", "handover_reason"):
+        if not isinstance(result[field], str):
+            raise ValueError(f"{field} must be a string")
+
+    service = result["service"].strip()
+    lead_summary = result["lead_summary"].strip()
+    handover_reason = result["handover_reason"].strip()
+
+    if len(service) > 100:
+        raise ValueError("service is too long")
+    if len(lead_summary) > 1500:
+        raise ValueError("lead_summary is too long")
+    if len(handover_reason) > 800:
+        raise ValueError("handover_reason is too long")
+
+    if result["lead_required"]:
+        # A lead must contain useful, explicit handover data. This prevents
+        # malformed model output from silently creating low-quality leads.
+        if not service or not lead_summary or not handover_reason:
+            raise ValueError("qualified lead is missing required handover data")
+    else:
+        # Non-lead output is not allowed to smuggle lead/handover metadata
+        # into downstream processing.
+        service = ""
+        lead_summary = ""
+        handover_reason = ""
+
+    return {
+        "reply": reply,
+        "lead_required": result["lead_required"],
+        "service": service,
+        "lead_summary": lead_summary,
+        "handover_reason": handover_reason,
+    }
+
+
+
 # =========================================================
 # OPENAI BUSINESS ASSISTANT
 # =========================================================
@@ -2074,37 +2142,17 @@ Return ONLY the required JSON object.
 
         raw_output = response.output_text.strip()
 
-        result = json.loads(raw_output)
+        parsed_result = json.loads(raw_output)
+        final_result = validate_ai_structured_output(parsed_result)
 
         print(
-            "AI STRUCTURED OUTPUT OK: "
-            f"lead_required={bool(result.get('lead_required', False))}, "
-            f"service={canonicalize_service(result.get('service', ''))}",
+            "AI STRUCTURED OUTPUT VALIDATED: "
+            f"lead_required={final_result['lead_required']}, "
+            f"service={canonicalize_service(final_result['service'])}",
             flush=True
         )
 
-        reply = str(
-            result.get(
-                "reply",
-                "Thank you for contacting IBROWS Enterprise."
-            )
-        ).strip()
-
-        final_result = {
-            "reply": reply,
-            "lead_required": bool(
-                result.get("lead_required", False)
-            ),
-            "service": str(
-                result.get("service", "")
-            ).strip(),
-            "lead_summary": str(
-                result.get("lead_summary", "")
-            ).strip(),
-            "handover_reason": str(
-                result.get("handover_reason", "")
-            ).strip()
-        }
+        reply = final_result["reply"]
 
         save_message(
             customer_number,
