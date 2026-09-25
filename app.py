@@ -1665,6 +1665,64 @@ def save_application_evidence_corrections_from_findings(customer_number, finding
         return 0
 
 
+def _final_safe_directed_corrections(audit):
+    """
+    Return explicit old->new replacements for one final safe correction pass.
+
+    This is intentionally narrow:
+    - generic/document 'issues' are never auto-fixed here;
+    - unresolved requires_human findings are never auto-fixed here;
+    - every accepted finding must contain an explicit auditor-provided
+      replacement, so the code is not inventing replacement wording.
+    """
+    if not audit:
+        return []
+
+    if audit.get("issues"):
+        return []
+
+    safe_human = _safe_human_findings_for_auto_repair(audit)
+    safe_human_set = set(safe_human)
+    unresolved_human = [
+        item for item in (audit.get("requires_human") or [])
+        if item not in safe_human_set
+    ]
+    if unresolved_human:
+        return []
+
+    findings = []
+    findings.extend(audit.get("minor_repairable") or [])
+    findings.extend(safe_human)
+    findings = list(dict.fromkeys(
+        str(item).strip() for item in findings if str(item).strip()
+    ))
+    if not findings:
+        return []
+
+    replacements = []
+    for finding in findings[:8]:
+        replacement = _extract_explicit_qa_replacement(finding)
+        if not replacement:
+            return []
+        old_text, new_text = replacement
+        replacements.append((old_text, new_text, finding))
+
+    return replacements
+
+
+def _apply_directed_corrections(pack, directed):
+    for old_text, new_text, _ in directed or []:
+        pack["cv"] = _replace_text_in_application_documents(
+            pack.get("cv") or {}, old_text, new_text
+        )
+        pack["cover_letter"] = _replace_text_in_application_documents(
+            pack.get("cover_letter") or {}, old_text, new_text
+        )
+    normalize_application_pack_for_delivery(pack)
+    return pack
+
+
+
 def repair_application_pack_from_minor_findings(customer_number, pack, findings):
     """Repair only evidence-backed wording drift; never invent or broaden candidate facts."""
     memory_context, _ = build_application_evidence_context(customer_number)
@@ -2370,13 +2428,118 @@ def process_application_pack(customer_number, customer_name, customer_message):
                 print("APPLICATION PACK QA AUTO-REPAIR COMPLETED", flush=True)
                 print("APPLICATION PACK QUALITY PASSED AFTER AUTO-REPAIR", flush=True)
             else:
-                quality_issues = repaired_issues or [
-                    "Automatic QA repair did not produce a safely approved application pack."
-                ]
-                print(
-                    f"APPLICATION PACK QUALITY BLOCKED AFTER AUTO-REPAIR: {len(quality_issues)} issue(s)",
-                    flush=True,
-                )
+                # One final deterministic correction is allowed only when the
+                # second auditor supplies explicit safe old->new wording for
+                # every remaining low-risk finding. This prevents a harmless
+                # wording refinement from bouncing indefinitely to human review.
+                directed = _final_safe_directed_corrections(repaired_audit)
+                directed_passed = False
+
+                if (
+                    directed
+                    and not repaired_deterministic
+                    and APPLICATION_PACK_QA_MAX_REPAIR_ATTEMPTS > 0
+                ):
+                    print(
+                        f"APPLICATION PACK QA DIRECTED CORRECTION STARTED: {len(directed)} issue(s)",
+                        flush=True,
+                    )
+                    directed_pack = _apply_directed_corrections(repaired_pack, directed)
+                    directed_pack, directed_normalizations = apply_persistent_evidence_normalization(
+                        customer_number,
+                        directed_pack,
+                    )
+                    if directed_normalizations:
+                        print(
+                            f"APPLICATION PACK EVIDENCE NORMALIZATION AFTER DIRECTED CORRECTION: "
+                            f"{len(directed_normalizations)} change(s)",
+                            flush=True,
+                        )
+
+                    directed_deterministic = deterministic_application_quality_issues(
+                        directed_pack
+                    )
+                    directed_deterministic.extend(
+                        deterministic_evidence_normalization_issues(
+                            customer_number,
+                            directed_pack,
+                        )
+                    )
+
+                    directed_audit = None
+                    if not directed_deterministic:
+                        directed_audit = audit_application_pack_against_evidence(
+                            customer_number,
+                            directed_pack,
+                        )
+
+                    directed_issues = list(directed_deterministic)
+                    if directed_audit:
+                        directed_issues.extend(
+                            directed_audit.get("minor_repairable", [])
+                        )
+                        directed_issues.extend(
+                            directed_audit.get("requires_human", [])
+                        )
+                        directed_issues.extend(
+                            directed_audit.get("issues", [])
+                        )
+                    directed_issues = list(dict.fromkeys(
+                        str(item).strip()
+                        for item in directed_issues
+                        if str(item).strip()
+                    ))
+
+                    if (
+                        not directed_issues
+                        and directed_audit
+                        and directed_audit.get("approved")
+                    ):
+                        pack = directed_pack
+                        quality_issues = []
+                        remembered = save_application_evidence_corrections(
+                            customer_number,
+                            [(old_text, new_text) for old_text, new_text, _ in directed],
+                            source="approved-directed-correction",
+                        )
+                        remembered += save_application_evidence_corrections_from_findings(
+                            customer_number,
+                            minor_findings,
+                            source="approved-auto-repair",
+                        )
+                        if remembered:
+                            print(
+                                f"APPLICATION PACK EVIDENCE CORRECTIONS REMEMBERED: {remembered}",
+                                flush=True,
+                            )
+                        print(
+                            "APPLICATION PACK QA DIRECTED CORRECTION COMPLETED",
+                            flush=True,
+                        )
+                        print(
+                            "APPLICATION PACK QUALITY PASSED AFTER DIRECTED CORRECTION",
+                            flush=True,
+                        )
+                        directed_passed = True
+                    else:
+                        quality_issues = directed_issues or [
+                            "Final auditor-directed correction did not produce a safely approved application pack."
+                        ]
+                        print(
+                            f"APPLICATION PACK QUALITY BLOCKED AFTER DIRECTED CORRECTION: "
+                            f"{len(quality_issues)} issue(s)",
+                            flush=True,
+                        )
+
+                if not directed_passed and not directed:
+                    quality_issues = repaired_issues or [
+                        "Automatic QA repair did not produce a safely approved application pack."
+                    ]
+                    print(
+                        f"APPLICATION PACK QUALITY BLOCKED AFTER AUTO-REPAIR: "
+                        f"{len(quality_issues)} issue(s)",
+                        flush=True,
+                    )
         except Exception as repair_error:
             print(f"APPLICATION PACK QA AUTO-REPAIR ERROR: {type(repair_error).__name__}", flush=True)
             quality_issues = list(dict.fromkeys(quality_issues + [
