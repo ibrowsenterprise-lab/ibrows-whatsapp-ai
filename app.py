@@ -3837,6 +3837,115 @@ def get_lead_counts():
     return counts
 
 
+
+def _crm_amount_lines(amounts):
+    """Return stable per-currency labels without unsafe FX aggregation."""
+    order = ["MWK", "USD", "ZAR", "EUR", "GBP"]
+    lines = []
+    for currency in order:
+        amount = amounts.get(currency)
+        if amount is None:
+            continue
+        amount = Decimal(amount)
+        if amount == 0:
+            continue
+        lines.append({
+            "currency": currency,
+            "amount": amount,
+            "label": _format_crm_amount(amount, currency),
+        })
+    for currency in sorted(set(amounts) - set(order)):
+        amount = Decimal(amounts[currency])
+        if amount:
+            lines.append({
+                "currency": currency,
+                "amount": amount,
+                "label": _format_crm_amount(amount, currency),
+            })
+    return lines
+
+
+def get_pipeline_summary():
+    """
+    Business-wide commercial summary.
+    Different currencies are kept separate; no implied FX conversion is made.
+    """
+    buckets = {
+        "open": {},
+        "sent": {},
+        "accepted": {},
+    }
+    quote_counts = {key: 0 for key in QUOTE_STATUSES}
+    unpriced_open = 0
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    status,
+                    COALESCE(quote_status, 'NOT_STARTED'),
+                    COALESCE(value_currency, 'MWK'),
+                    estimated_value
+                FROM leads
+                WHERE merged_into_lead_id IS NULL
+                """
+            )
+            rows = cur.fetchall()
+
+    for status, quote_status, currency, estimated_value in rows:
+        quote_status = quote_status if quote_status in QUOTE_STATUSES else "NOT_STARTED"
+        quote_counts[quote_status] = quote_counts.get(quote_status, 0) + 1
+        currency = currency or "MWK"
+
+        if status != "CLOSED" and estimated_value is None:
+            unpriced_open += 1
+
+        if estimated_value is None:
+            continue
+
+        amount = Decimal(estimated_value)
+
+        if status != "CLOSED" and quote_status != "DECLINED":
+            buckets["open"][currency] = buckets["open"].get(currency, Decimal("0")) + amount
+
+        if status != "CLOSED" and quote_status == "SENT":
+            buckets["sent"][currency] = buckets["sent"].get(currency, Decimal("0")) + amount
+
+        if quote_status == "ACCEPTED":
+            buckets["accepted"][currency] = buckets["accepted"].get(currency, Decimal("0")) + amount
+
+    return {
+        "open": _crm_amount_lines(buckets["open"]),
+        "sent": _crm_amount_lines(buckets["sent"]),
+        "accepted": _crm_amount_lines(buckets["accepted"]),
+        "quote_counts": quote_counts,
+        "unpriced_open": unpriced_open,
+    }
+
+
+def summarize_customer_values(leads):
+    buckets = {"open": {}, "accepted": {}}
+    for lead in leads or []:
+        amount = lead.get("estimated_value")
+        if amount is None:
+            continue
+        currency = lead.get("value_currency") or "MWK"
+        amount = Decimal(amount)
+        quote_status = lead.get("quote_status") or "NOT_STARTED"
+
+        if lead.get("status") != "CLOSED" and quote_status != "DECLINED":
+            buckets["open"][currency] = buckets["open"].get(currency, Decimal("0")) + amount
+        if quote_status == "ACCEPTED":
+            buckets["accepted"][currency] = buckets["accepted"].get(currency, Decimal("0")) + amount
+
+    return {
+        "open": _crm_amount_lines(buckets["open"]),
+        "accepted": _crm_amount_lines(buckets["accepted"]),
+    }
+
+
+
 def get_recent_lead_notes(lead_ids, per_lead=3):
     if not lead_ids:
         return {}
@@ -4649,9 +4758,10 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:14px 0}
 .stat{display:block;text-decoration:none;color:#101828;background:white;padding:13px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
 .stat-number{font-size:23px;font-weight:800}.stat-label{color:#667085;font-size:11px;margin-top:3px}
+.pipeline{background:white;border-radius:12px;padding:12px;margin:0 0 12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.pipeline h2{font-size:16px;margin:0 0 9px}.pipeline-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.pipe{background:#f9fafb;border-radius:10px;padding:10px}.pipe-title{font-size:11px;font-weight:800;color:#667085;margin-bottom:5px}.pipe-value{font-size:13px;font-weight:800;line-height:1.5}.pipe-empty{color:#98a2b3;font-weight:600}.pipe-note{font-size:10px;color:#98a2b3;margin-top:6px;line-height:1.35}
 .stat.attention{border:1px solid #f2b8a0}
 .tools{background:white;border-radius:12px;padding:11px;margin:0 0 12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
-.search-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(130px,190px) minmax(110px,150px) auto;gap:7px}
+.search-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(125px,180px) minmax(105px,140px) minmax(120px,150px) auto;gap:7px}
 .search-row input,.search-row select{min-width:0;border:1px solid #d0d5dd;border-radius:9px;padding:10px;font-size:14px;background:#fff;color:#101828}
 .search-row button{border:0;background:#101828;color:#fff;border-radius:9px;padding:0 14px;font-weight:700}
 .filters{display:flex;gap:7px;overflow-x:auto;padding-top:9px;scrollbar-width:none}.filters::-webkit-scrollbar{display:none}
@@ -4678,6 +4788,7 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 .pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:15px 0 26px}.page-link{flex:1;text-align:center;text-decoration:none;border:1px solid #d0d5dd;background:white;color:#344054;border-radius:9px;padding:9px;font-weight:700}.page-link.disabled{opacity:.45;pointer-events:none}.page-info{font-size:12px;color:#667085;white-space:nowrap}
 @media(max-width:760px){
  .stats{grid-template-columns:repeat(2,1fr)}.stats .stat:last-child{grid-column:1/-1}
+ .pipeline-grid{grid-template-columns:1fr 1fr}
  .search-row{grid-template-columns:1fr 1fr}.search-row input{grid-column:1/-1}.search-row button{padding:10px}
  .manage-grid{grid-template-columns:1fr}.note-form{grid-column:auto}
  .container,.header-inner{padding-left:11px;padding-right:11px}
@@ -4704,17 +4815,28 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 <a class="stat" href="{{ url_for('admin_leads', status='CLOSED') }}"><div class="stat-number">{{ counts.CLOSED }}</div><div class="stat-label">Closed</div></a>
 </div>
 
+<div class="pipeline">
+<h2>Sales pipeline</h2>
+<div class="pipeline-grid">
+<div class="pipe"><div class="pipe-title">Open estimated value</div><div class="pipe-value">{% if pipeline.open %}{% for item in pipeline.open %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="pipe-empty">No priced open leads</span>{% endif %}</div></div>
+<div class="pipe"><div class="pipe-title">Quotes sent</div><div class="pipe-value">{% if pipeline.sent %}{% for item in pipeline.sent %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="pipe-empty">None</span>{% endif %}</div></div>
+<div class="pipe"><div class="pipe-title">Accepted value</div><div class="pipe-value">{% if pipeline.accepted %}{% for item in pipeline.accepted %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="pipe-empty">None</span>{% endif %}</div></div>
+<div class="pipe"><div class="pipe-title">Open leads without value</div><div class="pipe-value">{{ pipeline.unpriced_open }}</div><div class="pipe-note">Currencies are kept separate; IBROWS does not apply an FX conversion.</div></div>
+</div>
+</div>
+
 <div class="tools">
 <form class="search-row" method="GET" action="{{ url_for('admin_leads') }}">
 <input name="q" value="{{ search_query }}" placeholder="Search name, number, service, notes or enquiry">
 <select name="service"><option value="">All services</option>{% for service in services %}<option value="{{ service }}" {% if service_filter == service %}selected{% endif %}>{{ service }}</option>{% endfor %}</select>
 <select name="priority"><option value="">All priorities</option>{% for p in ['URGENT','HIGH','NORMAL','LOW'] %}<option value="{{ p }}" {% if priority_filter == p %}selected{% endif %}>{{ p.title() }}</option>{% endfor %}</select>
-<input type="hidden" name="status" value="{{ status_filter }}"><input type="hidden" name="attention" value="{{ attention_filter }}">
+<select name="quote"><option value="">All quote stages</option>{% for key,label in [('NOT_STARTED','Not started'),('DRAFT','Draft'),('SENT','Sent'),('ACCEPTED','Accepted'),('DECLINED','Declined')] %}<option value="{{ key }}" {% if quote_filter == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+<input type="hidden" name="status" value="{{ status_filter }}"><input type="hidden" name="attention" value="{{ '1' if attention_filter else '' }}">
 <button type="submit">Search</button>
 </form>
 <div class="filters">
-{% for item in ['ALL','NEW','CONTACTED','CLOSED'] %}<a class="filter {% if status_filter == item and not attention_filter %}active{% endif %}" href="{{ url_for('admin_leads', status=item, q=search_query, service=service_filter, priority=priority_filter) }}">{{ item.title() }}</a>{% endfor %}
-<a class="filter {% if attention_filter %}active{% endif %}" href="{{ url_for('admin_leads', attention='1', q=search_query, service=service_filter, priority=priority_filter) }}">Needs Attention</a>
+{% for item in ['ALL','NEW','CONTACTED','CLOSED'] %}<a class="filter {% if status_filter == item and not attention_filter %}active{% endif %}" href="{{ url_for('admin_leads', status=item, q=search_query, service=service_filter, priority=priority_filter, quote=quote_filter) }}">{{ item.title() }}</a>{% endfor %}
+<a class="filter {% if attention_filter %}active{% endif %}" href="{{ url_for('admin_leads', attention='1', q=search_query, service=service_filter, priority=priority_filter, quote=quote_filter) }}">Needs Attention</a>
 </div>
 </div>
 
@@ -4939,6 +5061,11 @@ def admin_leads():
     priority_filter = request.args.get("priority", "").strip().upper()
     if priority_filter not in {"", "LOW", "NORMAL", "HIGH", "URGENT"}:
         priority_filter = ""
+
+    quote_filter = request.args.get("quote", "").strip().upper()
+    if quote_filter not in {"", "NOT_STARTED", "DRAFT", "SENT", "ACCEPTED", "DECLINED"}:
+        quote_filter = ""
+
     attention_filter = request.args.get("attention", "").strip() == "1"
 
     services = sorted({
@@ -4963,6 +5090,12 @@ def admin_leads():
 
     if priority_filter:
         leads = [lead for lead in leads if lead["priority"] == priority_filter]
+
+    if quote_filter:
+        leads = [
+            lead for lead in leads
+            if (lead.get("quote_status") or "NOT_STARTED") == quote_filter
+        ]
 
     if search_query:
         needle = search_query.casefold()
@@ -4997,6 +5130,7 @@ def admin_leads():
         "q": search_query,
         "service": service_filter,
         "priority": priority_filter,
+        "quote": quote_filter,
         "attention": "1" if attention_filter else "",
     }
     prev_url = url_for("admin_leads", page=max(1, page - 1), **common_args)
@@ -5017,8 +5151,10 @@ def admin_leads():
         search_query=search_query,
         service_filter=service_filter,
         priority_filter=priority_filter,
+        quote_filter=quote_filter,
         attention_filter=attention_filter,
         services=services,
+        pipeline=get_pipeline_summary(),
         total_filtered=total_filtered,
         page=page,
         total_pages=total_pages,
@@ -5048,6 +5184,7 @@ header{background:#101828;color:#fff;padding:16px 0;position:sticky;top:0;z-inde
 .hero,.card{background:#fff;border-radius:14px;padding:16px;margin-top:14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
 .duplicate-card{border:1px solid #f2b8a0;background:#fffaf7}.duplicate-item{padding:11px 0;border-top:1px solid #f2e4dc}.duplicate-item:first-of-type{border-top:0}.duplicate-item strong{display:block;margin-bottom:4px}.merge-form button{width:100%;margin-top:8px;border:0;border-radius:9px;padding:10px;background:#101828;color:white;font-weight:800}.safety{font-size:12px;color:#667085;line-height:1.45}.merged-note{margin-top:8px;font-size:12px;color:#667085}
 .hero h1{margin:0 0 5px;font-size:23px}.phone a{color:#175cd3;text-decoration:none}.muted{color:#667085}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.metric{background:#f9fafb;border-radius:10px;padding:10px}.metric b{display:block;font-size:19px}.metric span{font-size:11px;color:#667085}
+.customer-value{margin-top:10px;background:#f9fafb;border-radius:10px;padding:10px}.customer-value-title{font-size:11px;color:#667085;font-weight:800}.customer-value-row{display:flex;justify-content:space-between;gap:12px;margin-top:5px;font-size:13px}.customer-value-row b{text-align:right}.fx-note{font-size:10px;color:#98a2b3;margin-top:6px}
 .lead-head{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.service{font-size:17px;font-weight:800}.badges{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.badge{font-size:10px;font-weight:800;background:#eef2f6;border-radius:16px;padding:6px 8px}.commercial{margin-top:8px;font-weight:800;font-size:13px}.summary{margin-top:8px;line-height:1.45;font-size:14px}.meta{font-size:11px;color:#98a2b3;margin-top:8px}.timeline h2,.services h2{margin:0 0 10px;font-size:19px}
 .event{position:relative;padding:0 0 15px 20px;border-left:2px solid #d0d5dd;margin-left:5px}.event:last-child{border-left-color:transparent}.dot{position:absolute;left:-6px;top:2px;width:10px;height:10px;background:#101828;border-radius:50%}.event-title{font-weight:800;font-size:13px}.event-desc{font-size:13px;line-height:1.4;margin-top:3px}.event-time{font-size:11px;color:#98a2b3;margin-top:4px}.whatsapp{display:block;text-align:center;background:#157347;color:white;text-decoration:none;border-radius:9px;padding:11px;margin-top:12px;font-weight:800}
 @media(max-width:620px){.metrics{grid-template-columns:1fr 1fr}.metrics .metric:last-child{grid-column:1/-1}}
@@ -5066,6 +5203,14 @@ header{background:#101828;color:#fff;padding:16px 0;position:sticky;top:0;z-inde
 <div class="metric"><b>{{ services_count }}</b><span>Services used</span></div>
 {% if archived_merged_count %}<div class="metric"><b>{{ archived_merged_count }}</b><span>Merged history</span></div>{% endif %}
 </div>
+{% if customer_values.open or customer_values.accepted %}
+<div class="customer-value">
+<div class="customer-value-title">Customer commercial summary</div>
+{% if customer_values.open %}<div class="customer-value-row"><span>Open estimated value</span><b>{% for item in customer_values.open %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</b></div>{% endif %}
+{% if customer_values.accepted %}<div class="customer-value-row"><span>Accepted value</span><b>{% for item in customer_values.accepted %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</b></div>{% endif %}
+<div class="fx-note">Different currencies are shown separately; no exchange-rate conversion is applied.</div>
+</div>
+{% endif %}
 <a class="whatsapp" href="https://wa.me/{{ customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a>
 {% if archived_merged_count %}<div class="merged-note">{{ archived_merged_count }} older duplicate record{% if archived_merged_count != 1 %}s{% endif %} retained safely as merged history.</div>{% endif %}
 </div>
@@ -5174,6 +5319,7 @@ def admin_customer_history(customer_number):
         services_count=len({lead["service"] for lead in leads}),
         archived_merged_count=profile.get("archived_merged_count", 0),
         duplicate_groups=profile.get("duplicate_groups", []),
+        customer_values=summarize_customer_values(leads),
         csrf_token=get_csrf_token(),
         return_to=return_to,
     )
