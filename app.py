@@ -351,6 +351,16 @@ def init_database():
             """)
 
             cur.execute("""
+                ALTER TABLE business_documents
+                ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ
+            """)
+
+            cur.execute("""
+                ALTER TABLE business_documents
+                ADD COLUMN IF NOT EXISTS send_count INTEGER NOT NULL DEFAULT 0
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS lead_notes (
                     id BIGSERIAL PRIMARY KEY,
                     lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
@@ -3675,6 +3685,59 @@ def get_or_create_business_document_record(doc_type, lead_id, payment_id=None):
     }
 
 
+
+def get_customer_business_documents(customer_number):
+    """
+    Return the customer's permanent document registry, including documents
+    attached to merged historical lead records.
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    d.id,
+                    d.lead_id,
+                    d.payment_id,
+                    d.doc_type,
+                    d.document_number,
+                    d.issued_at,
+                    d.last_sent_at,
+                    COALESCE(d.send_count, 0),
+                    l.service,
+                    l.merged_into_lead_id
+                FROM business_documents d
+                JOIN leads l ON l.id = d.lead_id
+                WHERE l.customer_number = %s
+                ORDER BY d.issued_at DESC, d.id DESC
+                """,
+                (customer_number,)
+            )
+            rows = cur.fetchall()
+
+    documents = []
+    for row in rows:
+        doc_type = row[3]
+        documents.append({
+            "id": row[0],
+            "lead_id": row[1],
+            "payment_id": row[2],
+            "doc_type": doc_type,
+            "doc_type_label": BUSINESS_DOCUMENT_TYPES.get(
+                doc_type,
+                str(doc_type or "").replace("_", " ").title(),
+            ),
+            "document_number": row[4],
+            "issued_at": row[5],
+            "last_sent_at": row[6],
+            "send_count": int(row[7] or 0),
+            "service": canonicalize_service(row[8]),
+            "merged_historical": row[9] is not None,
+        })
+    return documents
+
+
+
 def get_latest_payment_by_lead(lead_ids):
     if not lead_ids:
         return {}
@@ -4134,6 +4197,17 @@ def _business_doc_response(document):
 def _record_document_sent_activity(lead_id, doc_type, reference):
     with get_db() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE business_documents
+                SET last_sent_at = NOW(),
+                    send_count = COALESCE(send_count, 0) + 1
+                WHERE document_number = %s
+                  AND lead_id = %s
+                  AND doc_type = %s
+                """,
+                (reference, lead_id, doc_type)
+            )
             _activity_insert(
                 cur,
                 lead_id,
@@ -6212,6 +6286,7 @@ header{background:#101828;color:#fff;padding:16px 0;position:sticky;top:0;z-inde
 .customer-value{margin-top:10px;background:#f9fafb;border-radius:10px;padding:10px}.customer-value-title{font-size:11px;color:#667085;font-weight:800}.customer-value-row{display:flex;justify-content:space-between;gap:12px;margin-top:5px;font-size:13px}.customer-value-row b{text-align:right}.fx-note{font-size:10px;color:#98a2b3;margin-top:6px}
 .lead-head{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.service{font-size:17px;font-weight:800}.badges{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.badge{font-size:10px;font-weight:800;background:#eef2f6;border-radius:16px;padding:6px 8px}.commercial{margin-top:8px;font-weight:800;font-size:13px}.summary{margin-top:8px;line-height:1.45;font-size:14px}.meta{font-size:11px;color:#98a2b3;margin-top:8px}.timeline h2,.services h2{margin:0 0 10px;font-size:19px}
 .event{position:relative;padding:0 0 15px 20px;border-left:2px solid #d0d5dd;margin-left:5px}.event:last-child{border-left-color:transparent}.dot{position:absolute;left:-6px;top:2px;width:10px;height:10px;background:#101828;border-radius:50%}.event-title{font-weight:800;font-size:13px}.event-desc{font-size:13px;line-height:1.4;margin-top:3px}.event-time{font-size:11px;color:#98a2b3;margin-top:4px}.whatsapp{display:block;text-align:center;background:#157347;color:white;text-decoration:none;border-radius:9px;padding:11px;margin-top:12px;font-weight:800}
+.doc-row{padding:13px 0;border-bottom:1px solid #eaecf0}.doc-row:last-child{border-bottom:0}.doc-number{font-size:15px;font-weight:800}.doc-sub{margin-top:4px;font-size:12px;color:#667085;line-height:1.4}.doc-actions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:9px}.doc-actions a,.doc-actions button{display:block;width:100%;text-align:center;text-decoration:none;border-radius:8px;padding:9px 7px;font-weight:800;font-size:12px}.doc-actions a{border:1px solid #d0d5dd;color:#101828;background:#fff}.doc-actions button{border:1px solid #101828;background:#101828;color:#fff}.doc-actions form{margin:0}.historical-tag{font-size:10px;color:#667085;background:#f2f4f7;border-radius:12px;padding:4px 7px;margin-left:5px}
 @media(max-width:620px){.metrics{grid-template-columns:1fr 1fr}.metrics .metric:last-child{grid-column:1/-1}}
 </style>
 <script src="{{ url_for('admin_pwa_js') }}" defer></script>
@@ -6295,6 +6370,37 @@ header{background:#101828;color:#fff;padding:16px 0;position:sticky;top:0;z-inde
 </div>
 {% endif %}
 
+{% if documents %}
+<div class="card services">
+<h2>Document registry</h2>
+<div class="muted" style="font-size:12px;margin-bottom:7px">Permanent IBROWS quotations, invoices and receipts issued for this customer.</div>
+{% for doc in documents %}
+<div class="doc-row">
+<div class="lead-head">
+<div>
+<div class="doc-number">{{ doc.document_number }}</div>
+<div class="doc-sub">{{ doc.doc_type_label }} · {{ doc.service }}{% if doc.merged_historical %}<span class="historical-tag">Merged history</span>{% endif %}</div>
+</div>
+<div class="badge">{% if doc.send_count %}SENT{% else %}GENERATED{% endif %}</div>
+</div>
+<div class="doc-sub">
+Issued {{ doc.issued_label }}
+{% if doc.send_count %} · Sent {{ doc.send_count }} time{% if doc.send_count != 1 %}s{% endif %} · Last sent {{ doc.last_sent_label }}{% else %} · Not yet sent{% endif %}
+</div>
+<div class="doc-actions">
+<a href="{{ url_for('admin_business_document_download', lead_id=doc.lead_id, doc_type=doc.doc_type, payment_id=doc.payment_id) }}">Download</a>
+<form method="POST" action="{{ url_for('admin_business_document_send', lead_id=doc.lead_id, doc_type=doc.doc_type) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+{% if doc.payment_id %}<input type="hidden" name="payment_id" value="{{ doc.payment_id }}">{% endif %}
+<input type="hidden" name="return_to" value="{{ crm_return }}">
+<button type="submit">Send on WhatsApp</button>
+</form>
+</div>
+</div>
+{% endfor %}
+</div>
+{% endif %}
+
 <div class="card timeline">
 <h2>Activity timeline</h2>
 {% if timeline %}
@@ -6322,6 +6428,7 @@ def admin_customer_history(customer_number):
     leads = profile["leads"]
     timeline = profile["timeline"]
     payments = profile.get("payments", [])
+    documents = get_customer_business_documents(customer_number)
     payment_totals = get_payment_totals_by_lead([lead["id"] for lead in leads])
     customer_name = next(
         (lead["customer_name"] for lead in leads if lead.get("customer_name")),
@@ -6376,7 +6483,24 @@ def admin_customer_history(customer_number):
             ADMIN_TIMEZONE
         ).strftime("%d %b %Y %H:%M")
 
+    for doc in documents:
+        doc["issued_label"] = doc["issued_at"].astimezone(
+            ADMIN_TIMEZONE
+        ).strftime("%d %b %Y %H:%M")
+        doc["last_sent_label"] = (
+            doc["last_sent_at"].astimezone(ADMIN_TIMEZONE).strftime(
+                "%d %b %Y %H:%M"
+            )
+            if doc["last_sent_at"]
+            else ""
+        )
+
     return_to = _safe_admin_return_path(request.args.get("return_to"))
+    crm_return = url_for(
+        "admin_customer_history",
+        customer_number=customer_number,
+        return_to=return_to,
+    )
     return render_template_string(
         CUSTOMER_CRM_TEMPLATE,
         customer_number=customer_number,
@@ -6389,7 +6513,9 @@ def admin_customer_history(customer_number):
         duplicate_groups=profile.get("duplicate_groups", []),
         customer_values=summarize_customer_values(leads, payment_totals),
         payments=payments,
+        documents=documents,
         csrf_token=get_csrf_token(),
+        crm_return=crm_return,
         return_to=return_to,
     )
 
