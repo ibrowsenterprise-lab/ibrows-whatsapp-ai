@@ -1094,6 +1094,43 @@ def _normalise_letter_signoff(signoff, candidate_name):
         raw += ","
     return raw
 
+
+_LETTER_CLOSING_TAIL_RE = re.compile(
+    r"""(?ix)
+    (?:
+        [\s\n\r,;:\-–—]*
+        (?:
+            yours\s+faithfully |
+            yours\s+sincerely |
+            sincerely |
+            kind\s+regards |
+            best\s+regards |
+            regards |
+            respectfully
+        )
+        \s*[,.;:]?
+        (?:\s+[A-Z][A-Za-z'’.\-]+(?:\s+[A-Z][A-Za-z'’.\-]+){0,4})?
+        \s*$
+    )
+    """
+)
+
+
+def _remove_closing_from_letter_paragraph(paragraph):
+    """
+    Remove a closing/signature accidentally embedded at the end of a body paragraph.
+    The structured signoff is rendered separately, so keeping it in a paragraph
+    would duplicate 'Yours faithfully' and sometimes the candidate name.
+    """
+    raw = str(paragraph or "").strip()
+    if not raw:
+        return ""
+
+    cleaned = _LETTER_CLOSING_TAIL_RE.sub("", raw).strip()
+    # Clean punctuation/space left behind only at the new end.
+    cleaned = re.sub(r"[\s,;:\-–—]+$", "", cleaned).strip()
+    return cleaned
+
 def normalize_application_pack_for_delivery(pack):
     """Apply deterministic, truth-preserving presentation rules before QA/document creation."""
     letter = pack.get("cover_letter") or {}
@@ -1123,6 +1160,7 @@ def normalize_application_pack_for_delivery(pack):
         if _is_defensive_gap_paragraph(paragraph):
             continue
         paragraph = _remove_background_sentences(paragraph)
+        paragraph = _remove_closing_from_letter_paragraph(paragraph)
         if paragraph:
             cleaned_paragraphs.append(paragraph)
     letter["paragraphs"] = cleaned_paragraphs
@@ -1189,6 +1227,8 @@ def deterministic_application_quality_issues(pack):
             issues.append("Cover letter still advertises an unsupported-experience gap.")
         if _is_background_investigation_text(paragraph):
             issues.append("Background-investigation wording remains in the cover letter.")
+        if _LETTER_CLOSING_TAIL_RE.search(str(paragraph or "")):
+            issues.append("Cover-letter closing is duplicated inside a body paragraph.")
 
     # Preserve order while removing duplicates.
     return list(dict.fromkeys(issues))
