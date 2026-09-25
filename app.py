@@ -4798,6 +4798,248 @@ def _crm_amount_lines(amounts):
     return lines
 
 
+
+FINANCE_PERIODS = {
+    "month": "This month",
+    "30d": "Last 30 days",
+    "year": "This year",
+    "all": "All time",
+}
+
+
+def _finance_period_start(period):
+    now_local = datetime.now(ADMIN_TIMEZONE)
+    if period == "month":
+        start_local = datetime(
+            now_local.year, now_local.month, 1,
+            tzinfo=ADMIN_TIMEZONE,
+        )
+    elif period == "30d":
+        start_local = now_local - timedelta(days=30)
+    elif period == "year":
+        start_local = datetime(
+            now_local.year, 1, 1,
+            tzinfo=ADMIN_TIMEZONE,
+        )
+    else:
+        return None
+    return start_local.astimezone(UTC_TIMEZONE)
+
+
+def get_finance_dashboard_data(period="month"):
+    period = period if period in FINANCE_PERIODS else "month"
+    start_utc = _finance_period_start(period)
+
+    received = {}
+    payment_count = 0
+    customer_numbers = set()
+    method_breakdown = {}
+    recent_payments = []
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if start_utc is None:
+                cur.execute(
+                    """
+                    SELECT
+                        p.id, p.lead_id, p.amount, p.currency,
+                        p.payment_method, p.reference, p.received_at,
+                        l.customer_number, l.customer_name, l.service
+                    FROM lead_payments p
+                    JOIN leads l ON l.id = p.lead_id
+                    WHERE l.merged_into_lead_id IS NULL
+                    ORDER BY p.received_at DESC, p.id DESC
+                    """
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        p.id, p.lead_id, p.amount, p.currency,
+                        p.payment_method, p.reference, p.received_at,
+                        l.customer_number, l.customer_name, l.service
+                    FROM lead_payments p
+                    JOIN leads l ON l.id = p.lead_id
+                    WHERE l.merged_into_lead_id IS NULL
+                      AND p.received_at >= %s
+                    ORDER BY p.received_at DESC, p.id DESC
+                    """,
+                    (start_utc,),
+                )
+            payment_rows = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT
+                    l.id,
+                    l.customer_number,
+                    l.customer_name,
+                    l.service,
+                    COALESCE(l.value_currency, 'MWK'),
+                    l.estimated_value,
+                    l.updated_at,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN p.currency = COALESCE(l.value_currency, 'MWK')
+                            THEN p.amount ELSE 0
+                        END
+                    ), 0) AS paid_total
+                FROM leads l
+                LEFT JOIN lead_payments p ON p.lead_id = l.id
+                WHERE l.merged_into_lead_id IS NULL
+                  AND COALESCE(l.quote_status, 'NOT_STARTED') = 'ACCEPTED'
+                  AND l.estimated_value IS NOT NULL
+                GROUP BY
+                    l.id, l.customer_number, l.customer_name, l.service,
+                    l.value_currency, l.estimated_value, l.updated_at
+                ORDER BY l.updated_at DESC
+                """
+            )
+            accepted_rows = cur.fetchall()
+
+            current_year = datetime.now(ADMIN_TIMEZONE).year
+            year_start_utc = datetime(
+                current_year, 1, 1, tzinfo=ADMIN_TIMEZONE
+            ).astimezone(UTC_TIMEZONE)
+            cur.execute(
+                """
+                SELECT p.amount, p.currency, p.received_at
+                FROM lead_payments p
+                JOIN leads l ON l.id = p.lead_id
+                WHERE l.merged_into_lead_id IS NULL
+                  AND p.received_at >= %s
+                ORDER BY p.received_at ASC
+                """,
+                (year_start_utc,),
+            )
+            year_payment_rows = cur.fetchall()
+
+    for row in payment_rows:
+        (
+            payment_id, lead_id, amount, currency, method, reference,
+            received_at, customer_number, customer_name, service
+        ) = row
+        amount = Decimal(amount)
+        currency = currency or "MWK"
+        received[currency] = received.get(currency, Decimal("0")) + amount
+        payment_count += 1
+        customer_numbers.add(customer_number)
+
+        method_label = PAYMENT_METHODS.get(
+            method or "OTHER",
+            str(method or "OTHER").replace("_", " ").title(),
+        )
+        method_bucket = method_breakdown.setdefault(method_label, {})
+        method_bucket[currency] = (
+            method_bucket.get(currency, Decimal("0")) + amount
+        )
+
+        if len(recent_payments) < 25:
+            recent_payments.append({
+                "id": payment_id,
+                "lead_id": lead_id,
+                "amount": amount,
+                "amount_label": _format_crm_amount(amount, currency),
+                "currency": currency,
+                "method_label": method_label,
+                "reference": reference or "",
+                "received_at": received_at,
+                "received_label": received_at.astimezone(
+                    ADMIN_TIMEZONE
+                ).strftime("%d %b %Y %H:%M"),
+                "customer_number": customer_number,
+                "customer_name": customer_name or "WhatsApp Customer",
+                "service": canonicalize_service(service),
+            })
+
+    outstanding = {}
+    accepted_total = {}
+    outstanding_leads = []
+
+    for row in accepted_rows:
+        (
+            lead_id, customer_number, customer_name, service, currency,
+            estimated_value, updated_at, paid_total
+        ) = row
+        currency = currency or "MWK"
+        estimated_value = Decimal(estimated_value)
+        paid_total = Decimal(paid_total or 0)
+
+        accepted_total[currency] = (
+            accepted_total.get(currency, Decimal("0")) + estimated_value
+        )
+
+        balance = estimated_value - paid_total
+        if balance <= 0:
+            continue
+
+        outstanding[currency] = (
+            outstanding.get(currency, Decimal("0")) + balance
+        )
+        outstanding_leads.append({
+            "lead_id": lead_id,
+            "customer_number": customer_number,
+            "customer_name": customer_name or "WhatsApp Customer",
+            "service": canonicalize_service(service),
+            "currency": currency,
+            "estimated_value": estimated_value,
+            "paid_total": paid_total,
+            "balance": balance,
+            "balance_label": _format_crm_amount(balance, currency),
+            "paid_label": _format_crm_amount(paid_total, currency),
+            "value_label": _format_crm_amount(estimated_value, currency),
+            "updated_at": updated_at,
+            "updated_label": updated_at.astimezone(
+                ADMIN_TIMEZONE
+            ).strftime("%d %b %Y %H:%M"),
+        })
+
+    method_rows = []
+    for method_label in sorted(method_breakdown):
+        method_rows.append({
+            "method": method_label,
+            "amounts": _crm_amount_lines(method_breakdown[method_label]),
+        })
+
+    monthly = {}
+    for amount, currency, received_at in year_payment_rows:
+        local_dt = received_at.astimezone(ADMIN_TIMEZONE)
+        key = local_dt.strftime("%Y-%m")
+        label = local_dt.strftime("%b %Y")
+        bucket = monthly.setdefault(key, {
+            "label": label,
+            "amounts": {},
+        })
+        currency = currency or "MWK"
+        bucket["amounts"][currency] = (
+            bucket["amounts"].get(currency, Decimal("0"))
+            + Decimal(amount)
+        )
+
+    monthly_rows = []
+    for key in sorted(monthly.keys(), reverse=True):
+        monthly_rows.append({
+            "label": monthly[key]["label"],
+            "amounts": _crm_amount_lines(monthly[key]["amounts"]),
+        })
+
+    return {
+        "period": period,
+        "period_label": FINANCE_PERIODS[period],
+        "received": _crm_amount_lines(received),
+        "payment_count": payment_count,
+        "customer_count": len(customer_numbers),
+        "accepted_total": _crm_amount_lines(accepted_total),
+        "outstanding": _crm_amount_lines(outstanding),
+        "outstanding_count": len(outstanding_leads),
+        "outstanding_leads": outstanding_leads[:30],
+        "recent_payments": recent_payments,
+        "method_rows": method_rows,
+        "monthly_rows": monthly_rows,
+    }
+
+
+
 def get_pipeline_summary():
     """
     Business-wide commercial summary.
@@ -5840,7 +6082,7 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 <body>
 <header><div class="header-inner">
 <div><div class="brand">IBROWS Lead Dashboard</div><div class="tagline">Kupanga zofanana, mosiyana</div></div>
-<div class="header-actions"><button class="install" id="install-app" type="button" hidden>Install</button>
+<div class="header-actions"><a class="install" href="{{ url_for('admin_finance') }}" style="text-decoration:none">Finance</a><button class="install" id="install-app" type="button" hidden>Install</button>
 <form method="POST" action="{{ url_for('admin_logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout" type="submit">Logout</button></form></div>
 </div></header>
 
@@ -6266,6 +6508,100 @@ def admin_leads():
 
 
 
+FINANCE_DASHBOARD_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101828">
+<title>IBROWS Finance</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:30px}
+header{background:#101828;color:white;position:sticky;top:0;z-index:10}
+.wrap{max-width:980px;margin:auto;padding:0 14px}.top{display:flex;justify-content:space-between;align-items:center;padding-top:16px;padding-bottom:16px}.brand{font-size:20px;font-weight:800}.back{color:white;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:800;font-size:12px}
+h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-height:1.4}
+.periods{display:flex;gap:7px;overflow-x:auto;padding:2px 0 13px;scrollbar-width:none}.periods::-webkit-scrollbar{display:none}.period{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;background:white;border-radius:18px;padding:7px 11px;font-size:12px;font-weight:800}.period.active{background:#101828;color:white;border-color:#101828}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.card{background:white;border-radius:13px;padding:14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.metric-title{font-size:11px;color:#667085;font-weight:800}.metric-value{font-size:18px;font-weight:800;line-height:1.45;margin-top:5px}.empty{color:#98a2b3;font-size:13px;font-weight:600}
+.section{background:white;border-radius:13px;padding:14px;margin-top:13px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.section h2{font-size:18px;margin:0 0 11px}.note{font-size:11px;color:#98a2b3;line-height:1.4;margin-top:7px}
+.row{padding:11px 0;border-bottom:1px solid #eaecf0}.row:last-child{border-bottom:0}.row-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.name{font-weight:800;font-size:14px}.amount{font-weight:800;text-align:right}.meta{font-size:11px;color:#98a2b3;margin-top:4px;line-height:1.45}.service{font-size:12px;color:#667085;margin-top:3px}.customer-link{color:#175cd3;text-decoration:none;font-weight:700}.balance{color:#b42318}
+.method-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.method{background:#f9fafb;border-radius:10px;padding:10px}.method b{display:block;font-size:13px}.method span{font-size:12px;line-height:1.5;color:#475467}
+.month-row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #eaecf0}.month-row:last-child{border-bottom:0}.month-row b{text-align:right}
+@media(max-width:760px){.cards{grid-template-columns:1fr 1fr}.method-grid{grid-template-columns:1fr}.wrap{padding-left:11px;padding-right:11px}}
+</style>
+</head>
+<body>
+<header><div class="wrap top"><div class="brand">IBROWS Finance</div><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></header>
+<div class="wrap">
+<h1>Payments & Revenue</h1>
+<p class="sub">Track money actually received, current accepted work and outstanding customer balances.</p>
+
+<div class="periods">
+{% for key,label in periods.items() %}
+<a class="period {% if finance.period == key %}active{% endif %}" href="{{ url_for('admin_finance', period=key) }}">{{ label }}</a>
+{% endfor %}
+</div>
+
+<div class="cards">
+<div class="card"><div class="metric-title">Payments received · {{ finance.period_label }}</div><div class="metric-value">{% if finance.received %}{% for item in finance.received %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">No payments</span>{% endif %}</div></div>
+<div class="card"><div class="metric-title">Current accepted value</div><div class="metric-value">{% if finance.accepted_total %}{% for item in finance.accepted_total %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div>
+<div class="card"><div class="metric-title">Outstanding accepted balance</div><div class="metric-value">{% if finance.outstanding %}{% for item in finance.outstanding %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div>
+<div class="card"><div class="metric-title">Payment activity</div><div class="metric-value">{{ finance.payment_count }} payment{% if finance.payment_count != 1 %}s{% endif %}</div><div class="note">{{ finance.customer_count }} paying customer{% if finance.customer_count != 1 %}s{% endif %} · {{ finance.outstanding_count }} outstanding accepted lead{% if finance.outstanding_count != 1 %}s{% endif %}</div></div>
+</div>
+
+<div class="section">
+<h2>Recent payments · {{ finance.period_label }}</h2>
+{% if finance.recent_payments %}
+{% for payment in finance.recent_payments %}
+<div class="row">
+<div class="row-head"><div><div class="name"><a class="customer-link" href="{{ url_for('admin_customer_history', customer_number=payment.customer_number, return_to=url_for('admin_finance', period=finance.period)) }}">{{ payment.customer_name }}</a></div><div class="service">{{ payment.service }} · {{ payment.method_label }}{% if payment.reference %} · Ref: {{ payment.reference }}{% endif %}</div></div><div class="amount">{{ payment.amount_label }}</div></div>
+<div class="meta">{{ payment.received_label }}</div>
+</div>
+{% endfor %}
+{% else %}<div class="empty">No payments recorded in this period.</div>{% endif %}
+</div>
+
+<div class="section">
+<h2>Outstanding accepted balances</h2>
+{% if finance.outstanding_leads %}
+{% for lead in finance.outstanding_leads %}
+<div class="row">
+<div class="row-head"><div><div class="name"><a class="customer-link" href="{{ url_for('admin_customer_history', customer_number=lead.customer_number, return_to=url_for('admin_finance', period=finance.period)) }}">{{ lead.customer_name }}</a></div><div class="service">{{ lead.service }}</div></div><div class="amount balance">{{ lead.balance_label }}</div></div>
+<div class="meta">Service value {{ lead.value_label }} · Paid {{ lead.paid_label }} · Updated {{ lead.updated_label }}</div>
+</div>
+{% endfor %}
+{% else %}<div class="empty">No outstanding balances on accepted work.</div>{% endif %}
+<div class="note">Only accepted quotations with a remaining balance are listed. Different currencies are never combined.</div>
+</div>
+
+{% if finance.method_rows %}
+<div class="section">
+<h2>Payments by method · {{ finance.period_label }}</h2>
+<div class="method-grid">
+{% for row in finance.method_rows %}
+<div class="method"><b>{{ row.method }}</b><span>{% for item in row.amounts %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</span></div>
+{% endfor %}
+</div>
+</div>
+{% endif %}
+
+<div class="section">
+<h2>{{ current_year }} monthly collections</h2>
+{% if finance.monthly_rows %}
+{% for month in finance.monthly_rows %}
+<div class="month-row"><span>{{ month.label }}</span><b>{% for item in month.amounts %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</b></div>
+{% endfor %}
+{% else %}<div class="empty">No payments recorded this year.</div>{% endif %}
+<div class="note">This is money received, not quoted or invoiced value.</div>
+</div>
+
+</div>
+</body>
+</html>
+"""
+
+
 CUSTOMER_CRM_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -6413,6 +6749,24 @@ Issued {{ doc.issued_label }}
 </body>
 </html>
 """
+
+
+@app.route("/admin/finance", methods=["GET"])
+@admin_required
+def admin_finance():
+    period = request.args.get("period", "month").strip().lower()
+    if period not in FINANCE_PERIODS:
+        period = "month"
+
+    finance = get_finance_dashboard_data(period)
+    return render_template_string(
+        FINANCE_DASHBOARD_TEMPLATE,
+        finance=finance,
+        periods=FINANCE_PERIODS,
+        current_year=datetime.now(ADMIN_TIMEZONE).year,
+    )
+
+
 
 
 @app.route("/admin/customers/<customer_number>", methods=["GET"])
