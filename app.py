@@ -16,6 +16,7 @@ from html.parser import HTMLParser
 from xml.sax.saxutils import escape as xml_escape
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from datetime import timedelta, date, datetime
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 import requests
