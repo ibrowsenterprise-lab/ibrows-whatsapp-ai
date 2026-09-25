@@ -284,6 +284,33 @@ def init_database():
                 )
             """)
 
+            # Remember narrow, auditor-approved evidence wording corrections so a
+            # phrase that was already corrected cannot silently reappear in a later
+            # regenerated CV/cover letter for the same customer.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS application_evidence_corrections (
+                    id BIGSERIAL PRIMARY KEY,
+                    customer_number TEXT NOT NULL,
+                    old_text TEXT NOT NULL,
+                    new_text TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'qa',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_application_evidence_corrections_unique
+                ON application_evidence_corrections(customer_number, old_text, new_text)
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_application_evidence_corrections_customer
+                ON application_evidence_corrections(customer_number, updated_at DESC)
+            """)
+
         conn.commit()
 
     print("DATABASE READY", flush=True)
@@ -315,6 +342,10 @@ def cleanup_expired_data(force=False):
                     DELETE FROM application_pack_state
                     WHERE updated_at < NOW() - (%s * INTERVAL '1 day')
                 """, (CONVERSATION_RETENTION_DAYS,))
+                cur.execute("""
+                    DELETE FROM application_evidence_corrections
+                    WHERE updated_at < NOW() - (%s * INTERVAL '1 day')
+                """, (CONVERSATION_RETENTION_DAYS,))
             conn.commit()
         _last_privacy_cleanup = now
         print("PRIVACY RETENTION CLEANUP COMPLETED", flush=True)
@@ -331,6 +362,7 @@ def delete_customer_data(customer_number):
             cur.execute("DELETE FROM leads WHERE customer_number=%s", (customer_number,))
             cur.execute("DELETE FROM ai_takeover_state WHERE customer_number=%s", (customer_number,))
             cur.execute("DELETE FROM application_pack_state WHERE customer_number=%s", (customer_number,))
+            cur.execute("DELETE FROM application_evidence_corrections WHERE customer_number=%s", (customer_number,))
         conn.commit()
     print("CUSTOMER DATA DELETION COMPLETED", flush=True)
 
@@ -815,6 +847,61 @@ def set_application_pack_active(customer_number, active):
                 (customer_number, bool(active))
             )
         conn.commit()
+
+
+
+def get_application_evidence_corrections(customer_number, limit=40):
+    """Return narrow QA-approved wording corrections for this customer only."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT old_text, new_text, source
+                FROM application_evidence_corrections
+                WHERE customer_number = %s
+                ORDER BY updated_at DESC, id DESC
+                LIMIT %s
+                """,
+                (customer_number, limit)
+            )
+            return cur.fetchall()
+
+
+def save_application_evidence_corrections(customer_number, replacements, source="qa"):
+    """
+    Persist only narrow old->new phrase corrections. These are not raw documents;
+    they are short truth-preserving wording constraints and follow normal retention.
+    """
+    cleaned = []
+    for old_text, new_text in replacements or []:
+        old_text = " ".join(str(old_text or "").split()).strip()
+        new_text = " ".join(str(new_text or "").split()).strip()
+        if not old_text or not new_text:
+            continue
+        if old_text.lower() == new_text.lower():
+            continue
+        if len(old_text) > 240 or len(new_text) > 320:
+            continue
+        cleaned.append((old_text, new_text))
+
+    if not cleaned:
+        return 0
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for old_text, new_text in cleaned[:20]:
+                cur.execute(
+                    """
+                    INSERT INTO application_evidence_corrections
+                        (customer_number, old_text, new_text, source, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (customer_number, old_text, new_text)
+                    DO UPDATE SET source=EXCLUDED.source, updated_at=NOW()
+                    """,
+                    (customer_number, old_text, new_text, str(source or "qa")[:80])
+                )
+        conn.commit()
+    return len(cleaned)
 
 
 def detect_application_pack_request(customer_message):
@@ -1431,6 +1518,153 @@ def _apply_explicit_qa_replacements(pack, findings):
         )
     return pack
 
+
+# Conservative one-way downgrades for two recurring generator phrases already
+# proven problematic during live QA. They never add experience; they only narrow it.
+_LEGACY_EVIDENCE_DOWNGRADE_RULES = (
+    (
+        re.compile(
+            r"\bexperienced in developing data-management solutions,\s*"
+            r"reporting frameworks and dashboards\b",
+            re.IGNORECASE,
+        ),
+        "experienced in supporting the development and use of data-management solutions "
+        "and working with reporting frameworks and dashboards",
+        "data-management profile wording",
+    ),
+    (
+        re.compile(
+            r"\bexperienced in developing data-management solutions\b",
+            re.IGNORECASE,
+        ),
+        "experienced in supporting the development and use of data-management solutions",
+        "data-management profile wording",
+    ),
+    (
+        re.compile(
+            r"\breconciliations and records management\b",
+            re.IGNORECASE,
+        ),
+        "reconciliations and record keeping",
+        "record-keeping skill wording",
+    ),
+)
+
+
+def _regex_replace_application_documents(value, pattern, replacement):
+    if isinstance(value, dict):
+        return {
+            key: _regex_replace_application_documents(child, pattern, replacement)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _regex_replace_application_documents(child, pattern, replacement)
+            for child in value
+        ]
+    if isinstance(value, str):
+        def repl(match):
+            out = replacement
+            # Preserve sentence-start capitalization without broadening meaning.
+            if match.group(0) and match.group(0)[0].isupper():
+                out = out[:1].upper() + out[1:]
+            return out
+        return pattern.sub(repl, value)
+    return value
+
+
+def _application_document_strings(pack):
+    for root in ("cv", "cover_letter"):
+        for _, value in _walk_pack_strings(pack.get(root) or {}, path=root):
+            yield value
+
+
+def _phrase_present_in_application_documents(pack, phrase):
+    phrase = " ".join(str(phrase or "").split()).strip()
+    if not phrase:
+        return False
+    pattern = re.compile(re.escape(phrase), re.IGNORECASE)
+    return any(pattern.search(str(value or "")) for value in _application_document_strings(pack))
+
+
+def apply_persistent_evidence_normalization(customer_number, pack):
+    """
+    Apply customer-specific QA corrections plus conservative legacy downgrades.
+    Returns (pack, applied_labels). This runs after generation/repair and again
+    immediately before document delivery.
+    """
+    applied = []
+
+    # First apply customer-specific corrections learned from successful QA repairs.
+    try:
+        remembered = get_application_evidence_corrections(customer_number, limit=40)
+    except Exception as error:
+        print(f"EVIDENCE CORRECTION MEMORY READ ERROR: {type(error).__name__}", flush=True)
+        remembered = []
+
+    for old_text, new_text, source in remembered:
+        if not _phrase_present_in_application_documents(pack, old_text):
+            continue
+        pack["cv"] = _replace_text_in_application_documents(pack.get("cv") or {}, old_text, new_text)
+        pack["cover_letter"] = _replace_text_in_application_documents(
+            pack.get("cover_letter") or {}, old_text, new_text
+        )
+        applied.append(f"remembered:{source or 'qa'}")
+
+    # Then apply only the known one-way safe downgrades.
+    for pattern, replacement, label in _LEGACY_EVIDENCE_DOWNGRADE_RULES:
+        before = "\n".join(str(x or "") for x in _application_document_strings(pack))
+        if not pattern.search(before):
+            continue
+        pack["cv"] = _regex_replace_application_documents(pack.get("cv") or {}, pattern, replacement)
+        pack["cover_letter"] = _regex_replace_application_documents(
+            pack.get("cover_letter") or {}, pattern, replacement
+        )
+        after = "\n".join(str(x or "") for x in _application_document_strings(pack))
+        if before != after:
+            applied.append(f"guardrail:{label}")
+
+    return pack, applied
+
+
+def deterministic_evidence_normalization_issues(customer_number, pack):
+    """Final deterministic proof that already-rejected wording did not reappear."""
+    issues = []
+
+    try:
+        remembered = get_application_evidence_corrections(customer_number, limit=40)
+    except Exception:
+        remembered = []
+
+    for old_text, _, _ in remembered:
+        if _phrase_present_in_application_documents(pack, old_text):
+            issues.append(
+                "A previously corrected evidence-overstatement phrase reappeared in the application documents."
+            )
+
+    joined = "\n".join(str(x or "") for x in _application_document_strings(pack))
+    for pattern, _, label in _LEGACY_EVIDENCE_DOWNGRADE_RULES:
+        if pattern.search(joined):
+            issues.append(f"Known evidence wording guardrail still failed: {label}.")
+
+    return list(dict.fromkeys(issues))
+
+
+def save_application_evidence_corrections_from_findings(customer_number, findings, source="qa-approved"):
+    replacements = []
+    for finding in findings or []:
+        replacement = _extract_explicit_qa_replacement(finding)
+        if replacement:
+            replacements.append(replacement)
+    if not replacements:
+        return 0
+    try:
+        return save_application_evidence_corrections(customer_number, replacements, source=source)
+    except Exception as error:
+        print(f"EVIDENCE CORRECTION MEMORY WRITE ERROR: {type(error).__name__}", flush=True)
+        return 0
+
+
 def repair_application_pack_from_minor_findings(customer_number, pack, findings):
     """Repair only evidence-backed wording drift; never invent or broaden candidate facts."""
     memory_context, _ = build_application_evidence_context(customer_number)
@@ -2020,10 +2254,21 @@ def process_application_pack(customer_number, customer_name, customer_message):
         save_message(customer_number, "assistant", reply)
         return {"reply": reply, "documents": [], "ready": False}
 
+    # Apply all previously learned evidence wording constraints before QA.
+    pack, evidence_normalizations = apply_persistent_evidence_normalization(customer_number, pack)
+    if evidence_normalizations:
+        print(
+            f"APPLICATION PACK EVIDENCE NORMALIZATION APPLIED: {len(evidence_normalizations)} change(s)",
+            flush=True,
+        )
+
     # Final production-quality gate: deterministic checks plus independent evidence audit.
     # Minor wording drift gets one automatic truth-preserving repair attempt; substantive
     # unsupported claims still require human review immediately.
     deterministic_issues = deterministic_application_quality_issues(pack)
+    deterministic_issues.extend(
+        deterministic_evidence_normalization_issues(customer_number, pack)
+    )
     audit = None
     if not deterministic_issues:
         try:
@@ -2083,7 +2328,19 @@ def process_application_pack(customer_number, customer_name, customer_message):
                 pack,
                 minor_findings,
             )
+            repaired_pack, repaired_normalizations = apply_persistent_evidence_normalization(
+                customer_number,
+                repaired_pack,
+            )
+            if repaired_normalizations:
+                print(
+                    f"APPLICATION PACK EVIDENCE NORMALIZATION AFTER REPAIR: {len(repaired_normalizations)} change(s)",
+                    flush=True,
+                )
             repaired_deterministic = deterministic_application_quality_issues(repaired_pack)
+            repaired_deterministic.extend(
+                deterministic_evidence_normalization_issues(customer_number, repaired_pack)
+            )
             repaired_audit = None
             if not repaired_deterministic:
                 repaired_audit = audit_application_pack_against_evidence(customer_number, repaired_pack)
@@ -2100,6 +2357,16 @@ def process_application_pack(customer_number, customer_name, customer_message):
             if not repaired_issues and repaired_audit and repaired_audit.get("approved"):
                 pack = repaired_pack
                 quality_issues = []
+                remembered_count = save_application_evidence_corrections_from_findings(
+                    customer_number,
+                    minor_findings,
+                    source="approved-auto-repair",
+                )
+                if remembered_count:
+                    print(
+                        f"APPLICATION PACK EVIDENCE CORRECTIONS REMEMBERED: {remembered_count}",
+                        flush=True,
+                    )
                 print("APPLICATION PACK QA AUTO-REPAIR COMPLETED", flush=True)
                 print("APPLICATION PACK QUALITY PASSED AFTER AUTO-REPAIR", flush=True)
             else:
@@ -2120,9 +2387,36 @@ def process_application_pack(customer_number, customer_name, customer_message):
         str(item).strip() for item in quality_issues if str(item).strip()
     ))
 
+    # One final deterministic evidence-normalization pass happens AFTER all AI
+    # generation/repair and BEFORE visual QA/document creation. This closes the
+    # loophole where previously rejected stronger wording could reappear later.
+    if not quality_issues:
+        pack, final_evidence_normalizations = apply_persistent_evidence_normalization(
+            customer_number,
+            pack,
+        )
+        if final_evidence_normalizations:
+            print(
+                f"APPLICATION PACK FINAL EVIDENCE NORMALIZATION: {len(final_evidence_normalizations)} change(s)",
+                flush=True,
+            )
+
+        final_evidence_issues = deterministic_evidence_normalization_issues(
+            customer_number,
+            pack,
+        )
+        if final_evidence_issues:
+            quality_issues.extend(final_evidence_issues)
+            print(
+                f"APPLICATION PACK EVIDENCE NORMALIZATION BLOCKED: {len(final_evidence_issues)} issue(s)",
+                flush=True,
+            )
+        else:
+            print("APPLICATION PACK EVIDENCE NORMALIZATION PASSED", flush=True)
+
     # Separate deterministic visual/layout QA runs only after factual QA has
-    # produced a clean draft. It checks the exact same block structure used
-    # by both DOCX and PDF delivery.
+    # produced a clean, normalized draft. It checks the exact same block
+    # structure used by both DOCX and PDF delivery.
     if not quality_issues:
         layout_issues = deterministic_application_layout_issues(pack)
         if layout_issues:
