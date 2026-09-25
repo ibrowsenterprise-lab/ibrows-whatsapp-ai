@@ -1172,6 +1172,7 @@ Approve only if candidate-specific factual claims are supported by candidate-sup
 
 Classify every material problem into exactly one of these categories:
 1. minor_repairable: a narrow wording drift where the candidate evidence clearly contains a truthful weaker or more precise replacement and no new fact or customer clarification is needed. Examples: "support business decision-making" when the evidence only says "support information analysis and reporting"; or a broad operational wording where a narrower documented payroll/records wording is available.
+IMPORTANT: If the disputed wording can be safely narrowed, replaced, or deleted using existing candidate evidence WITHOUT changing a protected fact such as employer/title/date/qualification/contact/language/technical or management experience, classify it as minor_repairable, not requires_human. A statement being "not explicitly supported" does not by itself make it requires_human when the evidence clearly supplies a narrower safe replacement.
 2. requires_human: anything involving an invented, upgraded, ambiguous, or unsupported employer, job title, employment date, degree, qualification, certification, language level, contact detail, years of experience, metric/achievement, management/supervision claim, networking, infrastructure, cloud, cybersecurity, service-desk, IT-service-management, or other substantive experience. Also use this category whenever the evidence does not provide a clear safe replacement.
 3. issues: non-candidate-content defects such as placeholders, defensive gap wording, background-investigation wording in a CV/cover letter, or other workflow/document-quality defects that should not be silently rewritten by the evidence repair step.
 
@@ -1204,6 +1205,51 @@ Set approved=false whenever any of the three lists is non-empty. Keep each findi
         "issues": issues,
     }
 
+
+
+_HIGH_RISK_QA_FINDING_RE = re.compile(
+    r"\b(?:employer|company|organisation|organization|job title|employment date|"
+    r"start date|end date|degree|qualification|certificate|certification|"
+    r"language level|english|chichewa|phone|email|contact detail|years? of experience|"
+    r"metric|percentage|achievement|award|managed|management|manager|supervis(?:e|ed|ion|ory)|"
+    r"team lead|leadership|network(?:ing)?|infrastructure|cloud|cybersecurity|security|"
+    r"service[- ]?desk|help[- ]?desk|incident management|IT service management|ITSM)\b",
+    re.IGNORECASE,
+)
+
+
+def _safe_human_findings_for_auto_repair(audit):
+    """
+    Permit one repair attempt for low-risk wording findings even when the model
+    conservatively put them in requires_human. Never auto-repair high-risk facts.
+    """
+    if not audit:
+        return []
+    safe = []
+    for item in audit.get("requires_human", []) or []:
+        finding = str(item).strip()
+        if not finding:
+            continue
+        if _HIGH_RISK_QA_FINDING_RE.search(finding):
+            continue
+        # Restrict this escape hatch to wording/evidence-mismatch findings only.
+        low = finding.lower()
+        wording_signals = (
+            "wording",
+            "paraphrase",
+            "does not explicitly support",
+            "not explicitly supported",
+            "not documented",
+            "supplied evidence supports",
+            "evidence supports",
+            "specific claim",
+            "broader than",
+            "overstates",
+            "too broad",
+        )
+        if any(signal in low for signal in wording_signals):
+            safe.append(finding)
+    return safe
 
 def repair_application_pack_from_minor_findings(customer_number, pack, findings):
     """Repair only evidence-backed wording drift; never invent or broaden candidate facts."""
@@ -1582,19 +1628,43 @@ def process_application_pack(customer_number, customer_name, customer_message):
         quality_issues.extend(audit.get("requires_human", []))
         quality_issues.extend(audit.get("issues", []))
 
-    # Auto-repair only when every finding is explicitly classed as minor wording drift.
+    # Auto-repair explicit minor wording drift. Also permit one tightly-scoped repair
+    # attempt when the auditor conservatively classified a LOW-RISK wording mismatch
+    # as requires_human. High-risk facts (employment, qualifications, languages,
+    # contact details, management, networking/infrastructure/cloud/cybersecurity,
+    # service desk/ITSM, achievements/metrics, etc.) remain human-review only.
+    safe_human_repair_findings = _safe_human_findings_for_auto_repair(audit)
+    unresolved_human_findings = []
+    if audit:
+        safe_set = set(safe_human_repair_findings)
+        unresolved_human_findings = [
+            item for item in audit.get("requires_human", [])
+            if item not in safe_set
+        ]
+
+    repair_findings = []
+    if audit:
+        repair_findings.extend(audit.get("minor_repairable", []) or [])
+        repair_findings.extend(safe_human_repair_findings)
+    repair_findings = list(dict.fromkeys(
+        str(item).strip() for item in repair_findings if str(item).strip()
+    ))
+
     can_auto_repair = bool(
         audit
         and not deterministic_issues
-        and audit.get("minor_repairable")
-        and not audit.get("requires_human")
+        and repair_findings
+        and not unresolved_human_findings
         and not audit.get("issues")
     )
 
     if can_auto_repair and APPLICATION_PACK_QA_MAX_REPAIR_ATTEMPTS > 0:
-        minor_findings = audit.get("minor_repairable", [])[:8]
+        minor_findings = repair_findings[:8]
+        repair_mode = "minor"
+        if safe_human_repair_findings:
+            repair_mode = "low-risk wording"
         print(
-            f"APPLICATION PACK QA AUTO-REPAIR STARTED: {len(minor_findings)} issue(s)",
+            f"APPLICATION PACK QA AUTO-REPAIR STARTED: {len(minor_findings)} issue(s) [{repair_mode}]",
             flush=True,
         )
         try:
