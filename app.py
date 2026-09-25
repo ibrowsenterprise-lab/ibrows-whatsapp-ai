@@ -250,6 +250,26 @@ def init_database():
             """)
 
             cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS estimated_value NUMERIC(14,2)
+            """)
+
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS value_currency TEXT NOT NULL DEFAULT 'MWK'
+            """)
+
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS quote_status TEXT NOT NULL DEFAULT 'NOT_STARTED'
+            """)
+
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS quote_reference TEXT
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS lead_notes (
                     id BIGSERIAL PRIMARY KEY,
                     lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
@@ -261,6 +281,21 @@ def init_database():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_lead_notes_lead
                 ON lead_notes(lead_id, created_at DESC)
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lead_activity (
+                    id BIGSERIAL PRIMARY KEY,
+                    lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+                    activity_type TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_lead_activity_lead
+                ON lead_activity(lead_id, created_at DESC)
             """)
 
             cur.execute("""
@@ -2962,6 +2997,13 @@ def create_or_update_lead(
                     )
                 )
 
+                _activity_insert(
+                    cur,
+                    lead_id,
+                    "AI_UPDATE",
+                    "Lead details refreshed from the WhatsApp conversation.",
+                )
+
                 print(
                     f"LEAD UPDATED: {lead_id}",
                     flush=True
@@ -2990,6 +3032,13 @@ def create_or_update_lead(
                 )
 
                 lead_id = cur.fetchone()[0]
+
+                _activity_insert(
+                    cur,
+                    lead_id,
+                    "LEAD_CREATED",
+                    f"{service} lead created from WhatsApp.",
+                )
 
                 print(
                     f"NEW LEAD CREATED: {lead_id}",
@@ -3193,6 +3242,12 @@ def finish_follow_up_reminder(lead_id, success, error=None):
                     """,
                     (lead_id,)
                 )
+                _activity_insert(
+                    cur,
+                    lead_id,
+                    "REMINDER",
+                    "Follow-up email reminder sent to IBROWS.",
+                )
             else:
                 cur.execute(
                     """
@@ -3305,6 +3360,171 @@ def process_due_follow_up_reminders(limit=20):
 
 
 
+
+QUOTE_STATUSES = {
+    "NOT_STARTED": "Not started",
+    "DRAFT": "Draft",
+    "SENT": "Sent",
+    "ACCEPTED": "Accepted",
+    "DECLINED": "Declined",
+}
+SUPPORTED_CRM_CURRENCIES = {"MWK", "USD", "ZAR", "EUR", "GBP"}
+
+
+def _crm_money_value(raw_value):
+    value = str(raw_value or "").replace(",", "").strip()
+    if not value:
+        return None
+    try:
+        amount = Decimal(value)
+    except (InvalidOperation, ValueError):
+        raise ValueError("Invalid estimated value.")
+    if amount < 0 or amount > Decimal("999999999999.99"):
+        raise ValueError("Estimated value outside allowed range.")
+    return amount.quantize(Decimal("0.01"))
+
+
+def _crm_currency(raw_currency):
+    currency = str(raw_currency or "MWK").strip().upper()
+    if currency not in SUPPORTED_CRM_CURRENCIES:
+        raise ValueError("Invalid currency.")
+    return currency
+
+
+def _crm_quote_status(raw_status):
+    status = str(raw_status or "NOT_STARTED").strip().upper()
+    if status not in QUOTE_STATUSES:
+        raise ValueError("Invalid quote status.")
+    return status
+
+
+def _activity_insert(cur, lead_id, activity_type, description):
+    description = " ".join(str(description or "").split()).strip()
+    if not description:
+        return
+    cur.execute(
+        """
+        INSERT INTO lead_activity (lead_id, activity_type, description)
+        VALUES (%s, %s, %s)
+        """,
+        (lead_id, str(activity_type or "UPDATE")[:60], description[:1000])
+    )
+
+
+def get_customer_crm_profile(customer_number):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id, customer_number, customer_name, service, summary,
+                    handover_reason, status, priority, follow_up_at,
+                    follow_up_notified_at, estimated_value, value_currency,
+                    quote_status, quote_reference, created_at, updated_at
+                FROM leads
+                WHERE customer_number = %s
+                ORDER BY created_at DESC, id DESC
+                """,
+                (customer_number,)
+            )
+            lead_rows = cur.fetchall()
+
+            if not lead_rows:
+                return None
+
+            lead_ids = [row[0] for row in lead_rows]
+
+            cur.execute(
+                """
+                SELECT
+                    a.lead_id, a.activity_type, a.description, a.created_at,
+                    l.service
+                FROM lead_activity a
+                JOIN leads l ON l.id = a.lead_id
+                WHERE a.lead_id = ANY(%s)
+                ORDER BY a.created_at DESC, a.id DESC
+                LIMIT 100
+                """,
+                (lead_ids,)
+            )
+            activity_rows = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT
+                    n.lead_id, n.note_text, n.created_at, l.service
+                FROM lead_notes n
+                JOIN leads l ON l.id = n.lead_id
+                WHERE n.lead_id = ANY(%s)
+                ORDER BY n.created_at DESC, n.id DESC
+                LIMIT 100
+                """,
+                (lead_ids,)
+            )
+            note_rows = cur.fetchall()
+
+    leads = []
+    for row in lead_rows:
+        leads.append({
+            "id": row[0],
+            "customer_number": row[1],
+            "customer_name": row[2],
+            "service": canonicalize_service(row[3]),
+            "summary": row[4],
+            "handover_reason": row[5],
+            "status": row[6],
+            "priority": row[7] or "NORMAL",
+            "follow_up_at": row[8],
+            "follow_up_notified_at": row[9],
+            "estimated_value": row[10],
+            "value_currency": row[11] or "MWK",
+            "quote_status": row[12] or "NOT_STARTED",
+            "quote_reference": row[13] or "",
+            "created_at": row[14],
+            "updated_at": row[15],
+        })
+
+    timeline = []
+    for lead in leads:
+        timeline.append({
+            "kind": "LEAD_CREATED",
+            "description": f"{lead['service']} lead created.",
+            "created_at": lead["created_at"],
+            "service": lead["service"],
+        })
+
+    for lead_id, activity_type, description, created_at, service in activity_rows:
+        timeline.append({
+            "kind": activity_type,
+            "description": description,
+            "created_at": created_at,
+            "service": canonicalize_service(service),
+        })
+
+    for lead_id, note_text, created_at, service in note_rows:
+        timeline.append({
+            "kind": "NOTE",
+            "description": f"Internal note: {note_text}",
+            "created_at": created_at,
+            "service": canonicalize_service(service),
+        })
+
+    timeline.sort(key=lambda item: item["created_at"], reverse=True)
+    return {"leads": leads, "timeline": timeline[:150]}
+
+
+def _format_crm_amount(amount, currency):
+    if amount is None:
+        return ""
+    amount = Decimal(amount)
+    if amount == amount.to_integral():
+        number = f"{amount:,.0f}"
+    else:
+        number = f"{amount:,.2f}"
+    return f"{currency} {number}"
+
+
+
 def get_all_leads():
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -3320,6 +3540,10 @@ def get_all_leads():
                     priority,
                     follow_up_at,
                     follow_up_notified_at,
+                    estimated_value,
+                    value_currency,
+                    quote_status,
+                    quote_reference,
                     created_at,
                     updated_at
                 FROM leads
@@ -3408,6 +3632,12 @@ def update_lead_status(lead_id, status):
 
     with get_db() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT status FROM leads WHERE id=%s FOR UPDATE", (lead_id,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("Lead not found.")
+            old_status = row[0]
+
             if status == "CLOSED":
                 cur.execute(
                     """
@@ -3431,6 +3661,14 @@ def update_lead_status(lead_id, status):
                     WHERE id = %s
                     """,
                     (status, lead_id)
+                )
+
+            if old_status != status:
+                _activity_insert(
+                    cur,
+                    lead_id,
+                    "STATUS",
+                    f"Lead status changed from {old_status} to {status}.",
                 )
         conn.commit()
 
@@ -3504,19 +3742,46 @@ def add_lead_note(lead_id, note_text):
         conn.commit()
 
 
-def update_lead_management(lead_id, priority, follow_up_at, note_text=""):
-    """Save the Manage Lead form in one database transaction."""
+def update_lead_management(
+    lead_id,
+    priority,
+    follow_up_at,
+    note_text="",
+    estimated_value=None,
+    value_currency="MWK",
+    quote_status="NOT_STARTED",
+    quote_reference="",
+):
+    """Save operational and commercial lead management fields in one transaction."""
     allowed = {"LOW", "NORMAL", "HIGH", "URGENT"}
     priority = str(priority or "").strip().upper()
     if priority not in allowed:
         raise ValueError("Invalid lead priority.")
 
-    note_text = " ".join(str(note_text or "").split()).strip()
-    if len(note_text) > 2000:
-        note_text = note_text[:2000]
+    estimated_value = _crm_money_value(estimated_value)
+    value_currency = _crm_currency(value_currency)
+    quote_status = _crm_quote_status(quote_status)
+    quote_reference = " ".join(str(quote_reference or "").split()).strip()[:120]
+    note_text = " ".join(str(note_text or "").split()).strip()[:2000]
 
     with get_db() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT priority, follow_up_at, estimated_value, value_currency,
+                       quote_status, quote_reference
+                FROM leads
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (lead_id,)
+            )
+            old = cur.fetchone()
+            if not old:
+                raise ValueError("Lead not found.")
+
+            old_priority, old_follow_up, old_value, old_currency, old_quote_status, old_quote_ref = old
+
             cur.execute(
                 """
                 UPDATE leads
@@ -3531,6 +3796,10 @@ def update_lead_management(lead_id, priority, follow_up_at, note_text=""):
                         CASE WHEN follow_up_at IS DISTINCT FROM %s
                              THEN NULL ELSE follow_up_notification_error END,
                     follow_up_at = %s,
+                    estimated_value = %s,
+                    value_currency = %s,
+                    quote_status = %s,
+                    quote_reference = NULLIF(%s, ''),
                     updated_at = NOW()
                 WHERE id = %s
                 """,
@@ -3540,11 +3809,49 @@ def update_lead_management(lead_id, priority, follow_up_at, note_text=""):
                     follow_up_at,
                     follow_up_at,
                     follow_up_at,
+                    estimated_value,
+                    value_currency,
+                    quote_status,
+                    quote_reference,
                     lead_id,
                 )
             )
-            if cur.rowcount != 1:
-                raise ValueError("Lead not found.")
+
+            changes = []
+            if old_priority != priority:
+                changes.append(f"Priority changed from {old_priority} to {priority}.")
+
+            if old_follow_up != follow_up_at:
+                if follow_up_at:
+                    local_follow = follow_up_at.astimezone(ADMIN_TIMEZONE)
+                    changes.append(
+                        f"Follow-up scheduled for {local_follow.strftime('%d %b %Y at %H:%M')}."
+                    )
+                else:
+                    changes.append("Follow-up cleared.")
+
+            old_value_norm = Decimal(old_value) if old_value is not None else None
+            if old_value_norm != estimated_value or (old_currency or "MWK") != value_currency:
+                if estimated_value is None:
+                    changes.append("Estimated lead value cleared.")
+                else:
+                    changes.append(
+                        f"Estimated lead value set to {_format_crm_amount(estimated_value, value_currency)}."
+                    )
+
+            if (old_quote_status or "NOT_STARTED") != quote_status:
+                changes.append(
+                    f"Quotation status changed to {QUOTE_STATUSES.get(quote_status, quote_status)}."
+                )
+
+            if (old_quote_ref or "") != quote_reference:
+                if quote_reference:
+                    changes.append(f"Quotation reference set to {quote_reference}.")
+                else:
+                    changes.append("Quotation reference cleared.")
+
+            for description in changes:
+                _activity_insert(cur, lead_id, "LEAD_UPDATED", description)
 
             if note_text:
                 cur.execute(
@@ -3554,6 +3861,7 @@ def update_lead_management(lead_id, priority, follow_up_at, note_text=""):
                     """,
                     (lead_id, note_text)
                 )
+
         conn.commit()
 
 
@@ -3570,13 +3878,19 @@ def parse_admin_follow_up(value):
 def _safe_admin_return_path(value=None):
     candidate = str(value or "").strip()
     if (
-        candidate.startswith("/admin/leads")
-        and "://" not in candidate
-        and "\\" not in candidate
-        and "\r" not in candidate
-        and "\n" not in candidate
+        "://" in candidate
+        or "\\" in candidate
+        or "\r" in candidate
+        or "\n" in candidate
     ):
+        return url_for("admin_leads")
+
+    if candidate.startswith("/admin/leads"):
         return candidate
+
+    if re.fullmatch(r"/admin/customers/\d{1,20}(?:\?.*)?", candidate):
+        return candidate
+
     return url_for("admin_leads")
 
 
@@ -4099,6 +4413,8 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 .lead-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.customer{font-size:18px;font-weight:800}.number{margin-top:3px}.number a{color:#175cd3;text-decoration:none}
 .badges{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.badge{font-weight:800;font-size:10px;padding:6px 8px;border-radius:18px;background:#eef2f6;white-space:nowrap}
 .badge.priority-URGENT{background:#fee4e2;color:#b42318}.badge.priority-HIGH{background:#fff3d6;color:#93370d}.badge.priority-LOW{background:#ecfdf3;color:#027a48}
+.commercial{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.commercial span{background:#f2f4f7;border-radius:16px;padding:5px 8px;font-size:11px;font-weight:800;color:#475467}.commercial .accepted{background:#ecfdf3;color:#027a48}.commercial .sent{background:#eff8ff;color:#175cd3}
+.history-link{display:block;text-align:center;text-decoration:none;color:#101828;border:1px solid #98a2b3;border-radius:9px;padding:9px 12px;margin-top:7px;font-weight:800;font-size:12px}
 .service{margin-top:11px;font-weight:800}.summary,.reason{margin-top:8px;line-height:1.45;font-size:14px}.reason{color:#667085}
 .followup{margin-top:9px;padding:9px 10px;border-radius:9px;background:#f9fafb;font-size:13px;font-weight:700}.followup.overdue{background:#fff1f0;color:#b42318}.followup.soon{background:#fff7e6;color:#93370d}
 .reminder-sent{margin-top:5px;color:#027a48;font-size:11px;font-weight:700}
@@ -4164,6 +4480,13 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 </div>
 
 <div class="service">{{ lead.service or 'General Enquiry' }}</div>
+{% if lead.estimated_value_label or lead.quote_status != 'NOT_STARTED' %}
+<div class="commercial">
+{% if lead.estimated_value_label %}<span>{{ lead.estimated_value_label }}</span>{% endif %}
+{% if lead.quote_status != 'NOT_STARTED' %}<span class="{% if lead.quote_status == 'ACCEPTED' %}accepted{% elif lead.quote_status == 'SENT' %}sent{% endif %}">Quote: {{ lead.quote_status_label }}</span>{% endif %}
+{% if lead.quote_reference %}<span>{{ lead.quote_reference }}</span>{% endif %}
+</div>
+{% endif %}
 <div class="summary">{{ lead.summary or 'No summary available.' }}</div>
 {% if lead.handover_reason %}<div class="reason"><strong>Human follow-up:</strong> {{ lead.handover_reason }}</div>{% endif %}
 
@@ -4183,7 +4506,8 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 <div class="meta">Created: {{ lead.created_at.strftime('%d %b %Y %H:%M') }} &nbsp;|&nbsp; Updated: {{ lead.updated_at.strftime('%d %b %Y %H:%M') }}</div>
 
 <a class="quick" href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a>
-<a class="privacy-link" href="{{ url_for('admin_customer_privacy', customer_number=lead.customer_number) }}">Customer Data & Privacy</a>
+<a class="history-link" href="{{ url_for('admin_customer_history', customer_number=lead.customer_number, return_to=current_return) }}">Customer history & CRM</a>
+<a class="privacy-link" href="{{ url_for('admin_customer_privacy', customer_number=lead.customer_number, return_to=current_return) }}">Customer Data & Privacy</a>
 
 <div class="ai-state">AI: {% if lead.ai_paused %}PAUSED — human takeover active{% else %}ACTIVE{% endif %}</div>
 <form class="takeover" method="POST" action="{{ url_for('admin_ai_takeover', customer_number=lead.customer_number) }}">
@@ -4221,9 +4545,37 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 {% endif %}
 </div>
 
+<div>
+<label>Estimated value</label>
+<input type="number" name="estimated_value" min="0" step="0.01" inputmode="decimal" value="{{ lead.estimated_value_input }}" placeholder="e.g. 50000">
+</div>
+
+<div>
+<label>Currency</label>
+<select name="value_currency">
+{% for c in ['MWK','USD','ZAR','EUR','GBP'] %}
+<option value="{{ c }}" {% if lead.value_currency == c %}selected{% endif %}>{{ c }}</option>
+{% endfor %}
+</select>
+</div>
+
+<div>
+<label>Quotation status</label>
+<select name="quote_status">
+{% for key,label in [('NOT_STARTED','Not started'),('DRAFT','Draft'),('SENT','Sent'),('ACCEPTED','Accepted'),('DECLINED','Declined')] %}
+<option value="{{ key }}" {% if lead.quote_status == key %}selected{% endif %}>{{ label }}</option>
+{% endfor %}
+</select>
+</div>
+
+<div>
+<label>Quote / invoice reference</label>
+<input type="text" name="quote_reference" maxlength="120" value="{{ lead.quote_reference }}" placeholder="e.g. IB-2026-014">
+</div>
+
 <div class="note-form">
 <label>Add internal note <span style="font-weight:400;color:#98a2b3">(optional)</span></label>
-<textarea name="note" maxlength="2000" placeholder="Example: Customer asked me to call tomorrow after 2 PM."></textarea>
+<textarea name="note" maxlength="2000" placeholder="Example: Customer approved the quotation and asked us to start Monday."></textarea>
 </div>
 
 <div class="save-all">
@@ -4263,8 +4615,12 @@ def admin_leads():
             "priority": row[7] or "NORMAL",
             "follow_up_at": row[8],
             "follow_up_notified_at": row[9],
-            "created_at": row[10],
-            "updated_at": row[11],
+            "estimated_value": row[10],
+            "value_currency": row[11] or "MWK",
+            "quote_status": row[12] or "NOT_STARTED",
+            "quote_reference": row[13] or "",
+            "created_at": row[14],
+            "updated_at": row[15],
         })
 
     paused_customers = get_paused_customers()
@@ -4301,6 +4657,18 @@ def admin_leads():
         lead["reminder_sent_label"] = (
             notified_at.astimezone(ADMIN_TIMEZONE).strftime("%d %b %Y at %H:%M")
             if notified_at else ""
+        )
+
+        lead["estimated_value_label"] = _format_crm_amount(
+            lead.get("estimated_value"),
+            lead.get("value_currency") or "MWK",
+        )
+        lead["estimated_value_input"] = (
+            str(lead["estimated_value"]) if lead.get("estimated_value") is not None else ""
+        )
+        lead["quote_status_label"] = QUOTE_STATUSES.get(
+            lead.get("quote_status") or "NOT_STARTED",
+            "Not started",
         )
 
         lead_notes = notes_map.get(lead["id"], [])
@@ -4414,6 +4782,128 @@ def admin_leads():
 
 
 
+CUSTOMER_CRM_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101828">
+<link rel="manifest" href="{{ url_for('admin_manifest') }}">
+<link rel="icon" href="{{ url_for('admin_icon') }}" type="image/svg+xml">
+<title>IBROWS Customer CRM</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif}
+header{background:#101828;color:#fff;padding:16px 0;position:sticky;top:0;z-index:5}.wrap{max-width:900px;margin:auto;padding:0 14px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:10px}.brand{font-weight:800;font-size:19px}.back{color:#fff;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 10px;font-weight:700}
+.hero,.card{background:#fff;border-radius:14px;padding:16px;margin-top:14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+.hero h1{margin:0 0 5px;font-size:23px}.phone a{color:#175cd3;text-decoration:none}.muted{color:#667085}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.metric{background:#f9fafb;border-radius:10px;padding:10px}.metric b{display:block;font-size:19px}.metric span{font-size:11px;color:#667085}
+.lead-head{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.service{font-size:17px;font-weight:800}.badges{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.badge{font-size:10px;font-weight:800;background:#eef2f6;border-radius:16px;padding:6px 8px}.commercial{margin-top:8px;font-weight:800;font-size:13px}.summary{margin-top:8px;line-height:1.45;font-size:14px}.meta{font-size:11px;color:#98a2b3;margin-top:8px}.timeline h2,.services h2{margin:0 0 10px;font-size:19px}
+.event{position:relative;padding:0 0 15px 20px;border-left:2px solid #d0d5dd;margin-left:5px}.event:last-child{border-left-color:transparent}.dot{position:absolute;left:-6px;top:2px;width:10px;height:10px;background:#101828;border-radius:50%}.event-title{font-weight:800;font-size:13px}.event-desc{font-size:13px;line-height:1.4;margin-top:3px}.event-time{font-size:11px;color:#98a2b3;margin-top:4px}.whatsapp{display:block;text-align:center;background:#157347;color:white;text-decoration:none;border-radius:9px;padding:11px;margin-top:12px;font-weight:800}
+@media(max-width:620px){.metrics{grid-template-columns:1fr 1fr}.metrics .metric:last-child{grid-column:1/-1}}
+</style>
+<script src="{{ url_for('admin_pwa_js') }}" defer></script>
+</head>
+<body>
+<header><div class="wrap top"><div class="brand">IBROWS Customer CRM</div><a class="back" href="{{ return_to }}">Back</a></div></header>
+<div class="wrap">
+<div class="hero">
+<h1>{{ customer_name }}</h1>
+<div class="phone"><a href="https://wa.me/{{ customer_number }}" target="_blank" rel="noopener noreferrer">+{{ customer_number }}</a></div>
+<div class="metrics">
+<div class="metric"><b>{{ leads|length }}</b><span>Total leads</span></div>
+<div class="metric"><b>{{ open_count }}</b><span>Open leads</span></div>
+<div class="metric"><b>{{ services_count }}</b><span>Services used</span></div>
+</div>
+<a class="whatsapp" href="https://wa.me/{{ customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a>
+</div>
+
+<div class="card services">
+<h2>Service history</h2>
+{% for lead in leads %}
+<div style="padding:12px 0;{% if not loop.last %}border-bottom:1px solid #eaecf0{% endif %}">
+<div class="lead-head"><div class="service">{{ lead.service }}</div><div class="badges"><span class="badge">{{ lead.status }}</span><span class="badge">{{ lead.priority }}</span></div></div>
+{% if lead.estimated_value_label %}<div class="commercial">{{ lead.estimated_value_label }} · Quote: {{ lead.quote_status_label }}{% if lead.quote_reference %} · {{ lead.quote_reference }}{% endif %}</div>{% elif lead.quote_status != 'NOT_STARTED' %}<div class="commercial">Quote: {{ lead.quote_status_label }}{% if lead.quote_reference %} · {{ lead.quote_reference }}{% endif %}</div>{% endif %}
+<div class="summary">{{ lead.summary or 'No summary available.' }}</div>
+<div class="meta">Created {{ lead.created_label }} · Updated {{ lead.updated_label }}</div>
+</div>
+{% endfor %}
+</div>
+
+<div class="card timeline">
+<h2>Activity timeline</h2>
+{% if timeline %}
+{% for item in timeline %}
+<div class="event"><span class="dot"></span><div class="event-title">{{ item.service }} · {{ item.kind_label }}</div><div class="event-desc">{{ item.description }}</div><div class="event-time">{{ item.time_label }}</div></div>
+{% endfor %}
+{% else %}<div class="muted">No activity recorded yet.</div>{% endif %}
+</div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.route("/admin/customers/<customer_number>", methods=["GET"])
+@admin_required
+def admin_customer_history(customer_number):
+    if not customer_number.isdigit() or len(customer_number) > 20:
+        abort(400)
+
+    profile = get_customer_crm_profile(customer_number)
+    if not profile:
+        abort(404)
+
+    leads = profile["leads"]
+    timeline = profile["timeline"]
+    customer_name = next(
+        (lead["customer_name"] for lead in leads if lead.get("customer_name")),
+        "WhatsApp Customer",
+    )
+
+    for lead in leads:
+        lead["estimated_value_label"] = _format_crm_amount(
+            lead.get("estimated_value"),
+            lead.get("value_currency") or "MWK",
+        )
+        lead["quote_status_label"] = QUOTE_STATUSES.get(
+            lead.get("quote_status") or "NOT_STARTED",
+            "Not started",
+        )
+        lead["created_label"] = lead["created_at"].astimezone(
+            ADMIN_TIMEZONE
+        ).strftime("%d %b %Y %H:%M")
+        lead["updated_label"] = lead["updated_at"].astimezone(
+            ADMIN_TIMEZONE
+        ).strftime("%d %b %Y %H:%M")
+
+    kind_labels = {
+        "LEAD_CREATED": "Lead created",
+        "AI_UPDATE": "AI update",
+        "LEAD_UPDATED": "Lead update",
+        "STATUS": "Status change",
+        "NOTE": "Internal note",
+        "REMINDER": "Reminder",
+    }
+    for item in timeline:
+        item["kind_label"] = kind_labels.get(item["kind"], item["kind"].replace("_", " ").title())
+        item["time_label"] = item["created_at"].astimezone(
+            ADMIN_TIMEZONE
+        ).strftime("%d %b %Y %H:%M")
+
+    return_to = _safe_admin_return_path(request.args.get("return_to"))
+    return render_template_string(
+        CUSTOMER_CRM_TEMPLATE,
+        customer_number=customer_number,
+        customer_name=customer_name,
+        leads=leads,
+        timeline=timeline,
+        open_count=sum(1 for lead in leads if lead["status"] != "CLOSED"),
+        services_count=len({lead["service"] for lead in leads}),
+        return_to=return_to,
+    )
+
+
 @app.route("/admin/customers/<customer_number>/ai", methods=["POST"])
 @admin_required
 def admin_ai_takeover(customer_number):
@@ -4451,6 +4941,10 @@ def admin_lead_operations(lead_id):
                 priority=priority,
                 follow_up_at=follow_up_at,
                 note_text=note_text,
+                estimated_value=request.form.get("estimated_value", ""),
+                value_currency=request.form.get("value_currency", "MWK"),
+                quote_status=request.form.get("quote_status", "NOT_STARTED"),
+                quote_reference=request.form.get("quote_reference", ""),
             )
 
         # Backward-compatible handling for an already-open older dashboard page.
