@@ -311,6 +311,46 @@ def init_database():
             """)
 
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS business_document_sequences (
+                    document_year INTEGER NOT NULL,
+                    doc_type TEXT NOT NULL,
+                    last_number INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (document_year, doc_type)
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS business_documents (
+                    id BIGSERIAL PRIMARY KEY,
+                    lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+                    payment_id BIGINT REFERENCES lead_payments(id) ON DELETE SET NULL,
+                    doc_type TEXT NOT NULL,
+                    document_number TEXT NOT NULL UNIQUE,
+                    issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_business_docs_lead_type
+                ON business_documents(lead_id, doc_type)
+                WHERE doc_type IN ('quotation', 'invoice')
+            """)
+
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_business_docs_receipt_payment
+                ON business_documents(payment_id)
+                WHERE doc_type = 'receipt' AND payment_id IS NOT NULL
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_business_docs_lead
+                ON business_documents(lead_id, issued_at DESC)
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS lead_notes (
                     id BIGSERIAL PRIMARY KEY,
                     lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
@@ -3500,6 +3540,140 @@ BUSINESS_DOCUMENT_TYPES = {
     "receipt": "Receipt",
 }
 
+BUSINESS_DOCUMENT_PREFIXES = {
+    "quotation": "Q",
+    "invoice": "I",
+    "receipt": "R",
+}
+BUSINESS_QUOTATION_VALID_DAYS = 7
+BUSINESS_INVOICE_DUE_DAYS = 7
+
+
+def get_or_create_business_document_record(doc_type, lead_id, payment_id=None):
+    """
+    Allocate a permanent professional number once, then reuse it forever.
+    Quotations/invoices are one number per lead; receipts are one number
+    per individual payment transaction.
+    """
+    doc_type = str(doc_type or "").strip().lower()
+    if doc_type not in BUSINESS_DOCUMENT_TYPES:
+        raise ValueError("Unsupported document type.")
+
+    if doc_type == "receipt":
+        if not payment_id:
+            raise ValueError("Receipt requires a payment.")
+    else:
+        payment_id = None
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if doc_type == "receipt":
+                cur.execute(
+                    """
+                    SELECT id, document_number, issued_at
+                    FROM business_documents
+                    WHERE doc_type = 'receipt'
+                      AND payment_id = %s
+                    LIMIT 1
+                    FOR UPDATE
+                    """,
+                    (payment_id,)
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, document_number, issued_at
+                    FROM business_documents
+                    WHERE lead_id = %s
+                      AND doc_type = %s
+                    LIMIT 1
+                    FOR UPDATE
+                    """,
+                    (lead_id, doc_type)
+                )
+
+            existing = cur.fetchone()
+            if existing:
+                return {
+                    "id": existing[0],
+                    "document_number": existing[1],
+                    "issued_at": existing[2],
+                }
+
+            year = datetime.now(ADMIN_TIMEZONE).year
+            cur.execute(
+                """
+                INSERT INTO business_document_sequences (
+                    document_year, doc_type, last_number
+                )
+                VALUES (%s, %s, 0)
+                ON CONFLICT (document_year, doc_type) DO NOTHING
+                """,
+                (year, doc_type)
+            )
+            cur.execute(
+                """
+                SELECT last_number
+                FROM business_document_sequences
+                WHERE document_year = %s
+                  AND doc_type = %s
+                FOR UPDATE
+                """,
+                (year, doc_type)
+            )
+            current = cur.fetchone()
+            if not current:
+                raise RuntimeError("Document sequence unavailable.")
+
+            next_number = int(current[0]) + 1
+            cur.execute(
+                """
+                UPDATE business_document_sequences
+                SET last_number = %s
+                WHERE document_year = %s
+                  AND doc_type = %s
+                """,
+                (next_number, year, doc_type)
+            )
+
+            prefix = BUSINESS_DOCUMENT_PREFIXES[doc_type]
+            document_number = f"IB-{prefix}-{year}-{next_number:04d}"
+
+            cur.execute(
+                """
+                INSERT INTO business_documents (
+                    lead_id, payment_id, doc_type, document_number
+                )
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, document_number, issued_at
+                """,
+                (lead_id, payment_id, doc_type, document_number)
+            )
+            created = cur.fetchone()
+
+            _activity_insert(
+                cur,
+                lead_id,
+                "DOCUMENT_CREATED",
+                (
+                    f"{BUSINESS_DOCUMENT_TYPES[doc_type]} "
+                    f"{created[1]} generated."
+                ),
+            )
+
+        conn.commit()
+
+    print(
+        f"BUSINESS DOCUMENT NUMBER ALLOCATED: "
+        f"lead={lead_id} type={doc_type} number={created[1]}",
+        flush=True,
+    )
+    return {
+        "id": created[0],
+        "document_number": created[1],
+        "issued_at": created[2],
+    }
+
 
 def get_latest_payment_by_lead(lead_ids):
     if not lead_ids:
@@ -3624,17 +3798,10 @@ def get_business_document_context(lead_id, payment_id=None):
     return lead
 
 
-def _business_doc_reference(doc_type, lead, selected_payment=None):
-    year = datetime.now(ADMIN_TIMEZONE).year
-    if doc_type == "quotation":
-        return lead.get("quote_reference") or f"IB-Q-{year}-{lead['id']:04d}"
-    if doc_type == "invoice":
-        return lead.get("quote_reference") or f"IB-I-{year}-{lead['id']:04d}"
-    if doc_type == "receipt":
-        if not selected_payment:
-            raise ValueError("Receipt requires a payment.")
-        return selected_payment.get("reference") or f"IB-R-{year}-{selected_payment['id']:04d}"
-    raise ValueError("Unsupported document type.")
+def _business_doc_reference(document_record):
+    if not document_record or not document_record.get("document_number"):
+        raise ValueError("Document number unavailable.")
+    return document_record["document_number"]
 
 
 def _business_pdf_money(amount, currency):
@@ -3652,7 +3819,7 @@ def _business_pdf_wrap(text, size=10, bold=False, width=475):
     )
 
 
-def _business_pdf_build(doc_type, lead, payment_id=None):
+def _business_pdf_build(doc_type, lead, payment_id=None, document_record=None):
     doc_type = str(doc_type or "").strip().lower()
     if doc_type not in BUSINESS_DOCUMENT_TYPES:
         raise ValueError("Unsupported document type.")
@@ -3669,10 +3836,45 @@ def _business_pdf_build(doc_type, lead, payment_id=None):
     if doc_type == "receipt" and not selected_payment:
         raise ValueError("No payment is available for this receipt.")
 
-    title = BUSINESS_DOCUMENT_TYPES[doc_type].upper()
-    reference = _business_doc_reference(doc_type, lead, selected_payment)
-    now_local = datetime.now(ADMIN_TIMEZONE)
+    if not document_record:
+        raise ValueError("Document record is required.")
+
+    reference = _business_doc_reference(document_record)
+    issued_local = document_record["issued_at"].astimezone(ADMIN_TIMEZONE)
     currency = lead.get("value_currency") or "MWK"
+
+    if doc_type == "receipt":
+        if (
+            lead.get("estimated_value") is not None
+            and lead.get("balance") is not None
+            and Decimal(lead.get("balance")) > 0
+        ):
+            title = "DEPOSIT RECEIPT"
+        else:
+            title = "PAYMENT RECEIPT"
+        document_date = selected_payment["received_at"].astimezone(ADMIN_TIMEZONE)
+    else:
+        title = BUSINESS_DOCUMENT_TYPES[doc_type].upper()
+        document_date = issued_local
+
+    secondary_header = ""
+    if doc_type == "quotation":
+        valid_until = issued_local + timedelta(days=BUSINESS_QUOTATION_VALID_DAYS)
+        secondary_header = (
+            "Valid until: " + valid_until.strftime("%d %B %Y")
+        )
+    elif doc_type == "invoice":
+        balance = lead.get("balance")
+        balance = Decimal(balance) if balance is not None else Decimal("0")
+        if balance <= 0:
+            secondary_header = "Status: Paid in full"
+        else:
+            due_date = issued_local + timedelta(days=BUSINESS_INVOICE_DUE_DAYS)
+            secondary_header = "Due: " + due_date.strftime("%d %B %Y")
+    elif doc_type == "receipt":
+        secondary_header = (
+            "Payment date: " + document_date.strftime("%d %B %Y")
+        )
 
     # First page only. Business documents are intentionally concise.
     commands = []
@@ -3688,11 +3890,15 @@ def _business_pdf_build(doc_type, lead, payment_id=None):
         f"BT /F2 21 Tf 390 796 Td ({_pdf_escape(title)}) Tj ET"
     )
     commands.append(
-        f"BT /F1 9 Tf 390 777 Td ({_pdf_escape('Ref: ' + reference)}) Tj ET"
+        f"BT /F1 9 Tf 390 777 Td ({_pdf_escape('Document No: ' + reference)}) Tj ET"
     )
     commands.append(
-        f"BT /F1 9 Tf 390 763 Td ({_pdf_escape('Date: ' + now_local.strftime('%d %B %Y'))}) Tj ET"
+        f"BT /F1 9 Tf 390 763 Td ({_pdf_escape('Date: ' + document_date.strftime('%d %B %Y'))}) Tj ET"
     )
+    if secondary_header:
+        commands.append(
+            f"BT /F1 8.5 Tf 390 749 Td ({_pdf_escape(secondary_header)}) Tj ET"
+        )
 
     # Purple brand rule.
     commands.append("0.39 0.08 0.35 RG 2 w 42 724 m 553 724 l S")
@@ -3765,12 +3971,28 @@ def _business_pdf_build(doc_type, lead, payment_id=None):
             ("Quoted amount", _business_pdf_money(lead["estimated_value"], currency)),
             ("Quotation status", QUOTE_STATUSES.get(lead.get("quote_status"), "Not started")),
         ]
+        if lead.get("quote_reference"):
+            rows.append(("Customer reference", lead["quote_reference"]))
+        rows.append(
+            ("Validity", f"{BUSINESS_QUOTATION_VALID_DAYS} days from issue")
+        )
     elif doc_type == "invoice":
+        balance = Decimal(lead.get("balance") or 0)
+        if balance <= 0:
+            invoice_status = "Paid in full"
+        elif Decimal(lead.get("paid_total") or 0) > 0:
+            invoice_status = "Part paid"
+        else:
+            invoice_status = "Unpaid"
+
         rows = [
             ("Service value", _business_pdf_money(lead["estimated_value"], currency)),
             ("Payments received", _business_pdf_money(lead.get("paid_total", 0), currency)),
             ("Balance due", _business_pdf_money(lead.get("balance"), currency)),
+            ("Invoice status", invoice_status),
         ]
+        if lead.get("quote_reference"):
+            rows.append(("Customer reference", lead["quote_reference"]))
     else:
         method_label = PAYMENT_METHODS.get(
             selected_payment.get("payment_method") or "OTHER",
@@ -3782,9 +4004,14 @@ def _business_pdf_build(doc_type, lead, payment_id=None):
             ("Cumulative payments", _business_pdf_money(lead.get("paid_total", 0), currency)),
         ]
         if lead.get("estimated_value") is not None:
+            remaining = Decimal(lead.get("balance") or 0)
             rows += [
                 ("Service value", _business_pdf_money(lead["estimated_value"], currency)),
                 ("Remaining balance", _business_pdf_money(lead.get("balance"), currency)),
+                (
+                    "Payment status",
+                    "Paid in full" if remaining <= 0 else "Deposit / part payment",
+                ),
             ]
 
     for label, value in rows:
@@ -3884,7 +4111,8 @@ def _business_pdf_build(doc_type, lead, payment_id=None):
     )
 
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", lead.get("customer_name") or "Customer").strip("_")
-    filename = f"IBROWS_{title.title()}_{safe_name}_{reference}.pdf"
+    safe_title = re.sub(r"[^A-Za-z0-9_-]+", "_", title.title()).strip("_")
+    filename = f"IBROWS_{safe_title}_{safe_name}_{reference}.pdf"
     return {
         "bytes": bytes(out),
         "filename": filename,
@@ -5739,7 +5967,7 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 <a href="{{ url_for('admin_business_document_download', lead_id=lead.id, doc_type='receipt', payment_id=lead.latest_payment_id) }}">Download latest receipt</a>
 <form method="POST" action="{{ url_for('admin_business_document_send', lead_id=lead.id, doc_type='receipt') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="payment_id" value="{{ lead.latest_payment_id }}"><input type="hidden" name="return_to" value="{{ current_return }}"><button type="submit">Send latest receipt</button></form>
 {% endif %}
-{% if lead.estimated_value is none and not lead.latest_payment_id %}<div class="docs-note">Add an estimated value or record a payment before generating business documents.</div>{% else %}<div class="docs-note">Documents use the exact IBROWS logo, CRM customer details, saved quotation value and payment records.</div>{% endif %}
+{% if lead.estimated_value is none and not lead.latest_payment_id %}<div class="docs-note">Add an estimated value or record a payment before generating business documents.</div>{% else %}<div class="docs-note">Each quotation, invoice and receipt gets its own permanent IBROWS document number. Customer/payment references remain separate.</div>{% endif %}
 </div>
 </details>
 </div>
@@ -6127,6 +6355,7 @@ def admin_customer_history(customer_number):
         "MERGE": "Duplicate consolidation",
         "PAYMENT": "Payment",
         "DOCUMENT_SENT": "Document sent",
+        "DOCUMENT_CREATED": "Document generated",
     }
     for item in timeline:
         item["kind_label"] = kind_labels.get(item["kind"], item["kind"].replace("_", " ").title())
@@ -6202,10 +6431,16 @@ def admin_business_document_download(lead_id, doc_type):
         abort(404)
 
     try:
+        document_record = get_or_create_business_document_record(
+            doc_type,
+            lead_id,
+            payment_id=payment_id,
+        )
         document = _business_pdf_build(
             doc_type,
             context,
             payment_id=payment_id,
+            document_record=document_record,
         )
     except ValueError:
         abort(400)
@@ -6230,10 +6465,16 @@ def admin_business_document_send(lead_id, doc_type):
         abort(404)
 
     try:
+        document_record = get_or_create_business_document_record(
+            doc_type,
+            lead_id,
+            payment_id=payment_id,
+        )
         document = _business_pdf_build(
             doc_type,
             context,
             payment_id=payment_id,
+            document_record=document_record,
         )
     except ValueError:
         abort(400)
