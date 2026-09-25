@@ -4826,6 +4826,219 @@ def _finance_period_start(period):
     return start_local.astimezone(UTC_TIMEZONE)
 
 
+
+RECEIVABLE_FILTERS = {
+    "all": "All invoices",
+    "open": "Open",
+    "due_soon": "Due soon",
+    "overdue": "Overdue",
+    "paid": "Paid",
+}
+RECEIVABLE_DUE_SOON_DAYS = 3
+
+
+def get_accounts_receivable_data(status_filter="all"):
+    status_filter = (
+        status_filter if status_filter in RECEIVABLE_FILTERS else "all"
+    )
+    today_local = datetime.now(ADMIN_TIMEZONE).date()
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    d.id,
+                    d.lead_id,
+                    d.document_number,
+                    d.issued_at,
+                    d.last_sent_at,
+                    COALESCE(d.send_count, 0),
+                    l.customer_number,
+                    l.customer_name,
+                    l.service,
+                    l.estimated_value,
+                    COALESCE(l.value_currency, 'MWK'),
+                    COALESCE(SUM(
+                        CASE
+                            WHEN p.currency = COALESCE(l.value_currency, 'MWK')
+                            THEN p.amount ELSE 0
+                        END
+                    ), 0) AS paid_total
+                FROM business_documents d
+                JOIN leads l ON l.id = d.lead_id
+                LEFT JOIN lead_payments p ON p.lead_id = l.id
+                WHERE d.doc_type = 'invoice'
+                  AND l.merged_into_lead_id IS NULL
+                GROUP BY
+                    d.id, d.lead_id, d.document_number, d.issued_at,
+                    d.last_sent_at, d.send_count,
+                    l.customer_number, l.customer_name, l.service,
+                    l.estimated_value, l.value_currency
+                ORDER BY d.issued_at DESC, d.id DESC
+                """
+            )
+            rows = cur.fetchall()
+
+    invoices = []
+    outstanding_amounts = {}
+    overdue_amounts = {}
+    due_soon_amounts = {}
+    status_counts = {
+        "open": 0,
+        "due_soon": 0,
+        "overdue": 0,
+        "paid": 0,
+    }
+
+    for row in rows:
+        (
+            document_id, lead_id, document_number, issued_at,
+            last_sent_at, send_count, customer_number, customer_name,
+            service, estimated_value, currency, paid_total
+        ) = row
+
+        currency = currency or "MWK"
+        estimated = (
+            Decimal(estimated_value)
+            if estimated_value is not None
+            else Decimal("0")
+        )
+        paid_total = Decimal(paid_total or 0)
+        balance = max(estimated - paid_total, Decimal("0"))
+
+        issued_local = issued_at.astimezone(ADMIN_TIMEZONE)
+        due_local = issued_local + timedelta(
+            days=BUSINESS_INVOICE_DUE_DAYS
+        )
+        due_date = due_local.date()
+        days_to_due = (due_date - today_local).days
+
+        if balance <= 0 and estimated > 0:
+            status_key = "paid"
+            status_label = "Paid"
+            urgency_label = "Paid in full"
+            payment_status = "Paid"
+        else:
+            if paid_total > 0:
+                payment_status = "Part paid"
+            else:
+                payment_status = "Not paid"
+
+            if days_to_due < 0:
+                status_key = "overdue"
+                overdue_days = abs(days_to_due)
+                status_label = "Overdue"
+                urgency_label = (
+                    f"Overdue by {overdue_days} day"
+                    f"{'' if overdue_days == 1 else 's'}"
+                )
+            elif days_to_due <= RECEIVABLE_DUE_SOON_DAYS:
+                status_key = "due_soon"
+                status_label = "Due soon"
+                if days_to_due == 0:
+                    urgency_label = "Due today"
+                elif days_to_due == 1:
+                    urgency_label = "Due tomorrow"
+                else:
+                    urgency_label = f"Due in {days_to_due} days"
+            else:
+                status_key = "open"
+                status_label = "Open"
+                urgency_label = f"Due in {days_to_due} days"
+
+        status_counts[status_key] += 1
+
+        if balance > 0:
+            outstanding_amounts[currency] = (
+                outstanding_amounts.get(currency, Decimal("0")) + balance
+            )
+            if status_key == "overdue":
+                overdue_amounts[currency] = (
+                    overdue_amounts.get(currency, Decimal("0")) + balance
+                )
+            elif status_key == "due_soon":
+                due_soon_amounts[currency] = (
+                    due_soon_amounts.get(currency, Decimal("0")) + balance
+                )
+
+        sent_count = int(send_count or 0)
+        if sent_count:
+            sent_label = (
+                f"Sent {sent_count} time"
+                f"{'' if sent_count == 1 else 's'}"
+            )
+            if last_sent_at:
+                sent_label += (
+                    " · Last sent "
+                    + last_sent_at.astimezone(ADMIN_TIMEZONE).strftime(
+                        "%d %b %Y %H:%M"
+                    )
+                )
+        else:
+            sent_label = "Generated · not sent yet"
+
+        invoice = {
+            "document_id": document_id,
+            "lead_id": lead_id,
+            "document_number": document_number,
+            "customer_number": customer_number,
+            "customer_name": customer_name or "WhatsApp Customer",
+            "service": canonicalize_service(service),
+            "issued_at": issued_at,
+            "issued_label": issued_local.strftime("%d %b %Y"),
+            "due_label": due_local.strftime("%d %b %Y"),
+            "estimated_value": estimated,
+            "value_label": _format_crm_amount(estimated, currency),
+            "paid_total": paid_total,
+            "paid_label": _format_crm_amount(paid_total, currency),
+            "balance": balance,
+            "balance_label": _format_crm_amount(balance, currency),
+            "currency": currency,
+            "status_key": status_key,
+            "status_label": status_label,
+            "urgency_label": urgency_label,
+            "payment_status": payment_status,
+            "send_count": sent_count,
+            "sent_label": sent_label,
+        }
+        invoices.append(invoice)
+
+    priority = {
+        "overdue": 0,
+        "due_soon": 1,
+        "open": 2,
+        "paid": 3,
+    }
+    invoices.sort(
+        key=lambda item: (
+            priority.get(item["status_key"], 9),
+            item["issued_at"],
+        )
+    )
+
+    if status_filter != "all":
+        visible_invoices = [
+            item for item in invoices
+            if item["status_key"] == status_filter
+        ]
+    else:
+        visible_invoices = invoices
+
+    return {
+        "filter": status_filter,
+        "filter_label": RECEIVABLE_FILTERS[status_filter],
+        "invoices": visible_invoices,
+        "invoice_count": len(invoices),
+        "visible_count": len(visible_invoices),
+        "outstanding": _crm_amount_lines(outstanding_amounts),
+        "overdue": _crm_amount_lines(overdue_amounts),
+        "due_soon": _crm_amount_lines(due_soon_amounts),
+        "status_counts": status_counts,
+    }
+
+
+
 def get_finance_dashboard_data(period="month"):
     period = period if period in FINANCE_PERIODS else "month"
     start_utc = _finance_period_start(period)
@@ -5526,6 +5739,9 @@ def _safe_admin_return_path(value=None):
         return url_for("admin_leads")
 
     if candidate.startswith("/admin/leads"):
+        return candidate
+
+    if candidate.startswith("/admin/finance"):
         return candidate
 
     if re.fullmatch(r"/admin/customers/\d{1,20}(?:\?.*)?", candidate):
@@ -6532,7 +6748,7 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 </style>
 </head>
 <body>
-<header><div class="wrap top"><div class="brand">IBROWS Finance</div><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></header>
+<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px"><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
 <div class="wrap">
 <h1>Payments & Revenue</h1>
 <p class="sub">Track money actually received, current accepted work and outstanding customer balances.</p>
@@ -6596,6 +6812,119 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 <div class="note">This is money received, not quoted or invoiced value.</div>
 </div>
 
+</div>
+</body>
+</html>
+"""
+
+
+ACCOUNTS_RECEIVABLE_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101828">
+<link rel="manifest" href="{{ url_for('admin_manifest') }}">
+<link rel="icon" href="{{ url_for('admin_icon') }}" type="image/svg+xml">
+<title>IBROWS Receivables</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:30px}
+header{background:#101828;color:#fff;position:sticky;top:0;z-index:10}
+.wrap{max-width:980px;margin:auto;padding:0 14px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:16px 0}
+.brand{font-size:20px;font-weight:800}
+.back{color:#fff;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:800;font-size:12px;white-space:nowrap}
+h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-height:1.4}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}
+.card{background:#fff;border-radius:13px;padding:14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+.metric-title{font-size:11px;color:#667085;font-weight:800}.metric-value{font-size:18px;font-weight:800;line-height:1.45;margin-top:5px}.metric-note{font-size:11px;color:#98a2b3;margin-top:5px}
+.filters{display:flex;gap:7px;overflow-x:auto;padding:14px 0 1px;scrollbar-width:none}.filters::-webkit-scrollbar{display:none}
+.filter{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;background:#fff;border-radius:18px;padding:7px 11px;font-size:12px;font-weight:800}
+.filter.active{background:#101828;color:#fff;border-color:#101828}
+.section{background:#fff;border-radius:13px;padding:14px;margin-top:13px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+.section h2{font-size:18px;margin:0 0 4px}.section-sub{font-size:12px;color:#667085;margin-bottom:6px;line-height:1.4}
+.invoice{padding:15px 0;border-bottom:1px solid #eaecf0}.invoice:last-child{border-bottom:0}
+.invoice-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.docno{font-weight:800;font-size:15px}.customer{font-weight:800;margin-top:5px}.customer a{color:#175cd3;text-decoration:none}
+.service{font-size:12px;color:#667085;margin-top:3px}.amount{text-align:right;font-weight:800;font-size:16px}
+.badges{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}.badge{font-size:10px;font-weight:800;border-radius:15px;padding:5px 8px;background:#eef2f6;color:#344054}
+.badge.overdue{background:#fee4e2;color:#b42318}.badge.due_soon{background:#fff3cd;color:#7a5d00}.badge.paid{background:#dcfae6;color:#067647}.badge.open{background:#eaf2ff;color:#175cd3}
+.money{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:10px}.money div{background:#f9fafb;border-radius:9px;padding:9px}.money span{display:block;font-size:10px;color:#667085;font-weight:700}.money b{display:block;font-size:13px;margin-top:3px}
+.meta{font-size:11px;color:#98a2b3;line-height:1.5;margin-top:9px}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:10px}.actions a,.actions button{width:100%;display:block;text-align:center;border-radius:8px;padding:9px 7px;font-weight:800;font-size:12px;text-decoration:none}.actions a{border:1px solid #d0d5dd;color:#101828;background:#fff}.actions button{border:1px solid #101828;color:#fff;background:#101828}.actions form{margin:0}
+.empty{color:#98a2b3;font-size:13px;font-weight:600;padding:12px 0}.note{font-size:11px;color:#98a2b3;line-height:1.4;margin-top:10px}
+@media(max-width:760px){.cards{grid-template-columns:1fr 1fr}.wrap{padding-left:11px;padding-right:11px}.brand{font-size:19px}}
+@media(max-width:420px){.top{align-items:flex-start}.back{font-size:11px;padding:8px 9px}.money{grid-template-columns:1fr 1fr}.money div:last-child{grid-column:1/-1}}
+</style>
+<script src="{{ url_for('admin_pwa_js') }}" defer></script>
+</head>
+<body>
+<header><div class="wrap top"><div class="brand">IBROWS Receivables</div><a class="back" href="{{ url_for('admin_finance') }}">Back to Finance</a></div></header>
+<div class="wrap">
+<h1>Invoices & Due Dates</h1>
+<p class="sub">See which invoices are open, approaching their due date, overdue or already paid.</p>
+
+<div class="cards">
+<div class="card"><div class="metric-title">Outstanding invoices</div><div class="metric-value">{% if ar.outstanding %}{% for item in ar.outstanding %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span style="color:#98a2b3">None</span>{% endif %}</div><div class="metric-note">{{ ar.status_counts.open + ar.status_counts.due_soon + ar.status_counts.overdue }} invoice{% if ar.status_counts.open + ar.status_counts.due_soon + ar.status_counts.overdue != 1 %}s{% endif %}</div></div>
+<div class="card"><div class="metric-title">Due soon</div><div class="metric-value">{% if ar.due_soon %}{% for item in ar.due_soon %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span style="color:#98a2b3">None</span>{% endif %}</div><div class="metric-note">{{ ar.status_counts.due_soon }} invoice{% if ar.status_counts.due_soon != 1 %}s{% endif %}</div></div>
+<div class="card"><div class="metric-title">Overdue</div><div class="metric-value">{% if ar.overdue %}{% for item in ar.overdue %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span style="color:#98a2b3">None</span>{% endif %}</div><div class="metric-note">{{ ar.status_counts.overdue }} invoice{% if ar.status_counts.overdue != 1 %}s{% endif %}</div></div>
+<div class="card"><div class="metric-title">Paid invoices</div><div class="metric-value">{{ ar.status_counts.paid }}</div><div class="metric-note">of {{ ar.invoice_count }} generated invoice{% if ar.invoice_count != 1 %}s{% endif %}</div></div>
+</div>
+
+<div class="filters">
+{% for key,label in filters.items() %}
+<a class="filter {% if ar.filter == key %}active{% endif %}" href="{{ url_for('admin_receivables', status=key) }}">{{ label }}{% if key != 'all' %} · {{ ar.status_counts.get(key, 0) }}{% endif %}</a>
+{% endfor %}
+</div>
+
+<div class="section">
+<h2>{{ ar.filter_label }}</h2>
+<div class="section-sub">{{ ar.visible_count }} shown · due date is {{ invoice_due_days }} days after invoice issue.</div>
+
+{% if ar.invoices %}
+{% for invoice in ar.invoices %}
+<div class="invoice">
+<div class="invoice-head">
+<div>
+<div class="docno">{{ invoice.document_number }}</div>
+<div class="customer"><a href="{{ url_for('admin_customer_history', customer_number=invoice.customer_number, return_to=current_return) }}">{{ invoice.customer_name }}</a></div>
+<div class="service">{{ invoice.service }}</div>
+</div>
+<div class="amount">{{ invoice.balance_label if invoice.balance > 0 else invoice.value_label }}</div>
+</div>
+
+<div class="badges">
+<span class="badge {{ invoice.status_key }}">{{ invoice.status_label }}</span>
+<span class="badge">{{ invoice.urgency_label }}</span>
+<span class="badge">{{ invoice.payment_status }}</span>
+</div>
+
+<div class="money">
+<div><span>Invoice value</span><b>{{ invoice.value_label }}</b></div>
+<div><span>Paid</span><b>{{ invoice.paid_label }}</b></div>
+<div><span>Balance</span><b>{{ invoice.balance_label }}</b></div>
+</div>
+
+<div class="meta">Issued {{ invoice.issued_label }} · Due {{ invoice.due_label }}<br>{{ invoice.sent_label }}</div>
+
+<div class="actions">
+<a href="{{ url_for('admin_business_document_download', lead_id=invoice.lead_id, doc_type='invoice') }}">Download invoice</a>
+<form method="POST" action="{{ url_for('admin_business_document_send', lead_id=invoice.lead_id, doc_type='invoice') }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<input type="hidden" name="return_to" value="{{ current_return }}">
+<button type="submit">Send invoice</button>
+</form>
+</div>
+</div>
+{% endfor %}
+{% else %}
+<div class="empty">No invoices match this filter.</div>
+{% endif %}
+
+<div class="note">Different currencies remain separate. This page does not automatically message customers; invoice sending stays under your control.</div>
+</div>
 </div>
 </body>
 </html>
@@ -6764,6 +7093,27 @@ def admin_finance():
         finance=finance,
         periods=FINANCE_PERIODS,
         current_year=datetime.now(ADMIN_TIMEZONE).year,
+    )
+
+
+
+
+@app.route("/admin/finance/receivables", methods=["GET"])
+@admin_required
+def admin_receivables():
+    status_filter = request.args.get("status", "all").strip().lower()
+    if status_filter not in RECEIVABLE_FILTERS:
+        status_filter = "all"
+
+    ar = get_accounts_receivable_data(status_filter)
+    current_return = request.full_path.rstrip("?")
+    return render_template_string(
+        ACCOUNTS_RECEIVABLE_TEMPLATE,
+        ar=ar,
+        filters=RECEIVABLE_FILTERS,
+        invoice_due_days=BUSINESS_INVOICE_DUE_DAYS,
+        csrf_token=get_csrf_token(),
+        current_return=current_return,
     )
 
 
