@@ -2765,10 +2765,12 @@ def handle_local_human_handover(
     set_ai_paused(customer_number, True)
 
     try:
+        handover_service = get_latest_open_lead_service(customer_number)
+
         lead_id, is_new_lead = create_or_update_lead(
             customer_number=customer_number,
             customer_name=customer_name,
-            service="Human Handover",
+            service=handover_service,
             summary="Customer explicitly requested human assistance and asked to stop AI interaction.",
             handover_reason="Explicit request to speak with a human/manager or stop AI."
         )
@@ -2778,7 +2780,7 @@ def handle_local_human_handover(
                 lead_id=lead_id,
                 customer_name=customer_name,
                 customer_number=customer_number,
-                service="Human Handover",
+                service=handover_service,
                 summary="Customer explicitly requested human assistance and asked to stop AI interaction.",
                 handover_reason="Explicit request to speak with a human/manager or stop AI."
             )
@@ -2842,9 +2844,43 @@ def canonicalize_service(service):
         "social media": "Social Media Management",
         "social media management": "Social Media Management",
         "photo restoration": "Photo Restoration",
+        "website development service": "Website Development",
+        "website development services": "Website Development",
+        "human handover": "General Enquiry",
+        "human support": "General Enquiry",
+        "human assistance": "General Enquiry",
+        "handover": "General Enquiry",
+        "general": "General Enquiry",
+        "general enquiry": "General Enquiry",
+        "general inquiry": "General Enquiry",
     }
 
     return aliases.get(value, str(service or "General Enquiry").strip() or "General Enquiry")
+
+
+def get_latest_open_lead_service(customer_number):
+    """
+    Keep an explicit human takeover attached to the customer's current service
+    when possible. "Human Handover" is a workflow state, not a service category.
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT service
+                FROM leads
+                WHERE customer_number = %s
+                  AND status IN ('NEW', 'CONTACTED')
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (customer_number,)
+            )
+            row = cur.fetchone()
+
+    if row and row[0]:
+        return canonicalize_service(row[0])
+    return "General Enquiry"
 
 
 def create_or_update_lead(
@@ -2861,18 +2897,20 @@ def create_or_update_lead(
 
             cur.execute(
                 """
-                SELECT id
+                SELECT id, service
                 FROM leads
                 WHERE customer_number = %s
                   AND status IN ('NEW', 'CONTACTED')
-                  AND LOWER(COALESCE(service, '')) = LOWER(%s)
-                ORDER BY created_at DESC
-                LIMIT 1
+                ORDER BY updated_at DESC, created_at DESC
                 """,
-                (customer_number, service)
+                (customer_number,)
             )
 
-            existing = cur.fetchone()
+            existing = None
+            for candidate_id, candidate_service in cur.fetchall():
+                if canonicalize_service(candidate_service).casefold() == service.casefold():
+                    existing = (candidate_id,)
+                    break
 
             if existing:
                 lead_id = existing[0]
@@ -3235,6 +3273,43 @@ def add_lead_note(lead_id, note_text):
                 """,
                 (lead_id,)
             )
+        conn.commit()
+
+
+def update_lead_management(lead_id, priority, follow_up_at, note_text=""):
+    """Save the Manage Lead form in one database transaction."""
+    allowed = {"LOW", "NORMAL", "HIGH", "URGENT"}
+    priority = str(priority or "").strip().upper()
+    if priority not in allowed:
+        raise ValueError("Invalid lead priority.")
+
+    note_text = " ".join(str(note_text or "").split()).strip()
+    if len(note_text) > 2000:
+        note_text = note_text[:2000]
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET priority = %s,
+                    follow_up_at = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (priority, follow_up_at, lead_id)
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Lead not found.")
+
+            if note_text:
+                cur.execute(
+                    """
+                    INSERT INTO lead_notes (lead_id, note_text)
+                    VALUES (%s, %s)
+                    """,
+                    (lead_id, note_text)
+                )
         conn.commit()
 
 
@@ -3760,7 +3835,7 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 .ai-state{margin-top:7px;font-size:11px;font-weight:800;color:#667085}.takeover{margin-top:7px}.takeover button{width:100%;border:1px solid #d0d5dd;background:#fff;border-radius:9px;padding:10px 12px;font-weight:800}.takeover .resume{background:#101828;color:#fff}
 .actions{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:7px}.actions form{margin:0}.actions button{width:100%;border:1px solid #d0d5dd;background:white;border-radius:8px;padding:8px 5px;font-weight:700;font-size:11px}
 .manage{margin-top:8px;border:1px solid #eaecf0;border-radius:10px;padding:0 10px}.manage summary{cursor:pointer;font-weight:800;padding:10px 0;font-size:13px}.manage-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding-bottom:10px}
-.manage form{margin:0}.manage label{display:block;font-size:11px;font-weight:800;color:#667085;margin-bottom:4px}.manage select,.manage input,.manage textarea{width:100%;border:1px solid #d0d5dd;border-radius:8px;padding:9px;font-size:13px;background:white}.manage textarea{min-height:70px;resize:vertical}.manage button{width:100%;border:0;border-radius:8px;background:#101828;color:white;padding:9px;font-weight:800;margin-top:5px;font-size:12px}.manage .secondary{background:white;color:#344054;border:1px solid #d0d5dd}.note-form{grid-column:1/-1}
+.manage form{margin:0}.manage label{display:block;font-size:11px;font-weight:800;color:#667085;margin-bottom:4px}.manage select,.manage input,.manage textarea{width:100%;border:1px solid #d0d5dd;border-radius:8px;padding:9px;font-size:13px;background:white}.manage textarea{min-height:70px;resize:vertical}.manage button{width:100%;border:0;border-radius:8px;background:#101828;color:white;padding:11px;font-weight:800;margin-top:5px;font-size:12px}.manage .secondary{background:white;color:#344054;border:1px solid #d0d5dd}.note-form{grid-column:1/-1}.save-all{grid-column:1/-1}.clear-follow{display:flex;align-items:center;gap:8px;margin-top:7px;font-size:12px;color:#667085;font-weight:700}.clear-follow input{width:auto;margin:0}
 .empty{background:white;padding:26px;border-radius:12px;text-align:center;color:#667085}.clear{display:inline-block;margin-top:9px;color:#175cd3;text-decoration:none;font-weight:700}
 .pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:15px 0 26px}.page-link{flex:1;text-align:center;text-decoration:none;border:1px solid #d0d5dd;background:white;color:#344054;border-radius:9px;padding:9px;font-weight:700}.page-link.disabled{opacity:.45;pointer-events:none}.page-info{font-size:12px;color:#667085;white-space:nowrap}
 @media(max-width:760px){
@@ -3850,23 +3925,37 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 
 <details class="manage">
 <summary>Manage lead</summary>
-<div class="manage-grid">
-<form method="POST" action="{{ url_for('admin_lead_operations', lead_id=lead.id) }}">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="priority"><input type="hidden" name="return_to" value="{{ current_return }}">
-<label>Priority</label><select name="priority">{% for p in ['URGENT','HIGH','NORMAL','LOW'] %}<option value="{{ p }}" {% if lead.priority == p %}selected{% endif %}>{{ p.title() }}</option>{% endfor %}</select><button type="submit">Save priority</button>
-</form>
+<form class="manage-grid" method="POST" action="{{ url_for('admin_lead_operations', lead_id=lead.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<input type="hidden" name="action" value="save_all">
+<input type="hidden" name="return_to" value="{{ current_return }}">
 
-<form method="POST" action="{{ url_for('admin_lead_operations', lead_id=lead.id) }}">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="followup"><input type="hidden" name="return_to" value="{{ current_return }}">
-<label>Follow-up date & time</label><input type="datetime-local" name="follow_up" value="{{ lead.follow_up_value }}"><button type="submit">Save follow-up</button>
-{% if lead.follow_up_at %}<button class="secondary" type="submit" name="clear_follow_up" value="1">Clear follow-up</button>{% endif %}
-</form>
-
-<form class="note-form" method="POST" action="{{ url_for('admin_lead_operations', lead_id=lead.id) }}">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="note"><input type="hidden" name="return_to" value="{{ current_return }}">
-<label>Add internal note</label><textarea name="note" maxlength="2000" placeholder="Example: Customer asked me to call tomorrow after 2 PM."></textarea><button type="submit">Add note</button>
-</form>
+<div>
+<label>Priority</label>
+<select name="priority">
+{% for p in ['URGENT','HIGH','NORMAL','LOW'] %}
+<option value="{{ p }}" {% if lead.priority == p %}selected{% endif %}>{{ p.title() }}</option>
+{% endfor %}
+</select>
 </div>
+
+<div>
+<label>Follow-up date & time</label>
+<input type="datetime-local" name="follow_up" value="{{ lead.follow_up_value }}">
+{% if lead.follow_up_at %}
+<label class="clear-follow"><input type="checkbox" name="clear_follow_up" value="1"> Clear current follow-up</label>
+{% endif %}
+</div>
+
+<div class="note-form">
+<label>Add internal note <span style="font-weight:400;color:#98a2b3">(optional)</span></label>
+<textarea name="note" maxlength="2000" placeholder="Example: Customer asked me to call tomorrow after 2 PM."></textarea>
+</div>
+
+<div class="save-all">
+<button type="submit">Save all changes</button>
+</div>
+</form>
 </details>
 </div>
 {% endfor %}
@@ -3893,7 +3982,7 @@ def admin_leads():
             "id": row[0],
             "customer_number": row[1],
             "customer_name": row[2],
-            "service": row[3],
+            "service": canonicalize_service(row[3]),
             "summary": row[4],
             "handover_reason": row[5],
             "status": row[6],
@@ -3955,9 +4044,9 @@ def admin_leads():
     attention_filter = request.args.get("attention", "").strip() == "1"
 
     services = sorted({
-        str(lead.get("service") or "").strip()
+        canonicalize_service(lead.get("service"))
         for lead in all_leads
-        if str(lead.get("service") or "").strip()
+        if canonicalize_service(lead.get("service"))
     }, key=str.casefold)
 
     leads = list(all_leads)
@@ -4064,7 +4153,27 @@ def admin_lead_operations(lead_id):
     return_to = _safe_admin_return_path(request.form.get("return_to"))
 
     try:
-        if action == "priority":
+        if action == "save_all":
+            priority = request.form.get("priority", "").strip().upper()
+            raw_follow_up = request.form.get("follow_up", "").strip()
+
+            if request.form.get("clear_follow_up") == "1":
+                follow_up_at = None
+            elif raw_follow_up:
+                follow_up_at = parse_admin_follow_up(raw_follow_up)
+            else:
+                follow_up_at = None
+
+            note_text = request.form.get("note", "")
+            update_lead_management(
+                lead_id=lead_id,
+                priority=priority,
+                follow_up_at=follow_up_at,
+                note_text=note_text,
+            )
+
+        # Backward-compatible handling for an already-open older dashboard page.
+        elif action == "priority":
             priority = request.form.get("priority", "").strip().upper()
             update_lead_priority(lead_id, priority)
 
