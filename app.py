@@ -1238,12 +1238,18 @@ def audit_application_pack_against_evidence(customer_number, pack):
     """Independent evidence audit with explicit minor-vs-human-review triage."""
     memory_context, _ = build_application_evidence_context(customer_number)
     conversation = get_application_customer_context(customer_number, limit=30)
+    audit_cover_letter = dict(pack.get("cover_letter") or {})
+    # Sign-off completeness is a rendering/layout concern, not a candidate factual claim.
+    # The document builder appends candidate_name exactly once and deterministic visual QA
+    # validates the rendered closing, so exclude the raw structured signoff here.
+    audit_cover_letter.pop("signoff", None)
+
     audit_view = {
         "candidate_name": pack.get("candidate_name", ""),
         "target_role": pack.get("target_role", ""),
         "target_organisation": pack.get("target_organisation", ""),
         "cv": pack.get("cv") or {},
-        "cover_letter": pack.get("cover_letter") or {},
+        "cover_letter": audit_cover_letter,
     }
     audit_payload = memory_context + conversation + [{
         "role": "user",
@@ -1270,6 +1276,7 @@ IMPORTANT: If the disputed wording can be safely narrowed, replaced, or deleted 
 
 Do not reject a draft merely because it omits an unmet requirement. Do reject candidate claims that upgrade vague evidence into stronger experience.
 Do not audit or comment on internal eligibility-warning/workflow metadata; it is not part of the CV or cover letter.
+Do not audit sign-off completeness, signature placement, page layout, wrapping, or other rendering details; those are checked separately by deterministic visual QA.
 
 Return ONLY valid JSON exactly as:
 {"approved": true, "minor_repairable": [], "requires_human": [], "issues": []}
@@ -1348,12 +1355,41 @@ def _safe_human_findings_for_auto_repair(audit):
 _EXPLICIT_QA_REPLACEMENT_RE = re.compile(
     r"""(?ix)
     \breplace\s+
-    [“"''](?P<old>[^”"'']{1,160})[”"'']
+    [“"''](?P<old>[^”"'']{1,220})[”"'']
     .*?
     \bwith(?:\s+the\s+(?:supported|documented|evidence[- ]backed)\s+wording)?\s+
-    [“"''](?P<new>[^”"'']{1,160})[”"'']
+    [“"''](?P<new>[^”"'']{1,220})[”"'']
     """
 )
+
+_NARROW_QA_REPLACEMENT_RE = re.compile(
+    r"""(?ix)
+    [“"''](?P<old>[^”"'']{1,220})[”"'']
+    \s+
+    should\s+be\s+
+    (?:
+        narrowed\s+to |
+        replaced\s+with |
+        changed\s+to |
+        revised\s+to
+    )
+    \s+
+    [“"''](?P<new>[^”"'']{1,220})[”"'']
+    """
+)
+
+
+def _extract_explicit_qa_replacement(finding):
+    raw = str(finding or "")
+    for pattern in (_EXPLICIT_QA_REPLACEMENT_RE, _NARROW_QA_REPLACEMENT_RE):
+        match = pattern.search(raw)
+        if not match:
+            continue
+        old = match.group("old").strip()
+        new = match.group("new").strip()
+        if old and new and old.lower() != new.lower():
+            return old, new
+    return None
 
 
 def _replace_text_in_application_documents(value, old, new):
@@ -1381,13 +1417,9 @@ def _apply_explicit_qa_replacements(pack, findings):
     """
     replacements = []
     for finding in findings or []:
-        match = _EXPLICIT_QA_REPLACEMENT_RE.search(str(finding or ""))
-        if not match:
-            continue
-        old = match.group("old").strip()
-        new = match.group("new").strip()
-        if old and new and old.lower() != new.lower():
-            replacements.append((old, new))
+        replacement = _extract_explicit_qa_replacement(finding)
+        if replacement:
+            replacements.append(replacement)
 
     if not replacements:
         return pack
