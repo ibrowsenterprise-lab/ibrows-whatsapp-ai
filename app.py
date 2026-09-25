@@ -55,6 +55,8 @@ NOTIFICATION_EMAIL = os.environ.get("NOTIFICATION_EMAIL") or "ibrowsenterprise@g
 BREVO_SENDER_EMAIL = os.environ.get("BREVO_SENDER_EMAIL") or "ibrowsenterprise@gmail.com"
 BREVO_SENDER_NAME = os.environ.get("BREVO_SENDER_NAME") or "IBROWS Enterprise"
 LEAD_DASHBOARD_URL = "https://ibrows-whatsapp-ai-1.onrender.com/admin/leads"
+ADMIN_TIMEZONE = ZoneInfo("Africa/Blantyre")
+UTC_TIMEZONE = ZoneInfo("UTC")
 
 app.secret_key = FLASK_SECRET_KEY
 
@@ -218,6 +220,35 @@ def init_database():
             cur.execute("""
                 ALTER TABLE leads
                 ADD COLUMN IF NOT EXISTS customer_name TEXT
+            """)
+
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'NORMAL'
+            """)
+
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS follow_up_at TIMESTAMPTZ
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lead_notes (
+                    id BIGSERIAL PRIMARY KEY,
+                    lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+                    note_text TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_lead_notes_lead
+                ON lead_notes(lead_id, created_at DESC)
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_leads_follow_up
+                ON leads(follow_up_at)
             """)
 
             cur.execute("""
@@ -3033,19 +3064,26 @@ def get_all_leads():
                     summary,
                     handover_reason,
                     status,
+                    priority,
+                    follow_up_at,
                     created_at,
                     updated_at
                 FROM leads
                 ORDER BY
-                    CASE status
-                        WHEN 'NEW' THEN 1
-                        WHEN 'CONTACTED' THEN 2
-                        WHEN 'CLOSED' THEN 3
-                        ELSE 4
+                    CASE
+                        WHEN status <> 'CLOSED'
+                             AND follow_up_at IS NOT NULL
+                             AND follow_up_at <= NOW() THEN 0
+                        WHEN status = 'NEW' THEN 1
+                        WHEN priority = 'URGENT' THEN 2
+                        WHEN priority = 'HIGH' THEN 3
+                        WHEN status = 'CONTACTED' THEN 4
+                        WHEN status = 'CLOSED' THEN 6
+                        ELSE 5
                     END,
+                    COALESCE(follow_up_at, updated_at) ASC,
                     updated_at DESC
             """)
-
             return cur.fetchall()
 
 
@@ -3064,35 +3102,163 @@ def get_lead_counts():
                 FROM leads
                 GROUP BY status
             """)
-
             for status, count in cur.fetchall():
                 counts["ALL"] += count
-
                 if status in counts:
                     counts[status] = count
 
     return counts
 
 
+def get_recent_lead_notes(lead_ids, per_lead=3):
+    if not lead_ids:
+        return {}
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT lead_id, note_text, created_at
+                FROM (
+                    SELECT
+                        lead_id,
+                        note_text,
+                        created_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY lead_id
+                            ORDER BY created_at DESC, id DESC
+                        ) AS rn
+                    FROM lead_notes
+                    WHERE lead_id = ANY(%s)
+                ) ranked
+                WHERE rn <= %s
+                ORDER BY lead_id, created_at DESC
+                """,
+                (list(lead_ids), int(per_lead))
+            )
+            rows = cur.fetchall()
+
+    notes = {}
+    for lead_id, note_text, created_at in rows:
+        notes.setdefault(lead_id, []).append({
+            "text": note_text,
+            "created_at": created_at,
+        })
+    return notes
+
+
 def update_lead_status(lead_id, status):
     allowed = {"NEW", "CONTACTED", "CLOSED"}
-
     if status not in allowed:
         raise ValueError("Invalid lead status.")
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if status == "CLOSED":
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET status = %s,
+                        follow_up_at = NULL,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (status, lead_id)
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET status = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (status, lead_id)
+                )
+        conn.commit()
+
+
+def update_lead_priority(lead_id, priority):
+    allowed = {"LOW", "NORMAL", "HIGH", "URGENT"}
+    if priority not in allowed:
+        raise ValueError("Invalid lead priority.")
 
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE leads
-                SET status = %s,
+                SET priority = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (status, lead_id)
+                (priority, lead_id)
             )
-
         conn.commit()
+
+
+def update_lead_follow_up(lead_id, follow_up_at):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET follow_up_at = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (follow_up_at, lead_id)
+            )
+        conn.commit()
+
+
+def add_lead_note(lead_id, note_text):
+    note_text = " ".join(str(note_text or "").split()).strip()
+    if not note_text:
+        raise ValueError("Note cannot be empty.")
+    note_text = note_text[:2000]
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO lead_notes (lead_id, note_text)
+                VALUES (%s, %s)
+                """,
+                (lead_id, note_text)
+            )
+            cur.execute(
+                """
+                UPDATE leads
+                SET updated_at = NOW()
+                WHERE id = %s
+                """,
+                (lead_id,)
+            )
+        conn.commit()
+
+
+def parse_admin_follow_up(value):
+    value = str(value or "").strip()
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ADMIN_TIMEZONE)
+    return parsed.astimezone(UTC_TIMEZONE)
+
+
+def _safe_admin_return_path(value=None):
+    candidate = str(value or "").strip()
+    if (
+        candidate.startswith("/admin/leads")
+        and "://" not in candidate
+        and "\\" not in candidate
+        and "\r" not in candidate
+        and "\n" not in candidate
+    ):
+        return candidate
+    return url_for("admin_leads")
 
 
 # =========================================================
@@ -3562,25 +3728,158 @@ DASHBOARD_TEMPLATE = """
 <link rel="icon" href="{{ url_for('admin_icon') }}" type="image/svg+xml">
 <title>IBROWS Lead Dashboard</title>
 <style>
-*{box-sizing:border-box} body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:env(safe-area-inset-bottom)}
-header{background:#101828;color:white;padding:16px 0;position:sticky;top:0;z-index:10;padding-top:calc(16px + env(safe-area-inset-top))}.header-inner,.container{max-width:980px;margin:auto;padding:0 16px}.header-inner{display:flex;justify-content:space-between;align-items:center;gap:12px}.header-actions{display:flex;align-items:center;gap:7px}.brand{font-size:19px;font-weight:800}.tagline{font-size:12px;color:#d0d5dd;margin-top:3px}.logout,.install{background:transparent;color:white;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:700}.install{background:white;color:#101828;border-color:white}.install[hidden]{display:none!important}
-h1{margin:24px 0 4px;font-size:26px}.description{color:#667085;margin:0 0 18px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}.stat{background:white;padding:16px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.stat-number{font-size:26px;font-weight:800}.stat-label{color:#667085;font-size:13px;margin-top:3px}
-.tools{background:white;border-radius:12px;padding:12px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.search-row{display:flex;gap:8px}.search-row input{flex:1;min-width:0;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:15px}.search-row select{min-width:160px;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:14px;background:white;color:#101828}.search-row button{border:0;background:#101828;color:white;border-radius:9px;padding:0 16px;font-weight:700}.filters{display:flex;gap:7px;overflow-x:auto;padding-top:10px}.filter{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:20px;padding:7px 11px;font-size:13px;font-weight:700}.filter.active{background:#101828;color:white;border-color:#101828}.result-note{color:#667085;font-size:13px;margin:4px 2px 12px}
-.lead{background:white;border-radius:14px;margin-bottom:14px;padding:17px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.lead-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.customer{font-size:19px;font-weight:800}.number{margin-top:4px}.number a{color:#175cd3;text-decoration:none}.status{font-weight:800;font-size:11px;padding:7px 10px;border-radius:20px;background:#eef2f6;white-space:nowrap}.service{margin-top:12px;font-weight:800}.summary,.reason{margin-top:9px;line-height:1.5}.reason{color:#667085}.meta{margin-top:12px;color:#98a2b3;font-size:12px;line-height:1.5}.quick{display:block;text-align:center;text-decoration:none;background:#157347;color:white;border-radius:9px;padding:11px 12px;margin-top:15px;font-weight:800}.privacy-link{display:block;text-align:center;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:9px;padding:10px 12px;margin-top:8px;font-weight:700;font-size:13px}.takeover{margin-top:8px}.takeover button{width:100%;border:1px solid #d0d5dd;background:#fff;border-radius:9px;padding:11px 12px;font-weight:800}.takeover .resume{background:#101828;color:#fff;border-color:#101828}.ai-state{margin-top:8px;font-size:12px;font-weight:800;color:#667085}.actions{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:8px}.actions form{margin:0}.actions button{width:100%;height:100%;border:1px solid #d0d5dd;background:white;border-radius:8px;padding:9px 6px;font-weight:700;font-size:12px}.empty{background:white;padding:28px;border-radius:12px;text-align:center;color:#667085}.clear{display:inline-block;margin-top:10px;color:#175cd3;text-decoration:none;font-weight:700}.pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:16px 0 28px}.page-link{flex:1;text-align:center;text-decoration:none;border:1px solid #d0d5dd;background:white;color:#344054;border-radius:9px;padding:10px;font-weight:700}.page-link.disabled{opacity:.45;pointer-events:none}.page-info{font-size:13px;color:#667085;white-space:nowrap}
-@media(max-width:700px){.stats{grid-template-columns:repeat(2,1fr)}.lead-top{align-items:flex-start}.container{padding:0 12px}.header-inner{padding:0 12px}.search-row{flex-wrap:wrap}.search-row input{flex-basis:100%}.search-row select{flex:1;min-width:0}.search-row button{padding:11px 12px}.actions{grid-template-columns:1fr 1fr 1fr}}
+*{box-sizing:border-box}
+body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:env(safe-area-inset-bottom)}
+header{background:#101828;color:white;padding:14px 0;position:sticky;top:0;z-index:10;padding-top:calc(14px + env(safe-area-inset-top))}
+.header-inner,.container{max-width:980px;margin:auto;padding:0 14px}
+.header-inner{display:flex;justify-content:space-between;align-items:center;gap:10px}.header-actions{display:flex;gap:7px;align-items:center}
+.brand{font-size:19px;font-weight:800}.tagline{font-size:12px;color:#d0d5dd;margin-top:3px}
+.logout,.install{background:transparent;color:white;border:1px solid #667085;border-radius:8px;padding:8px 10px;font-weight:700;font-size:12px}.install{background:#fff;color:#101828}.install[hidden]{display:none!important}
+h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:14px 0}
+.stat{display:block;text-decoration:none;color:#101828;background:white;padding:13px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+.stat-number{font-size:23px;font-weight:800}.stat-label{color:#667085;font-size:11px;margin-top:3px}
+.stat.attention{border:1px solid #f2b8a0}
+.tools{background:white;border-radius:12px;padding:11px;margin:0 0 12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+.search-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(130px,190px) minmax(110px,150px) auto;gap:7px}
+.search-row input,.search-row select{min-width:0;border:1px solid #d0d5dd;border-radius:9px;padding:10px;font-size:14px;background:#fff;color:#101828}
+.search-row button{border:0;background:#101828;color:#fff;border-radius:9px;padding:0 14px;font-weight:700}
+.filters{display:flex;gap:7px;overflow-x:auto;padding-top:9px;scrollbar-width:none}.filters::-webkit-scrollbar{display:none}
+.filter{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:18px;padding:6px 10px;font-size:12px;font-weight:700}.filter.active{background:#101828;color:white;border-color:#101828}
+.result-note{color:#667085;font-size:12px;margin:3px 2px 10px}
+.lead{background:white;border-radius:14px;margin-bottom:13px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+.lead.attention-card{border-left:4px solid #b54708}
+.lead-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.customer{font-size:18px;font-weight:800}.number{margin-top:3px}.number a{color:#175cd3;text-decoration:none}
+.badges{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.badge{font-weight:800;font-size:10px;padding:6px 8px;border-radius:18px;background:#eef2f6;white-space:nowrap}
+.badge.priority-URGENT{background:#fee4e2;color:#b42318}.badge.priority-HIGH{background:#fff3d6;color:#93370d}.badge.priority-LOW{background:#ecfdf3;color:#027a48}
+.service{margin-top:11px;font-weight:800}.summary,.reason{margin-top:8px;line-height:1.45;font-size:14px}.reason{color:#667085}
+.followup{margin-top:9px;padding:9px 10px;border-radius:9px;background:#f9fafb;font-size:13px;font-weight:700}.followup.overdue{background:#fff1f0;color:#b42318}.followup.soon{background:#fff7e6;color:#93370d}
+.notes{margin-top:9px;border-top:1px solid #eaecf0;padding-top:8px}.note{font-size:13px;line-height:1.4;margin:5px 0}.note time{color:#98a2b3;font-size:11px}
+.meta{margin-top:9px;color:#98a2b3;font-size:11px;line-height:1.5}.quick{display:block;text-align:center;text-decoration:none;background:#157347;color:white;border-radius:9px;padding:10px 12px;margin-top:13px;font-weight:800}
+.privacy-link{display:block;text-align:center;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:9px;padding:9px 12px;margin-top:7px;font-weight:700;font-size:12px}
+.ai-state{margin-top:7px;font-size:11px;font-weight:800;color:#667085}.takeover{margin-top:7px}.takeover button{width:100%;border:1px solid #d0d5dd;background:#fff;border-radius:9px;padding:10px 12px;font-weight:800}.takeover .resume{background:#101828;color:#fff}
+.actions{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:7px}.actions form{margin:0}.actions button{width:100%;border:1px solid #d0d5dd;background:white;border-radius:8px;padding:8px 5px;font-weight:700;font-size:11px}
+.manage{margin-top:8px;border:1px solid #eaecf0;border-radius:10px;padding:0 10px}.manage summary{cursor:pointer;font-weight:800;padding:10px 0;font-size:13px}.manage-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding-bottom:10px}
+.manage form{margin:0}.manage label{display:block;font-size:11px;font-weight:800;color:#667085;margin-bottom:4px}.manage select,.manage input,.manage textarea{width:100%;border:1px solid #d0d5dd;border-radius:8px;padding:9px;font-size:13px;background:white}.manage textarea{min-height:70px;resize:vertical}.manage button{width:100%;border:0;border-radius:8px;background:#101828;color:white;padding:9px;font-weight:800;margin-top:5px;font-size:12px}.manage .secondary{background:white;color:#344054;border:1px solid #d0d5dd}.note-form{grid-column:1/-1}
+.empty{background:white;padding:26px;border-radius:12px;text-align:center;color:#667085}.clear{display:inline-block;margin-top:9px;color:#175cd3;text-decoration:none;font-weight:700}
+.pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:15px 0 26px}.page-link{flex:1;text-align:center;text-decoration:none;border:1px solid #d0d5dd;background:white;color:#344054;border-radius:9px;padding:9px;font-weight:700}.page-link.disabled{opacity:.45;pointer-events:none}.page-info{font-size:12px;color:#667085;white-space:nowrap}
+@media(max-width:760px){
+ .stats{grid-template-columns:repeat(2,1fr)}.stats .stat:last-child{grid-column:1/-1}
+ .search-row{grid-template-columns:1fr 1fr}.search-row input{grid-column:1/-1}.search-row button{padding:10px}
+ .manage-grid{grid-template-columns:1fr}.note-form{grid-column:auto}
+ .container,.header-inner{padding-left:11px;padding-right:11px}
+}
 </style>
 <script src="{{ url_for('admin_pwa_js') }}" defer></script>
 </head>
 <body>
-<header><div class="header-inner"><div><div class="brand">IBROWS Lead Dashboard</div><div class="tagline">Kupanga zofanana, mosiyana</div></div><div class="header-actions"><button class="install" id="install-app" type="button" hidden>Install</button><form method="POST" action="{{ url_for('admin_logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout" type="submit">Logout</button></form></div></div></header>
+<header><div class="header-inner">
+<div><div class="brand">IBROWS Lead Dashboard</div><div class="tagline">Kupanga zofanana, mosiyana</div></div>
+<div class="header-actions"><button class="install" id="install-app" type="button" hidden>Install</button>
+<form method="POST" action="{{ url_for('admin_logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout" type="submit">Logout</button></form></div>
+</div></header>
+
 <div class="container">
-<h1>Business Leads</h1><p class="description">Qualified enquiries captured by the IBROWS AI Business Assistant.</p>
-<div class="stats"><div class="stat"><div class="stat-number">{{ counts.ALL }}</div><div class="stat-label">All Leads</div></div><div class="stat"><div class="stat-number">{{ counts.NEW }}</div><div class="stat-label">New</div></div><div class="stat"><div class="stat-number">{{ counts.CONTACTED }}</div><div class="stat-label">Contacted</div></div><div class="stat"><div class="stat-number">{{ counts.CLOSED }}</div><div class="stat-label">Closed</div></div></div>
-<div class="tools"><form class="search-row" method="GET" action="{{ url_for('admin_leads') }}"><input name="q" value="{{ search_query }}" placeholder="Search name, number, service or enquiry"><select name="service" aria-label="Service"><option value="">All services</option>{% for service in services %}<option value="{{ service }}" {% if service_filter == service %}selected{% endif %}>{{ service }}</option>{% endfor %}</select><input type="hidden" name="status" value="{{ status_filter }}"><button type="submit">Search</button></form><div class="filters">{% for item in ['ALL','NEW','CONTACTED','CLOSED'] %}<a class="filter {% if status_filter == item %}active{% endif %}" href="{{ url_for('admin_leads', status=item, q=search_query, service=service_filter) }}">{{ item.title() }}</a>{% endfor %}</div></div>
-<div class="result-note">Showing {{ first_result }}–{{ last_result }} of {{ total_filtered }} lead{% if total_filtered != 1 %}s{% endif %}{% if search_query %} matching “{{ search_query }}”{% endif %}{% if service_filter %} in {{ service_filter }}{% endif %}.</div>
-{% if leads %}{% for lead in leads %}<div class="lead"><div class="lead-top"><div><div class="customer">{{ lead.customer_name or 'WhatsApp Customer' }}</div><div class="number"><a href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">+{{ lead.customer_number }}</a></div></div><div class="status">{{ lead.status }}</div></div><div class="service">{{ lead.service or 'General Enquiry' }}</div><div class="summary">{{ lead.summary or 'No summary available.' }}</div>{% if lead.handover_reason %}<div class="reason"><strong>Human follow-up:</strong> {{ lead.handover_reason }}</div>{% endif %}<div class="meta">Created: {{ lead.created_at.strftime('%d %b %Y %H:%M') }} &nbsp;|&nbsp; Updated: {{ lead.updated_at.strftime('%d %b %Y %H:%M') }}</div><a class="quick" href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a><a class="privacy-link" href="{{ url_for('admin_customer_privacy', customer_number=lead.customer_number) }}">Customer Data & Privacy</a><div class="ai-state">AI: {% if lead.ai_paused %}PAUSED — human takeover active{% else %}ACTIVE{% endif %}</div><form class="takeover" method="POST" action="{{ url_for('admin_ai_takeover', customer_number=lead.customer_number) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="paused" value="{% if lead.ai_paused %}0{% else %}1{% endif %}"><button class="{% if lead.ai_paused %}resume{% endif %}" type="submit">{% if lead.ai_paused %}Resume AI Assistant{% else %}Pause AI — Human Takeover{% endif %}</button></form><div class="actions">{% for target,label in [('NEW','Mark New'),('CONTACTED','Contacted'),('CLOSED','Close Lead')] %}{% if lead.status != target %}<form method="POST" action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ target }}"><button type="submit">{{ label }}</button></form>{% else %}<button type="button" disabled>{{ label }}</button>{% endif %}{% endfor %}</div></div>{% endfor %}{% else %}<div class="empty">No leads match this view.<br><a class="clear" href="{{ url_for('admin_leads') }}">Clear search and filters</a></div>{% endif %}
-{% if total_pages > 1 %}<div class="pagination"><a class="page-link {% if page <= 1 %}disabled{% endif %}" href="{{ prev_url }}">Previous</a><div class="page-info">Page {{ page }} of {{ total_pages }}</div><a class="page-link {% if page >= total_pages %}disabled{% endif %}" href="{{ next_url }}">Next</a></div>{% endif %}
-</div></body></html>
+<h1>Business Leads</h1>
+<p class="description">Follow up customers, record notes and focus first on leads that need attention.</p>
+
+<div class="stats">
+<a class="stat" href="{{ url_for('admin_leads') }}"><div class="stat-number">{{ counts.ALL }}</div><div class="stat-label">All Leads</div></a>
+<a class="stat" href="{{ url_for('admin_leads', status='NEW') }}"><div class="stat-number">{{ counts.NEW }}</div><div class="stat-label">New</div></a>
+<a class="stat" href="{{ url_for('admin_leads', status='CONTACTED') }}"><div class="stat-number">{{ counts.CONTACTED }}</div><div class="stat-label">Contacted</div></a>
+<a class="stat attention" href="{{ url_for('admin_leads', attention='1') }}"><div class="stat-number">{{ attention_count }}</div><div class="stat-label">Needs Attention</div></a>
+<a class="stat" href="{{ url_for('admin_leads', status='CLOSED') }}"><div class="stat-number">{{ counts.CLOSED }}</div><div class="stat-label">Closed</div></a>
+</div>
+
+<div class="tools">
+<form class="search-row" method="GET" action="{{ url_for('admin_leads') }}">
+<input name="q" value="{{ search_query }}" placeholder="Search name, number, service, notes or enquiry">
+<select name="service"><option value="">All services</option>{% for service in services %}<option value="{{ service }}" {% if service_filter == service %}selected{% endif %}>{{ service }}</option>{% endfor %}</select>
+<select name="priority"><option value="">All priorities</option>{% for p in ['URGENT','HIGH','NORMAL','LOW'] %}<option value="{{ p }}" {% if priority_filter == p %}selected{% endif %}>{{ p.title() }}</option>{% endfor %}</select>
+<input type="hidden" name="status" value="{{ status_filter }}"><input type="hidden" name="attention" value="{{ attention_filter }}">
+<button type="submit">Search</button>
+</form>
+<div class="filters">
+{% for item in ['ALL','NEW','CONTACTED','CLOSED'] %}<a class="filter {% if status_filter == item and not attention_filter %}active{% endif %}" href="{{ url_for('admin_leads', status=item, q=search_query, service=service_filter, priority=priority_filter) }}">{{ item.title() }}</a>{% endfor %}
+<a class="filter {% if attention_filter %}active{% endif %}" href="{{ url_for('admin_leads', attention='1', q=search_query, service=service_filter, priority=priority_filter) }}">Needs Attention</a>
+</div>
+</div>
+
+<div class="result-note">Showing {{ first_result }}–{{ last_result }} of {{ total_filtered }} lead{% if total_filtered != 1 %}s{% endif %}.</div>
+
+{% if leads %}
+{% for lead in leads %}
+<div class="lead {% if lead.needs_attention %}attention-card{% endif %}">
+<div class="lead-top">
+<div><div class="customer">{{ lead.customer_name or 'WhatsApp Customer' }}</div><div class="number"><a href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">+{{ lead.customer_number }}</a></div></div>
+<div class="badges"><span class="badge">{{ lead.status }}</span><span class="badge priority-{{ lead.priority }}">{{ lead.priority }}</span></div>
+</div>
+
+<div class="service">{{ lead.service or 'General Enquiry' }}</div>
+<div class="summary">{{ lead.summary or 'No summary available.' }}</div>
+{% if lead.handover_reason %}<div class="reason"><strong>Human follow-up:</strong> {{ lead.handover_reason }}</div>{% endif %}
+
+{% if lead.follow_up_at %}
+<div class="followup {% if lead.is_overdue %}overdue{% elif lead.due_soon %}soon{% endif %}">
+{% if lead.is_overdue %}OVERDUE — {% elif lead.due_soon %}DUE SOON — {% endif %}Follow up {{ lead.follow_up_label }}
+</div>
+{% endif %}
+
+{% if lead.notes %}
+<div class="notes"><strong>Recent notes</strong>
+{% for note in lead.notes %}<div class="note">{{ note.text }} <time>{{ note.local_time }}</time></div>{% endfor %}
+</div>
+{% endif %}
+
+<div class="meta">Created: {{ lead.created_at.strftime('%d %b %Y %H:%M') }} &nbsp;|&nbsp; Updated: {{ lead.updated_at.strftime('%d %b %Y %H:%M') }}</div>
+
+<a class="quick" href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a>
+<a class="privacy-link" href="{{ url_for('admin_customer_privacy', customer_number=lead.customer_number) }}">Customer Data & Privacy</a>
+
+<div class="ai-state">AI: {% if lead.ai_paused %}PAUSED — human takeover active{% else %}ACTIVE{% endif %}</div>
+<form class="takeover" method="POST" action="{{ url_for('admin_ai_takeover', customer_number=lead.customer_number) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="paused" value="{% if lead.ai_paused %}0{% else %}1{% endif %}"><input type="hidden" name="return_to" value="{{ current_return }}">
+<button class="{% if lead.ai_paused %}resume{% endif %}" type="submit">{% if lead.ai_paused %}Resume AI Assistant{% else %}Pause AI — Human Takeover{% endif %}</button>
+</form>
+
+<div class="actions">
+{% for target,label in [('NEW','Mark New'),('CONTACTED','Contacted'),('CLOSED','Close Lead')] %}
+{% if lead.status != target %}<form method="POST" action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ target }}"><input type="hidden" name="return_to" value="{{ current_return }}"><button type="submit">{{ label }}</button></form>{% else %}<button type="button" disabled>{{ label }}</button>{% endif %}
+{% endfor %}
+</div>
+
+<details class="manage">
+<summary>Manage lead</summary>
+<div class="manage-grid">
+<form method="POST" action="{{ url_for('admin_lead_operations', lead_id=lead.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="priority"><input type="hidden" name="return_to" value="{{ current_return }}">
+<label>Priority</label><select name="priority">{% for p in ['URGENT','HIGH','NORMAL','LOW'] %}<option value="{{ p }}" {% if lead.priority == p %}selected{% endif %}>{{ p.title() }}</option>{% endfor %}</select><button type="submit">Save priority</button>
+</form>
+
+<form method="POST" action="{{ url_for('admin_lead_operations', lead_id=lead.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="followup"><input type="hidden" name="return_to" value="{{ current_return }}">
+<label>Follow-up date & time</label><input type="datetime-local" name="follow_up" value="{{ lead.follow_up_value }}"><button type="submit">Save follow-up</button>
+{% if lead.follow_up_at %}<button class="secondary" type="submit" name="clear_follow_up" value="1">Clear follow-up</button>{% endif %}
+</form>
+
+<form class="note-form" method="POST" action="{{ url_for('admin_lead_operations', lead_id=lead.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="note"><input type="hidden" name="return_to" value="{{ current_return }}">
+<label>Add internal note</label><textarea name="note" maxlength="2000" placeholder="Example: Customer asked me to call tomorrow after 2 PM."></textarea><button type="submit">Add note</button>
+</form>
+</div>
+</details>
+</div>
+{% endfor %}
+{% else %}
+<div class="empty">No leads match this view.<br><a class="clear" href="{{ url_for('admin_leads') }}">Clear search and filters</a></div>
+{% endif %}
+
+{% if total_pages > 1 %}
+<div class="pagination"><a class="page-link {% if page <= 1 %}disabled{% endif %}" href="{{ prev_url }}">Previous</a><div class="page-info">Page {{ page }} of {{ total_pages }}</div><a class="page-link {% if page >= total_pages %}disabled{% endif %}" href="{{ next_url }}">Next</a></div>
+{% endif %}
+</div>
+</body>
+</html>
 """
 
 
@@ -3591,20 +3890,69 @@ def admin_leads():
     all_leads = []
     for row in rows:
         all_leads.append({
-            "id": row[0], "customer_number": row[1], "customer_name": row[2],
-            "service": row[3], "summary": row[4], "handover_reason": row[5],
-            "status": row[6], "created_at": row[7], "updated_at": row[8]
+            "id": row[0],
+            "customer_number": row[1],
+            "customer_name": row[2],
+            "service": row[3],
+            "summary": row[4],
+            "handover_reason": row[5],
+            "status": row[6],
+            "priority": row[7] or "NORMAL",
+            "follow_up_at": row[8],
+            "created_at": row[9],
+            "updated_at": row[10],
         })
 
     paused_customers = get_paused_customers()
+    notes_map = get_recent_lead_notes([lead["id"] for lead in all_leads], per_lead=3)
+    now_utc = datetime.now(UTC_TIMEZONE)
+    soon_cutoff = now_utc + timedelta(hours=24)
+
     for lead in all_leads:
         lead["ai_paused"] = lead["customer_number"] in paused_customers
+        follow_up = lead["follow_up_at"]
+        lead["is_overdue"] = bool(follow_up and follow_up <= now_utc)
+        lead["due_soon"] = bool(
+            follow_up and now_utc < follow_up <= soon_cutoff
+        )
+        lead["needs_attention"] = bool(
+            lead["status"] != "CLOSED"
+            and (
+                lead["status"] == "NEW"
+                or lead["priority"] in {"URGENT", "HIGH"}
+                or lead["is_overdue"]
+                or lead["due_soon"]
+            )
+        )
+
+        if follow_up:
+            local_follow = follow_up.astimezone(ADMIN_TIMEZONE)
+            lead["follow_up_label"] = local_follow.strftime("%d %b %Y at %H:%M")
+            lead["follow_up_value"] = local_follow.strftime("%Y-%m-%dT%H:%M")
+        else:
+            lead["follow_up_label"] = ""
+            lead["follow_up_value"] = ""
+
+        lead_notes = notes_map.get(lead["id"], [])
+        for note in lead_notes:
+            note["local_time"] = note["created_at"].astimezone(
+                ADMIN_TIMEZONE
+            ).strftime("%d %b %H:%M")
+        lead["notes"] = lead_notes
+
+    counts = get_lead_counts()
+    attention_count = sum(1 for lead in all_leads if lead["needs_attention"])
 
     status_filter = request.args.get("status", "ALL").strip().upper()
     if status_filter not in {"ALL", "NEW", "CONTACTED", "CLOSED"}:
         status_filter = "ALL"
+
     search_query = request.args.get("q", "").strip()[:100]
     service_filter = request.args.get("service", "").strip()[:120]
+    priority_filter = request.args.get("priority", "").strip().upper()
+    if priority_filter not in {"", "LOW", "NORMAL", "HIGH", "URGENT"}:
+        priority_filter = ""
+    attention_filter = request.args.get("attention", "").strip() == "1"
 
     services = sorted({
         str(lead.get("service") or "").strip()
@@ -3613,7 +3961,11 @@ def admin_leads():
     }, key=str.casefold)
 
     leads = list(all_leads)
-    if status_filter != "ALL":
+
+    if attention_filter:
+        leads = [lead for lead in leads if lead["needs_attention"]]
+        status_filter = "ALL"
+    elif status_filter != "ALL":
         leads = [lead for lead in leads if lead["status"] == status_filter]
 
     if service_filter:
@@ -3622,13 +3974,19 @@ def admin_leads():
             if str(lead.get("service") or "").casefold() == service_filter.casefold()
         ]
 
+    if priority_filter:
+        leads = [lead for lead in leads if lead["priority"] == priority_filter]
+
     if search_query:
         needle = search_query.casefold()
         def matches(lead):
+            note_text = " ".join(note["text"] for note in lead.get("notes", []))
             searchable = " ".join(str(lead.get(field) or "") for field in (
-                "customer_name", "customer_number", "service", "summary", "handover_reason"
-            )).casefold()
-            return needle in searchable
+                "customer_name", "customer_number", "service", "summary",
+                "handover_reason", "priority"
+            ))
+            searchable += " " + note_text
+            return needle in searchable.casefold()
         leads = [lead for lead in leads if matches(lead)]
 
     per_page = 20
@@ -3644,25 +4002,35 @@ def admin_leads():
     end_index = min(start_index + per_page, total_filtered)
     paged_leads = leads[start_index:end_index]
 
-    if total_filtered:
-        first_result = start_index + 1
-        last_result = end_index
-    else:
-        first_result = 0
-        last_result = 0
+    first_result = start_index + 1 if total_filtered else 0
+    last_result = end_index if total_filtered else 0
 
-    common_args = {"status": status_filter, "q": search_query, "service": service_filter}
+    common_args = {
+        "status": status_filter,
+        "q": search_query,
+        "service": service_filter,
+        "priority": priority_filter,
+        "attention": "1" if attention_filter else "",
+    }
     prev_url = url_for("admin_leads", page=max(1, page - 1), **common_args)
     next_url = url_for("admin_leads", page=min(total_pages, page + 1), **common_args)
+
+    current_return = request.full_path
+    if current_return.endswith("?"):
+        current_return = current_return[:-1]
+    current_return = _safe_admin_return_path(current_return)
 
     return render_template_string(
         DASHBOARD_TEMPLATE,
         leads=paged_leads,
-        counts=get_lead_counts(),
+        counts=counts,
+        attention_count=attention_count,
         csrf_token=get_csrf_token(),
         status_filter=status_filter,
         search_query=search_query,
         service_filter=service_filter,
+        priority_filter=priority_filter,
+        attention_filter=attention_filter,
         services=services,
         total_filtered=total_filtered,
         page=page,
@@ -3671,6 +4039,7 @@ def admin_leads():
         last_result=last_result,
         prev_url=prev_url,
         next_url=next_url,
+        current_return=current_return,
     )
 
 
@@ -3683,8 +4052,43 @@ def admin_ai_takeover(customer_number):
     if paused not in {"0", "1"}:
         abort(400)
     set_ai_paused(customer_number, paused == "1")
-    return redirect(url_for("admin_leads"))
+    return redirect(_safe_admin_return_path(request.form.get("return_to")))
 
+
+
+@app.route("/admin/leads/<int:lead_id>/operations", methods=["POST"])
+@admin_required
+def admin_lead_operations(lead_id):
+    validate_csrf()
+    action = request.form.get("action", "").strip().lower()
+    return_to = _safe_admin_return_path(request.form.get("return_to"))
+
+    try:
+        if action == "priority":
+            priority = request.form.get("priority", "").strip().upper()
+            update_lead_priority(lead_id, priority)
+
+        elif action == "followup":
+            if request.form.get("clear_follow_up") == "1":
+                update_lead_follow_up(lead_id, None)
+            else:
+                raw_follow_up = request.form.get("follow_up", "").strip()
+                if not raw_follow_up:
+                    abort(400)
+                follow_up_at = parse_admin_follow_up(raw_follow_up)
+                update_lead_follow_up(lead_id, follow_up_at)
+
+        elif action == "note":
+            note_text = request.form.get("note", "")
+            add_lead_note(lead_id, note_text)
+
+        else:
+            abort(400)
+
+    except (ValueError, TypeError):
+        abort(400)
+
+    return redirect(return_to)
 
 
 CUSTOMER_PRIVACY_TEMPLATE = """
@@ -3742,7 +4146,7 @@ def admin_lead_status(lead_id):
         status
     )
 
-    return redirect(url_for("admin_leads"))
+    return redirect(_safe_admin_return_path(request.form.get("return_to")))
 
 
 # =========================================================
