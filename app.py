@@ -282,6 +282,26 @@ def init_database():
             """)
 
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS lead_payments (
+                    id BIGSERIAL PRIMARY KEY,
+                    lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+                    amount NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+                    currency TEXT NOT NULL,
+                    payment_method TEXT NOT NULL DEFAULT 'OTHER',
+                    reference TEXT,
+                    payment_note TEXT,
+                    request_token TEXT UNIQUE,
+                    received_at TIMESTAMPTZ DEFAULT NOW(),
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_lead_payments_lead
+                ON lead_payments(lead_id, received_at DESC)
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS lead_notes (
                     id BIGSERIAL PRIMARY KEY,
                     lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
@@ -3434,6 +3454,153 @@ def _activity_insert(cur, lead_id, activity_type, description):
 
 
 
+
+PAYMENT_METHODS = {
+    "CASH": "Cash",
+    "BANK_TRANSFER": "Bank transfer",
+    "MOBILE_MONEY": "Mobile money",
+    "CARD": "Card",
+    "OTHER": "Other",
+}
+
+
+def _crm_payment_amount(raw_value):
+    value = str(raw_value or "").replace(",", "").strip()
+    if not value:
+        return None
+    try:
+        amount = Decimal(value)
+    except (InvalidOperation, ValueError):
+        raise ValueError("Invalid payment amount.")
+    if amount <= 0 or amount > Decimal("999999999999.99"):
+        raise ValueError("Payment amount outside allowed range.")
+    return amount.quantize(Decimal("0.01"))
+
+
+def _crm_payment_method(raw_method):
+    method = str(raw_method or "OTHER").strip().upper()
+    if method not in PAYMENT_METHODS:
+        raise ValueError("Invalid payment method.")
+    return method
+
+
+def get_payment_totals_by_lead(lead_ids):
+    if not lead_ids:
+        return {}
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT lead_id, currency, COALESCE(SUM(amount), 0), MAX(received_at)
+                FROM lead_payments
+                WHERE lead_id = ANY(%s)
+                GROUP BY lead_id, currency
+                """,
+                (list(lead_ids),)
+            )
+            rows = cur.fetchall()
+
+    result = {}
+    for lead_id, currency, total, latest_at in rows:
+        result.setdefault(lead_id, {})[currency] = {
+            "total": Decimal(total),
+            "latest_at": latest_at,
+        }
+    return result
+
+
+def get_customer_payments(lead_ids, limit=100):
+    if not lead_ids:
+        return []
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    p.id, p.lead_id, p.amount, p.currency, p.payment_method,
+                    p.reference, p.payment_note, p.received_at, l.service
+                FROM lead_payments p
+                JOIN leads l ON l.id = p.lead_id
+                WHERE p.lead_id = ANY(%s)
+                ORDER BY p.received_at DESC, p.id DESC
+                LIMIT %s
+                """,
+                (list(lead_ids), int(limit))
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "lead_id": row[1],
+            "amount": Decimal(row[2]),
+            "currency": row[3],
+            "payment_method": row[4],
+            "reference": row[5] or "",
+            "payment_note": row[6] or "",
+            "received_at": row[7],
+            "service": canonicalize_service(row[8]),
+        }
+        for row in rows
+    ]
+
+
+def _lead_payment_snapshot(lead, payment_totals):
+    currency = lead.get("value_currency") or "MWK"
+    total = Decimal("0")
+    latest_at = None
+    currency_data = (payment_totals.get(lead["id"]) or {}).get(currency)
+    if currency_data:
+        total = Decimal(currency_data["total"])
+        latest_at = currency_data["latest_at"]
+
+    estimated = lead.get("estimated_value")
+    estimated = Decimal(estimated) if estimated is not None else None
+
+    balance = None
+    overpayment = Decimal("0")
+    if estimated is not None:
+        raw_balance = estimated - total
+        if raw_balance > 0:
+            balance = raw_balance
+        else:
+            balance = Decimal("0")
+            if raw_balance < 0:
+                overpayment = -raw_balance
+
+    if total <= 0:
+        status = "NOT_PAID"
+        status_label = "Not paid"
+    elif estimated is None:
+        status = "RECEIVED_UNPRICED"
+        status_label = "Payment received"
+    elif total < estimated:
+        status = "PART_PAID"
+        status_label = "Part paid"
+    else:
+        status = "PAID"
+        status_label = "Paid"
+
+    return {
+        "paid_total": total,
+        "paid_label": _format_crm_amount(total, currency) if total else "",
+        "balance": balance,
+        "balance_label": (
+            _format_crm_amount(balance, currency) if balance is not None else ""
+        ),
+        "overpayment": overpayment,
+        "overpayment_label": (
+            _format_crm_amount(overpayment, currency) if overpayment else ""
+        ),
+        "payment_status": status,
+        "payment_status_label": status_label,
+        "latest_payment_at": latest_at,
+    }
+
+
+
 def _duplicate_service_groups(leads):
     groups = {}
     for lead in leads or []:
@@ -3592,6 +3759,18 @@ def consolidate_customer_duplicate_service(customer_number, requested_service):
             )
 
             source_ids = [row[0] for row in sources]
+
+            # Preserve the payment ledger by attaching historical transactions
+            # to the surviving current lead before archiving duplicate lead rows.
+            cur.execute(
+                """
+                UPDATE lead_payments
+                SET lead_id = %s
+                WHERE lead_id = ANY(%s)
+                """,
+                (target_id, source_ids)
+            )
+
             cur.execute(
                 """
                 UPDATE leads
@@ -3750,11 +3929,31 @@ def get_customer_crm_profile(customer_number):
             "service": canonicalize_service(service),
         })
 
+    payments = get_customer_payments(lead_ids, limit=100)
+    for payment in payments:
+        method_label = PAYMENT_METHODS.get(
+            payment["payment_method"],
+            payment["payment_method"].replace("_", " ").title(),
+        )
+        description = (
+            f"Payment received: {_format_crm_amount(payment['amount'], payment['currency'])} "
+            f"via {method_label}."
+        )
+        if payment["reference"]:
+            description += f" Reference: {payment['reference']}."
+        timeline.append({
+            "kind": "PAYMENT",
+            "description": description,
+            "created_at": payment["received_at"],
+            "service": payment["service"],
+        })
+
     timeline.sort(key=lambda item: item["created_at"], reverse=True)
 
     return {
         "leads": active_leads,
         "timeline": timeline[:200],
+        "payments": payments,
         "archived_merged_count": len(archived_leads),
         "duplicate_groups": _duplicate_service_groups(active_leads),
     }
@@ -3874,6 +4073,8 @@ def get_pipeline_summary():
         "open": {},
         "sent": {},
         "accepted": {},
+        "received": {},
+        "outstanding": {},
     }
     quote_counts = {key: 0 for key in QUOTE_STATUSES}
     unpriced_open = 0
@@ -3883,20 +4084,37 @@ def get_pipeline_summary():
             cur.execute(
                 """
                 SELECT
-                    status,
-                    COALESCE(quote_status, 'NOT_STARTED'),
-                    COALESCE(value_currency, 'MWK'),
-                    estimated_value
-                FROM leads
-                WHERE merged_into_lead_id IS NULL
+                    l.id,
+                    l.status,
+                    COALESCE(l.quote_status, 'NOT_STARTED'),
+                    COALESCE(l.value_currency, 'MWK'),
+                    l.estimated_value,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN p.currency = COALESCE(l.value_currency, 'MWK')
+                            THEN p.amount ELSE 0
+                        END
+                    ), 0) AS paid_total
+                FROM leads l
+                LEFT JOIN lead_payments p ON p.lead_id = l.id
+                WHERE l.merged_into_lead_id IS NULL
+                GROUP BY
+                    l.id, l.status, l.quote_status,
+                    l.value_currency, l.estimated_value
                 """
             )
             rows = cur.fetchall()
 
-    for status, quote_status, currency, estimated_value in rows:
+    for lead_id, status, quote_status, currency, estimated_value, paid_total in rows:
         quote_status = quote_status if quote_status in QUOTE_STATUSES else "NOT_STARTED"
         quote_counts[quote_status] = quote_counts.get(quote_status, 0) + 1
         currency = currency or "MWK"
+        paid_total = Decimal(paid_total or 0)
+
+        if paid_total:
+            buckets["received"][currency] = (
+                buckets["received"].get(currency, Decimal("0")) + paid_total
+            )
 
         if status != "CLOSED" and estimated_value is None:
             unpriced_open += 1
@@ -3907,41 +4125,82 @@ def get_pipeline_summary():
         amount = Decimal(estimated_value)
 
         if status != "CLOSED" and quote_status != "DECLINED":
-            buckets["open"][currency] = buckets["open"].get(currency, Decimal("0")) + amount
+            buckets["open"][currency] = (
+                buckets["open"].get(currency, Decimal("0")) + amount
+            )
 
         if status != "CLOSED" and quote_status == "SENT":
-            buckets["sent"][currency] = buckets["sent"].get(currency, Decimal("0")) + amount
+            buckets["sent"][currency] = (
+                buckets["sent"].get(currency, Decimal("0")) + amount
+            )
 
         if quote_status == "ACCEPTED":
-            buckets["accepted"][currency] = buckets["accepted"].get(currency, Decimal("0")) + amount
+            buckets["accepted"][currency] = (
+                buckets["accepted"].get(currency, Decimal("0")) + amount
+            )
+            balance = amount - paid_total
+            if balance > 0:
+                buckets["outstanding"][currency] = (
+                    buckets["outstanding"].get(currency, Decimal("0")) + balance
+                )
 
     return {
         "open": _crm_amount_lines(buckets["open"]),
         "sent": _crm_amount_lines(buckets["sent"]),
         "accepted": _crm_amount_lines(buckets["accepted"]),
+        "received": _crm_amount_lines(buckets["received"]),
+        "outstanding": _crm_amount_lines(buckets["outstanding"]),
         "quote_counts": quote_counts,
         "unpriced_open": unpriced_open,
     }
 
 
-def summarize_customer_values(leads):
-    buckets = {"open": {}, "accepted": {}}
+def summarize_customer_values(leads, payment_totals=None):
+    payment_totals = payment_totals or {}
+    buckets = {
+        "open": {},
+        "accepted": {},
+        "received": {},
+        "outstanding": {},
+    }
+
     for lead in leads or []:
-        amount = lead.get("estimated_value")
-        if amount is None:
-            continue
         currency = lead.get("value_currency") or "MWK"
-        amount = Decimal(amount)
+        amount = lead.get("estimated_value")
+        amount = Decimal(amount) if amount is not None else None
         quote_status = lead.get("quote_status") or "NOT_STARTED"
 
+        snapshot = _lead_payment_snapshot(lead, payment_totals)
+        paid_total = snapshot["paid_total"]
+
+        if paid_total:
+            buckets["received"][currency] = (
+                buckets["received"].get(currency, Decimal("0")) + paid_total
+            )
+
+        if amount is None:
+            continue
+
         if lead.get("status") != "CLOSED" and quote_status != "DECLINED":
-            buckets["open"][currency] = buckets["open"].get(currency, Decimal("0")) + amount
+            buckets["open"][currency] = (
+                buckets["open"].get(currency, Decimal("0")) + amount
+            )
+
         if quote_status == "ACCEPTED":
-            buckets["accepted"][currency] = buckets["accepted"].get(currency, Decimal("0")) + amount
+            buckets["accepted"][currency] = (
+                buckets["accepted"].get(currency, Decimal("0")) + amount
+            )
+            balance = amount - paid_total
+            if balance > 0:
+                buckets["outstanding"][currency] = (
+                    buckets["outstanding"].get(currency, Decimal("0")) + balance
+                )
 
     return {
         "open": _crm_amount_lines(buckets["open"]),
         "accepted": _crm_amount_lines(buckets["accepted"]),
+        "received": _crm_amount_lines(buckets["received"]),
+        "outstanding": _crm_amount_lines(buckets["outstanding"]),
     }
 
 
@@ -4109,8 +4368,13 @@ def update_lead_management(
     value_currency="MWK",
     quote_status="NOT_STARTED",
     quote_reference="",
+    payment_amount=None,
+    payment_method="OTHER",
+    payment_reference="",
+    payment_note="",
+    payment_request_token="",
 ):
-    """Save operational and commercial lead management fields in one transaction."""
+    """Save lead management fields and optionally record one immutable payment."""
     allowed = {"LOW", "NORMAL", "HIGH", "URGENT"}
     priority = str(priority or "").strip().upper()
     if priority not in allowed:
@@ -4122,6 +4386,15 @@ def update_lead_management(
     quote_reference = " ".join(str(quote_reference or "").split()).strip()[:120]
     note_text = " ".join(str(note_text or "").split()).strip()[:2000]
 
+    payment_amount = _crm_payment_amount(payment_amount)
+    payment_method = _crm_payment_method(payment_method)
+    payment_reference = " ".join(str(payment_reference or "").split()).strip()[:120]
+    payment_note = " ".join(str(payment_note or "").split()).strip()[:500]
+    payment_request_token = str(payment_request_token or "").strip()[:160]
+
+    if payment_amount is not None and not payment_request_token:
+        raise ValueError("Missing payment request token.")
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -4130,6 +4403,7 @@ def update_lead_management(
                        quote_status, quote_reference
                 FROM leads
                 WHERE id = %s
+                  AND merged_into_lead_id IS NULL
                 FOR UPDATE
                 """,
                 (lead_id,)
@@ -4219,6 +4493,38 @@ def update_lead_management(
                     """,
                     (lead_id, note_text)
                 )
+
+            if payment_amount is not None:
+                cur.execute(
+                    """
+                    INSERT INTO lead_payments (
+                        lead_id, amount, currency, payment_method,
+                        reference, payment_note, request_token
+                    )
+                    VALUES (%s, %s, %s, %s, NULLIF(%s, ''), NULLIF(%s, ''), %s)
+                    ON CONFLICT (request_token) DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        lead_id,
+                        payment_amount,
+                        value_currency,
+                        payment_method,
+                        payment_reference,
+                        payment_note,
+                        payment_request_token,
+                    )
+                )
+                inserted = cur.fetchone()
+                if inserted:
+                    description = (
+                        f"Payment received: "
+                        f"{_format_crm_amount(payment_amount, value_currency)} "
+                        f"via {PAYMENT_METHODS.get(payment_method, payment_method)}."
+                    )
+                    if payment_reference:
+                        description += f" Reference: {payment_reference}."
+                    _activity_insert(cur, lead_id, "PAYMENT", description)
 
         conn.commit()
 
@@ -4821,6 +5127,8 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 <div class="pipe"><div class="pipe-title">Open estimated value</div><div class="pipe-value">{% if pipeline.open %}{% for item in pipeline.open %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="pipe-empty">No priced open leads</span>{% endif %}</div></div>
 <div class="pipe"><div class="pipe-title">Quotes sent</div><div class="pipe-value">{% if pipeline.sent %}{% for item in pipeline.sent %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="pipe-empty">None</span>{% endif %}</div></div>
 <div class="pipe"><div class="pipe-title">Accepted value</div><div class="pipe-value">{% if pipeline.accepted %}{% for item in pipeline.accepted %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="pipe-empty">None</span>{% endif %}</div></div>
+<div class="pipe"><div class="pipe-title">Payments received</div><div class="pipe-value">{% if pipeline.received %}{% for item in pipeline.received %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="pipe-empty">None</span>{% endif %}</div></div>
+<div class="pipe"><div class="pipe-title">Outstanding accepted balance</div><div class="pipe-value">{% if pipeline.outstanding %}{% for item in pipeline.outstanding %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="pipe-empty">None</span>{% endif %}</div></div>
 <div class="pipe"><div class="pipe-title">Open leads without value</div><div class="pipe-value">{{ pipeline.unpriced_open }}</div><div class="pipe-note">Currencies are kept separate; IBROWS does not apply an FX conversion.</div></div>
 </div>
 </div>
@@ -4851,11 +5159,14 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 </div>
 
 <div class="service">{{ lead.service or 'General Enquiry' }}</div>
-{% if lead.estimated_value_label or lead.quote_status != 'NOT_STARTED' %}
+{% if lead.estimated_value_label or lead.quote_status != 'NOT_STARTED' or lead.paid_label %}
 <div class="commercial">
 {% if lead.estimated_value_label %}<span>{{ lead.estimated_value_label }}</span>{% endif %}
 {% if lead.quote_status != 'NOT_STARTED' %}<span class="{% if lead.quote_status == 'ACCEPTED' %}accepted{% elif lead.quote_status == 'SENT' %}sent{% endif %}">Quote: {{ lead.quote_status_label }}</span>{% endif %}
 {% if lead.quote_reference %}<span>{{ lead.quote_reference }}</span>{% endif %}
+{% if lead.paid_label %}<span>Paid: {{ lead.paid_label }}</span>{% endif %}
+{% if lead.balance_label and lead.balance > 0 %}<span>Balance: {{ lead.balance_label }}</span>{% endif %}
+{% if lead.payment_status == 'PAID' %}<span class="accepted">Paid in full</span>{% elif lead.payment_status == 'PART_PAID' %}<span class="sent">Part paid</span>{% endif %}
 </div>
 {% endif %}
 <div class="summary">{{ lead.summary or 'No summary available.' }}</div>
@@ -4949,6 +5260,33 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 <textarea name="note" maxlength="2000" placeholder="Example: Customer approved the quotation and asked us to start Monday."></textarea>
 </div>
 
+<div class="note-form" style="border-top:1px solid #eaecf0;padding-top:10px">
+<label>Record payment received <span style="font-weight:400;color:#98a2b3">(optional · {{ lead.value_currency }})</span></label>
+<input type="number" name="payment_amount" min="0.01" step="0.01" inputmode="decimal" placeholder="e.g. 2500">
+<input type="hidden" name="payment_request_token" value="{{ lead.payment_token }}">
+</div>
+
+<div>
+<label>Payment method</label>
+<select name="payment_method">
+<option value="MOBILE_MONEY">Mobile money</option>
+<option value="BANK_TRANSFER">Bank transfer</option>
+<option value="CASH">Cash</option>
+<option value="CARD">Card</option>
+<option value="OTHER">Other</option>
+</select>
+</div>
+
+<div>
+<label>Payment reference <span style="font-weight:400;color:#98a2b3">(optional)</span></label>
+<input type="text" name="payment_reference" maxlength="120" placeholder="Transaction / receipt reference">
+</div>
+
+<div class="note-form">
+<label>Payment note <span style="font-weight:400;color:#98a2b3">(optional)</span></label>
+<textarea name="payment_note" maxlength="500" placeholder="Example: Deposit paid via Airtel Money."></textarea>
+</div>
+
 <div class="save-all">
 <button type="submit">Save all changes</button>
 </div>
@@ -4995,7 +5333,9 @@ def admin_leads():
         })
 
     paused_customers = get_paused_customers()
-    notes_map = get_recent_lead_notes([lead["id"] for lead in all_leads], per_lead=3)
+    lead_ids = [lead["id"] for lead in all_leads]
+    notes_map = get_recent_lead_notes(lead_ids, per_lead=3)
+    payment_totals = get_payment_totals_by_lead(lead_ids)
     now_utc = datetime.now(UTC_TIMEZONE)
     soon_cutoff = now_utc + timedelta(hours=24)
 
@@ -5041,6 +5381,8 @@ def admin_leads():
             lead.get("quote_status") or "NOT_STARTED",
             "Not started",
         )
+        lead.update(_lead_payment_snapshot(lead, payment_totals))
+        lead["payment_token"] = secrets.token_urlsafe(24)
 
         lead_notes = notes_map.get(lead["id"], [])
         for note in lead_notes:
@@ -5208,6 +5550,8 @@ header{background:#101828;color:#fff;padding:16px 0;position:sticky;top:0;z-inde
 <div class="customer-value-title">Customer commercial summary</div>
 {% if customer_values.open %}<div class="customer-value-row"><span>Open estimated value</span><b>{% for item in customer_values.open %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</b></div>{% endif %}
 {% if customer_values.accepted %}<div class="customer-value-row"><span>Accepted value</span><b>{% for item in customer_values.accepted %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</b></div>{% endif %}
+{% if customer_values.received %}<div class="customer-value-row"><span>Payments received</span><b>{% for item in customer_values.received %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</b></div>{% endif %}
+{% if customer_values.outstanding %}<div class="customer-value-row"><span>Outstanding accepted balance</span><b>{% for item in customer_values.outstanding %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</b></div>{% endif %}
 <div class="fx-note">Different currencies are shown separately; no exchange-rate conversion is applied.</div>
 </div>
 {% endif %}
@@ -5239,12 +5583,34 @@ header{background:#101828;color:#fff;padding:16px 0;position:sticky;top:0;z-inde
 {% for lead in leads %}
 <div style="padding:12px 0;{% if not loop.last %}border-bottom:1px solid #eaecf0{% endif %}">
 <div class="lead-head"><div class="service">{{ lead.service }}</div><div class="badges"><span class="badge">{{ lead.status }}</span><span class="badge">{{ lead.priority }}</span></div></div>
-{% if lead.estimated_value_label %}<div class="commercial">{{ lead.estimated_value_label }} · Quote: {{ lead.quote_status_label }}{% if lead.quote_reference %} · {{ lead.quote_reference }}{% endif %}</div>{% elif lead.quote_status != 'NOT_STARTED' %}<div class="commercial">Quote: {{ lead.quote_status_label }}{% if lead.quote_reference %} · {{ lead.quote_reference }}{% endif %}</div>{% endif %}
+{% if lead.estimated_value_label or lead.quote_status != 'NOT_STARTED' or lead.paid_label %}
+<div class="commercial">
+{% if lead.estimated_value_label %}{{ lead.estimated_value_label }}{% endif %}
+{% if lead.quote_status != 'NOT_STARTED' %} · Quote: {{ lead.quote_status_label }}{% endif %}
+{% if lead.quote_reference %} · {{ lead.quote_reference }}{% endif %}
+{% if lead.paid_label %}<br>Paid: {{ lead.paid_label }}{% endif %}
+{% if lead.balance is not none and lead.balance > 0 %} · Balance: {{ lead.balance_label }}{% elif lead.payment_status == 'PAID' %} · Paid in full{% endif %}
+</div>
+{% endif %}
 <div class="summary">{{ lead.summary or 'No summary available.' }}</div>
 <div class="meta">Created {{ lead.created_label }} · Updated {{ lead.updated_label }}</div>
 </div>
 {% endfor %}
 </div>
+
+{% if payments %}
+<div class="card services">
+<h2>Payment history</h2>
+{% for payment in payments %}
+<div style="padding:12px 0;{% if not loop.last %}border-bottom:1px solid #eaecf0{% endif %}">
+<div class="lead-head"><div class="service">{{ payment.amount_label }}</div><div class="badge">{{ payment.method_label }}</div></div>
+<div class="summary">{{ payment.service }}{% if payment.reference %} · Ref: {{ payment.reference }}{% endif %}</div>
+{% if payment.payment_note %}<div class="muted" style="margin-top:5px;font-size:13px">{{ payment.payment_note }}</div>{% endif %}
+<div class="meta">{{ payment.received_label }}</div>
+</div>
+{% endfor %}
+</div>
+{% endif %}
 
 <div class="card timeline">
 <h2>Activity timeline</h2>
@@ -5272,6 +5638,8 @@ def admin_customer_history(customer_number):
 
     leads = profile["leads"]
     timeline = profile["timeline"]
+    payments = profile.get("payments", [])
+    payment_totals = get_payment_totals_by_lead([lead["id"] for lead in leads])
     customer_name = next(
         (lead["customer_name"] for lead in leads if lead.get("customer_name")),
         "WhatsApp Customer",
@@ -5286,6 +5654,7 @@ def admin_customer_history(customer_number):
             lead.get("quote_status") or "NOT_STARTED",
             "Not started",
         )
+        lead.update(_lead_payment_snapshot(lead, payment_totals))
         lead["created_label"] = lead["created_at"].astimezone(
             ADMIN_TIMEZONE
         ).strftime("%d %b %Y %H:%M")
@@ -5301,10 +5670,24 @@ def admin_customer_history(customer_number):
         "NOTE": "Internal note",
         "REMINDER": "Reminder",
         "MERGE": "Duplicate consolidation",
+        "PAYMENT": "Payment",
     }
     for item in timeline:
         item["kind_label"] = kind_labels.get(item["kind"], item["kind"].replace("_", " ").title())
         item["time_label"] = item["created_at"].astimezone(
+            ADMIN_TIMEZONE
+        ).strftime("%d %b %Y %H:%M")
+
+    for payment in payments:
+        payment["amount_label"] = _format_crm_amount(
+            payment["amount"],
+            payment["currency"],
+        )
+        payment["method_label"] = PAYMENT_METHODS.get(
+            payment["payment_method"],
+            payment["payment_method"].replace("_", " ").title(),
+        )
+        payment["received_label"] = payment["received_at"].astimezone(
             ADMIN_TIMEZONE
         ).strftime("%d %b %Y %H:%M")
 
@@ -5319,7 +5702,8 @@ def admin_customer_history(customer_number):
         services_count=len({lead["service"] for lead in leads}),
         archived_merged_count=profile.get("archived_merged_count", 0),
         duplicate_groups=profile.get("duplicate_groups", []),
-        customer_values=summarize_customer_values(leads),
+        customer_values=summarize_customer_values(leads, payment_totals),
+        payments=payments,
         csrf_token=get_csrf_token(),
         return_to=return_to,
     )
@@ -5390,6 +5774,11 @@ def admin_lead_operations(lead_id):
                 value_currency=request.form.get("value_currency", "MWK"),
                 quote_status=request.form.get("quote_status", "NOT_STARTED"),
                 quote_reference=request.form.get("quote_reference", ""),
+                payment_amount=request.form.get("payment_amount", ""),
+                payment_method=request.form.get("payment_method", "OTHER"),
+                payment_reference=request.form.get("payment_reference", ""),
+                payment_note=request.form.get("payment_note", ""),
+                payment_request_token=request.form.get("payment_request_token", ""),
             )
 
         # Backward-compatible handling for an already-open older dashboard page.
