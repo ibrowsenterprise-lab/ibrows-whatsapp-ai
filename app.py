@@ -271,6 +271,17 @@ def init_database():
             """)
 
             cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS merged_into_lead_id BIGINT
+                REFERENCES leads(id) ON DELETE SET NULL
+            """)
+
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS merged_at TIMESTAMPTZ
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS lead_notes (
                     id BIGSERIAL PRIMARY KEY,
                     lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
@@ -308,6 +319,7 @@ def init_database():
                 CREATE INDEX IF NOT EXISTS idx_leads_due_reminders
                 ON leads(follow_up_at)
                 WHERE status <> 'CLOSED'
+                  AND merged_into_lead_id IS NULL
                   AND follow_up_at IS NOT NULL
                   AND follow_up_notified_at IS NULL
             """)
@@ -316,6 +328,12 @@ def init_database():
                 CREATE INDEX IF NOT EXISTS
                 idx_leads_customer
                 ON leads(customer_number, created_at DESC)
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_leads_merged_into
+                ON leads(merged_into_lead_id)
             """)
 
             # Prevent Meta webhook retries from processing the same
@@ -2932,6 +2950,7 @@ def get_latest_open_lead_service(customer_number):
                 FROM leads
                 WHERE customer_number = %s
                   AND status IN ('NEW', 'CONTACTED')
+                  AND merged_into_lead_id IS NULL
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT 1
                 """,
@@ -2962,6 +2981,7 @@ def create_or_update_lead(
                 FROM leads
                 WHERE customer_number = %s
                   AND status IN ('NEW', 'CONTACTED')
+                  AND merged_into_lead_id IS NULL
                 ORDER BY updated_at DESC, created_at DESC
                 """,
                 (customer_number,)
@@ -3210,6 +3230,7 @@ def claim_due_follow_up_reminders(limit=20):
                         follow_up_notification_error = NULL
                     WHERE id = %s
                       AND follow_up_notified_at IS NULL
+                      AND merged_into_lead_id IS NULL
                     """,
                     (row[0],)
                 )
@@ -3412,6 +3433,206 @@ def _activity_insert(cur, lead_id, activity_type, description):
     )
 
 
+
+def _duplicate_service_groups(leads):
+    groups = {}
+    for lead in leads or []:
+        if lead.get("merged_into_lead_id") is not None:
+            continue
+        service = canonicalize_service(lead.get("service"))
+        groups.setdefault(service, []).append(lead)
+
+    duplicates = []
+    for service, items in groups.items():
+        if len(items) < 2:
+            continue
+        duplicates.append({
+            "service": service,
+            "count": len(items),
+            "lead_ids": [item["id"] for item in items],
+        })
+
+    duplicates.sort(key=lambda item: (-item["count"], item["service"].casefold()))
+    return duplicates
+
+
+def consolidate_customer_duplicate_service(customer_number, requested_service):
+    """
+    Non-destructive consolidation:
+    - chooses the best current record as the primary lead;
+    - keeps every original duplicate row in PostgreSQL;
+    - marks duplicates as merged/archived so normal lead views ignore them;
+    - preserves their notes/activity in customer CRM history;
+    - fills only empty/default fields on the primary record.
+    """
+    canonical_service = canonicalize_service(requested_service)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id, customer_name, service, summary, handover_reason,
+                    status, priority, follow_up_at, follow_up_notified_at,
+                    follow_up_notification_claimed_at,
+                    follow_up_notification_error,
+                    estimated_value, value_currency, quote_status,
+                    quote_reference, created_at, updated_at
+                FROM leads
+                WHERE customer_number = %s
+                  AND merged_into_lead_id IS NULL
+                ORDER BY
+                    CASE
+                        WHEN status = 'CONTACTED' THEN 0
+                        WHEN status = 'NEW' THEN 1
+                        ELSE 2
+                    END,
+                    updated_at DESC,
+                    id DESC
+                FOR UPDATE
+                """,
+                (customer_number,)
+            )
+            rows = cur.fetchall()
+
+            matches = [
+                row for row in rows
+                if canonicalize_service(row[2]).casefold()
+                   == canonical_service.casefold()
+            ]
+
+            if len(matches) < 2:
+                return {
+                    "merged_count": 0,
+                    "target_id": matches[0][0] if matches else None,
+                    "service": canonical_service,
+                }
+
+            target = list(matches[0])
+            sources = [list(row) for row in matches[1:]]
+            target_id = target[0]
+
+            # Fill only gaps/defaults. Never overwrite established current data.
+            def first_nonempty(index):
+                for row in sources:
+                    value = row[index]
+                    if value not in (None, ""):
+                        return value
+                return None
+
+            customer_name = target[1] or first_nonempty(1)
+            summary = target[3] or first_nonempty(3)
+            handover_reason = target[4] or first_nonempty(4)
+
+            follow_up_at = target[7]
+            follow_up_notified_at = target[8]
+            follow_up_claimed_at = target[9]
+            follow_up_error = target[10]
+            if follow_up_at is None and target[5] != "CLOSED":
+                for row in sources:
+                    if row[7] is not None:
+                        follow_up_at = row[7]
+                        follow_up_notified_at = row[8]
+                        follow_up_claimed_at = row[9]
+                        follow_up_error = row[10]
+                        break
+
+            estimated_value = target[11]
+            value_currency = target[12] or "MWK"
+            if estimated_value is None:
+                for row in sources:
+                    if row[11] is not None:
+                        estimated_value = row[11]
+                        value_currency = row[12] or "MWK"
+                        break
+
+            quote_status = target[13] or "NOT_STARTED"
+            if quote_status == "NOT_STARTED":
+                for row in sources:
+                    source_status = row[13] or "NOT_STARTED"
+                    if source_status != "NOT_STARTED":
+                        quote_status = source_status
+                        break
+
+            quote_reference = target[14] or first_nonempty(14)
+
+            cur.execute(
+                """
+                UPDATE leads
+                SET customer_name = %s,
+                    service = %s,
+                    summary = %s,
+                    handover_reason = %s,
+                    follow_up_at = %s,
+                    follow_up_notified_at = %s,
+                    follow_up_notification_claimed_at = %s,
+                    follow_up_notification_error = %s,
+                    estimated_value = %s,
+                    value_currency = %s,
+                    quote_status = %s,
+                    quote_reference = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    customer_name,
+                    canonical_service,
+                    summary,
+                    handover_reason,
+                    follow_up_at,
+                    follow_up_notified_at,
+                    follow_up_claimed_at,
+                    follow_up_error,
+                    estimated_value,
+                    value_currency,
+                    quote_status,
+                    quote_reference,
+                    target_id,
+                )
+            )
+
+            source_ids = [row[0] for row in sources]
+            cur.execute(
+                """
+                UPDATE leads
+                SET merged_into_lead_id = %s,
+                    merged_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = ANY(%s)
+                  AND merged_into_lead_id IS NULL
+                """,
+                (target_id, source_ids)
+            )
+            merged_count = cur.rowcount
+
+            if merged_count:
+                ids_label = ", ".join(f"#{lead_id}" for lead_id in source_ids)
+                _activity_insert(
+                    cur,
+                    target_id,
+                    "MERGE",
+                    (
+                        f"Consolidated {merged_count} duplicate historical "
+                        f"{canonical_service} lead record(s). Original lead IDs "
+                        f"retained as merged history: {ids_label}."
+                    ),
+                )
+
+        conn.commit()
+
+    print(
+        f"LEAD DUPLICATES CONSOLIDATED: customer={customer_number} "
+        f"service={canonical_service} target={target_id} merged={merged_count}",
+        flush=True,
+    )
+    return {
+        "merged_count": merged_count,
+        "target_id": target_id,
+        "service": canonical_service,
+    }
+
+
+
 def get_customer_crm_profile(customer_number):
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -3421,7 +3642,8 @@ def get_customer_crm_profile(customer_number):
                     id, customer_number, customer_name, service, summary,
                     handover_reason, status, priority, follow_up_at,
                     follow_up_notified_at, estimated_value, value_currency,
-                    quote_status, quote_reference, created_at, updated_at
+                    quote_status, quote_reference, created_at, updated_at,
+                    merged_into_lead_id, merged_at
                 FROM leads
                 WHERE customer_number = %s
                 ORDER BY created_at DESC, id DESC
@@ -3444,7 +3666,7 @@ def get_customer_crm_profile(customer_number):
                 JOIN leads l ON l.id = a.lead_id
                 WHERE a.lead_id = ANY(%s)
                 ORDER BY a.created_at DESC, a.id DESC
-                LIMIT 100
+                LIMIT 150
                 """,
                 (lead_ids,)
             )
@@ -3458,15 +3680,15 @@ def get_customer_crm_profile(customer_number):
                 JOIN leads l ON l.id = n.lead_id
                 WHERE n.lead_id = ANY(%s)
                 ORDER BY n.created_at DESC, n.id DESC
-                LIMIT 100
+                LIMIT 150
                 """,
                 (lead_ids,)
             )
             note_rows = cur.fetchall()
 
-    leads = []
+    all_leads = []
     for row in lead_rows:
-        leads.append({
+        all_leads.append({
             "id": row[0],
             "customer_number": row[1],
             "customer_name": row[2],
@@ -3483,13 +3705,31 @@ def get_customer_crm_profile(customer_number):
             "quote_reference": row[13] or "",
             "created_at": row[14],
             "updated_at": row[15],
+            "merged_into_lead_id": row[16],
+            "merged_at": row[17],
         })
 
+    active_leads = [
+        lead for lead in all_leads
+        if lead["merged_into_lead_id"] is None
+    ]
+    archived_leads = [
+        lead for lead in all_leads
+        if lead["merged_into_lead_id"] is not None
+    ]
+
     timeline = []
-    for lead in leads:
+    for lead in all_leads:
+        if lead["merged_into_lead_id"] is None:
+            description = f"{lead['service']} lead created."
+        else:
+            description = (
+                f"Historical {lead['service']} lead #{lead['id']} retained "
+                f"after consolidation into lead #{lead['merged_into_lead_id']}."
+            )
         timeline.append({
             "kind": "LEAD_CREATED",
-            "description": f"{lead['service']} lead created.",
+            "description": description,
             "created_at": lead["created_at"],
             "service": lead["service"],
         })
@@ -3511,7 +3751,13 @@ def get_customer_crm_profile(customer_number):
         })
 
     timeline.sort(key=lambda item: item["created_at"], reverse=True)
-    return {"leads": leads, "timeline": timeline[:150]}
+
+    return {
+        "leads": active_leads,
+        "timeline": timeline[:200],
+        "archived_merged_count": len(archived_leads),
+        "duplicate_groups": _duplicate_service_groups(active_leads),
+    }
 
 
 def _format_crm_amount(amount, currency):
@@ -3548,6 +3794,7 @@ def get_all_leads():
                     created_at,
                     updated_at
                 FROM leads
+                WHERE merged_into_lead_id IS NULL
                 ORDER BY
                     CASE
                         WHEN status <> 'CLOSED'
@@ -3579,6 +3826,7 @@ def get_lead_counts():
             cur.execute("""
                 SELECT status, COUNT(*)
                 FROM leads
+                WHERE merged_into_lead_id IS NULL
                 GROUP BY status
             """)
             for status, count in cur.fetchall():
@@ -4798,6 +5046,7 @@ CUSTOMER_CRM_TEMPLATE = """
 header{background:#101828;color:#fff;padding:16px 0;position:sticky;top:0;z-index:5}.wrap{max-width:900px;margin:auto;padding:0 14px}
 .top{display:flex;justify-content:space-between;align-items:center;gap:10px}.brand{font-weight:800;font-size:19px}.back{color:#fff;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 10px;font-weight:700}
 .hero,.card{background:#fff;border-radius:14px;padding:16px;margin-top:14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+.duplicate-card{border:1px solid #f2b8a0;background:#fffaf7}.duplicate-item{padding:11px 0;border-top:1px solid #f2e4dc}.duplicate-item:first-of-type{border-top:0}.duplicate-item strong{display:block;margin-bottom:4px}.merge-form button{width:100%;margin-top:8px;border:0;border-radius:9px;padding:10px;background:#101828;color:white;font-weight:800}.safety{font-size:12px;color:#667085;line-height:1.45}.merged-note{margin-top:8px;font-size:12px;color:#667085}
 .hero h1{margin:0 0 5px;font-size:23px}.phone a{color:#175cd3;text-decoration:none}.muted{color:#667085}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.metric{background:#f9fafb;border-radius:10px;padding:10px}.metric b{display:block;font-size:19px}.metric span{font-size:11px;color:#667085}
 .lead-head{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.service{font-size:17px;font-weight:800}.badges{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.badge{font-size:10px;font-weight:800;background:#eef2f6;border-radius:16px;padding:6px 8px}.commercial{margin-top:8px;font-weight:800;font-size:13px}.summary{margin-top:8px;line-height:1.45;font-size:14px}.meta{font-size:11px;color:#98a2b3;margin-top:8px}.timeline h2,.services h2{margin:0 0 10px;font-size:19px}
 .event{position:relative;padding:0 0 15px 20px;border-left:2px solid #d0d5dd;margin-left:5px}.event:last-child{border-left-color:transparent}.dot{position:absolute;left:-6px;top:2px;width:10px;height:10px;background:#101828;border-radius:50%}.event-title{font-weight:800;font-size:13px}.event-desc{font-size:13px;line-height:1.4;margin-top:3px}.event-time{font-size:11px;color:#98a2b3;margin-top:4px}.whatsapp{display:block;text-align:center;background:#157347;color:white;text-decoration:none;border-radius:9px;padding:11px;margin-top:12px;font-weight:800}
@@ -4812,12 +5061,33 @@ header{background:#101828;color:#fff;padding:16px 0;position:sticky;top:0;z-inde
 <h1>{{ customer_name }}</h1>
 <div class="phone"><a href="https://wa.me/{{ customer_number }}" target="_blank" rel="noopener noreferrer">+{{ customer_number }}</a></div>
 <div class="metrics">
-<div class="metric"><b>{{ leads|length }}</b><span>Total leads</span></div>
+<div class="metric"><b>{{ leads|length }}</b><span>Current leads</span></div>
 <div class="metric"><b>{{ open_count }}</b><span>Open leads</span></div>
 <div class="metric"><b>{{ services_count }}</b><span>Services used</span></div>
+{% if archived_merged_count %}<div class="metric"><b>{{ archived_merged_count }}</b><span>Merged history</span></div>{% endif %}
 </div>
 <a class="whatsapp" href="https://wa.me/{{ customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a>
+{% if archived_merged_count %}<div class="merged-note">{{ archived_merged_count }} older duplicate record{% if archived_merged_count != 1 %}s{% endif %} retained safely as merged history.</div>{% endif %}
 </div>
+
+{% if duplicate_groups %}
+<div class="card duplicate-card">
+<h2 style="margin-top:0">Potential duplicate leads</h2>
+<p class="safety">These are older records for the same customer and service. Consolidation is non-destructive: the original records remain in PostgreSQL as archived history, while normal lead views show one current record.</p>
+{% for group in duplicate_groups %}
+<div class="duplicate-item">
+<strong>{{ group.service }} — {{ group.count }} current records</strong>
+<div class="safety">Lead IDs: {% for lead_id in group.lead_ids %}#{{ lead_id }}{% if not loop.last %}, {% endif %}{% endfor %}</div>
+<form class="merge-form" method="POST" action="{{ url_for('admin_merge_customer_duplicates', customer_number=customer_number) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<input type="hidden" name="service" value="{{ group.service }}">
+<input type="hidden" name="return_to" value="{{ return_to }}">
+<button type="submit">Consolidate {{ group.service }} records</button>
+</form>
+</div>
+{% endfor %}
+</div>
+{% endif %}
 
 <div class="card services">
 <h2>Service history</h2>
@@ -4885,6 +5155,7 @@ def admin_customer_history(customer_number):
         "STATUS": "Status change",
         "NOTE": "Internal note",
         "REMINDER": "Reminder",
+        "MERGE": "Duplicate consolidation",
     }
     for item in timeline:
         item["kind_label"] = kind_labels.get(item["kind"], item["kind"].replace("_", " ").title())
@@ -4901,7 +5172,34 @@ def admin_customer_history(customer_number):
         timeline=timeline,
         open_count=sum(1 for lead in leads if lead["status"] != "CLOSED"),
         services_count=len({lead["service"] for lead in leads}),
+        archived_merged_count=profile.get("archived_merged_count", 0),
+        duplicate_groups=profile.get("duplicate_groups", []),
+        csrf_token=get_csrf_token(),
         return_to=return_to,
+    )
+
+
+@app.route("/admin/customers/<customer_number>/merge-duplicates", methods=["POST"])
+@admin_required
+def admin_merge_customer_duplicates(customer_number):
+    if not customer_number.isdigit() or len(customer_number) > 20:
+        abort(400)
+
+    validate_csrf()
+    service = request.form.get("service", "").strip()
+    if not service or len(service) > 160:
+        abort(400)
+
+    return_to = _safe_admin_return_path(request.form.get("return_to"))
+    result = consolidate_customer_duplicate_service(customer_number, service)
+
+    return redirect(
+        url_for(
+            "admin_customer_history",
+            customer_number=customer_number,
+            return_to=return_to,
+            merged=result.get("merged_count", 0),
+        )
     )
 
 
