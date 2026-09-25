@@ -1,1 +1,24 @@
+name: IBROWS Follow-up Reminders
 
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-followups:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger IBROWS due follow-up reminders
+        env:
+          FOLLOWUP_CRON_SECRET: ${{ secrets.FOLLOWUP_CRON_SECRET }}
+        run: |
+          curl --fail --show-error --silent \
+            --max-time 120 \
+            --retry 2 \
+            -X POST \
+            -H "X-IBROWS-CRON-SECRET: ${FOLLOWUP_CRON_SECRET}" \
+            "https://ibrows-whatsapp-ai-1.onrender.com/tasks/followup-reminders"
