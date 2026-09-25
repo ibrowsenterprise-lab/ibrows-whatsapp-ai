@@ -991,6 +991,8 @@ and cover_letter must be exactly:
   "signoff": ""
 }
 
+For cover_letter.signoff, return only the closing phrase such as "Yours faithfully," or "Yours sincerely,". Do not include the candidate's name in signoff; the document builder inserts the candidate name exactly once.
+
 The reply for ready=true should say that draft application files have been prepared for review before submission. Do not say IBROWS submitted the application. Do not say a human reviewed the files unless the conversation explicitly confirms that.
 """
     response = client.responses.create(
@@ -1055,6 +1057,43 @@ def _remove_background_sentences(text):
     return " ".join(kept).strip()
 
 
+
+def _normalise_letter_signoff(signoff, candidate_name):
+    """Keep only the closing phrase; the document builder adds the candidate name once."""
+    raw = re.sub(r"\s+", " ", str(signoff or "")).strip()
+    name = re.sub(r"\s+", " ", str(candidate_name or "")).strip()
+
+    if name and raw:
+        # Remove one or more candidate-name copies from the end of the signoff.
+        raw = re.sub(
+            r"(?:[\s,;:\-]*" + re.escape(name) + r"\s*)+$",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        ).strip(" ,;:-")
+
+    if not raw:
+        return "Yours faithfully,"
+
+    common = (
+        ("yours faithfully", "Yours faithfully,"),
+        ("yours sincerely", "Yours sincerely,"),
+        ("sincerely", "Sincerely,"),
+        ("kind regards", "Kind regards,"),
+        ("best regards", "Best regards,"),
+        ("regards", "Regards,"),
+        ("respectfully", "Respectfully,"),
+    )
+    key = raw.lower().rstrip(" ,.;:")
+    for phrase, canonical in common:
+        if key == phrase:
+            return canonical
+
+    # Preserve an unusual but harmless closing while making it line-ready.
+    if raw[-1] not in ",.;:":
+        raw += ","
+    return raw
+
 def normalize_application_pack_for_delivery(pack):
     """Apply deterministic, truth-preserving presentation rules before QA/document creation."""
     letter = pack.get("cover_letter") or {}
@@ -1087,6 +1126,10 @@ def normalize_application_pack_for_delivery(pack):
         if paragraph:
             cleaned_paragraphs.append(paragraph)
     letter["paragraphs"] = cleaned_paragraphs
+    letter["signoff"] = _normalise_letter_signoff(
+        letter.get("signoff"),
+        pack.get("candidate_name"),
+    )
 
     pack["cv"] = cv
     pack["cover_letter"] = letter
@@ -1370,80 +1413,247 @@ def _pdf_escape(text):
     return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
-def _wrap_pdf_text(text, width=86):
-    text = str(text or "").strip()
+def _pdf_text_width_points(text, size=10, bold=False):
+    """
+    Conservative Helvetica/Helvetica-Bold width estimate in PDF points.
+    It intentionally over-estimates slightly so text does not run into the margin.
+    """
+    units = 0.0
+    for ch in str(text or ""):
+        if ch == " ":
+            units += 0.28
+        elif ch in "ilI.,'`:;!|":
+            units += 0.28
+        elif ch in "MW@#%&":
+            units += 0.86
+        elif ch.isupper():
+            units += 0.64
+        elif ch.isdigit():
+            units += 0.56
+        else:
+            units += 0.53
+    if bold:
+        units *= 1.035
+    return units * float(size)
+
+
+def _wrap_pdf_text_points(text, size=10, bold=False, max_points=492):
+    text = _pdf_normalize_text(text).strip()
     if not text:
         return [""]
-    return textwrap.wrap(text, width=width, break_long_words=False, break_on_hyphens=False) or [""]
+
+    words = text.split()
+    lines = []
+    current = ""
+
+    for word in words:
+        candidate = word if not current else current + " " + word
+        if _pdf_text_width_points(candidate, size, bold) <= max_points:
+            current = candidate
+            continue
+
+        if current:
+            lines.append(current)
+            current = ""
+
+        # A genuinely long token (URL/code-like text) is split conservatively.
+        if _pdf_text_width_points(word, size, bold) > max_points:
+            part = ""
+            for ch in word:
+                candidate_part = part + ch
+                if part and _pdf_text_width_points(candidate_part, size, bold) > max_points:
+                    lines.append(part)
+                    part = ch
+                else:
+                    part = candidate_part
+            current = part
+        else:
+            current = word
+
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def _pdf_group(kind, text, bold, size, leading, max_points=492):
+    wrapped = _wrap_pdf_text_points(text, size=size, bold=bold, max_points=max_points)
+    return {
+        "kind": kind,
+        "keep_with_next": kind in {"title", "heading", "subheading"},
+        "lines": [
+            {"text": line, "bold": bold, "size": size, "leading": leading, "kind": kind}
+            for line in wrapped
+        ],
+    }
+
+
+def _pdf_layout_groups(title, blocks):
+    groups = [_pdf_group("title", title, True, 16, 20, 492)]
+    for kind, value in blocks:
+        value = str(value or "")
+        if kind == "heading":
+            groups.append(_pdf_group("heading", value, True, 12, 17, 492))
+        elif kind == "subheading":
+            groups.append(_pdf_group("subheading", value, True, 10.5, 14, 492))
+        elif kind == "bullet":
+            groups.append(_pdf_group("bullet", "- " + value, False, 10, 13, 492))
+        elif kind == "spacer":
+            groups.append({
+                "kind": "spacer",
+                "keep_with_next": False,
+                "lines": [{"text": "", "bold": False, "size": 10, "leading": 10, "kind": "spacer"}],
+            })
+        else:
+            groups.append(_pdf_group("text", value, False, 10, 13, 492))
+    return groups
+
+
+def _pdf_group_height(group):
+    return sum(float(line["leading"]) for line in group["lines"])
+
+
+def _paginate_pdf_groups(groups, soft_limit):
+    pages = []
+    current = []
+    used = 0.0
+    hard_limit = 742.0
+
+    for index, group in enumerate(groups):
+        group_h = _pdf_group_height(group)
+        next_h = 0.0
+        if group.get("keep_with_next") and index + 1 < len(groups):
+            next_h = _pdf_group_height(groups[index + 1])
+
+        # Never strand a heading/subheading/title at the bottom of a page.
+        if current and used + group_h + next_h > soft_limit and group.get("keep_with_next"):
+            pages.append({"groups": current, "used": used})
+            current, used = [], 0.0
+
+        # Normal soft page break, but never exceed the physical hard limit.
+        if current and (used + group_h > soft_limit or used + group_h > hard_limit):
+            pages.append({"groups": current, "used": used})
+            current, used = [], 0.0
+
+        current.append(group)
+        used += group_h
+
+    if current or not pages:
+        pages.append({"groups": current, "used": used})
+    return pages
+
+
+def _balanced_pdf_pages(groups):
+    hard_limit = 742.0
+    total_height = sum(_pdf_group_height(g) for g in groups)
+    if total_height <= hard_limit:
+        return _paginate_pdf_groups(groups, hard_limit)
+
+    minimum_pages = max(2, int((total_height + hard_limit - 1) // hard_limit))
+    pages = _paginate_pdf_groups(groups, hard_limit)
+
+    # If the final page is extremely sparse, move whole logical blocks from the
+    # previous page by reducing the soft limit while preserving page count.
+    if len(pages) == minimum_pages and pages[-1]["used"] < hard_limit * 0.30:
+        best = pages
+        for ratio in (0.92, 0.86, 0.80, 0.74, 0.68):
+            candidate = _paginate_pdf_groups(groups, hard_limit * ratio)
+            if len(candidate) != minimum_pages:
+                continue
+            if candidate[-1]["used"] > best[-1]["used"]:
+                best = candidate
+            if best[-1]["used"] >= hard_limit * 0.34:
+                break
+        pages = best
+
+    return pages
+
+
+def _pdf_render_pages(title, blocks):
+    groups = _pdf_layout_groups(title, blocks)
+    group_pages = _balanced_pdf_pages(groups)
+    rendered = []
+
+    for page_data in group_pages:
+        y = 790.0
+        page_lines = []
+        for group in page_data["groups"]:
+            for line in group["lines"]:
+                page_lines.append({
+                    "text": line["text"],
+                    "bold": line["bold"],
+                    "size": line["size"],
+                    "y": y,
+                    "leading": line["leading"],
+                    "kind": line["kind"],
+                })
+                y -= float(line["leading"])
+        rendered.append({
+            "lines": page_lines,
+            "used": page_data["used"],
+        })
+    return rendered
 
 
 def build_pdf_bytes(title, blocks):
-    lines = [(title, True, 16, 20)]
-    for kind, text in blocks:
-        if kind == "heading":
-            lines.append((text, True, 12, 17))
-        elif kind == "subheading":
-            lines.append((text, True, 10.5, 14))
-        elif kind == "bullet":
-            wrapped = _wrap_pdf_text("- " + text, 88)
-            lines.extend((line, False, 10, 13) for line in wrapped)
-        elif kind == "spacer":
-            lines.append(("", False, 10, 10))
-        else:
-            wrapped = _wrap_pdf_text(text, 92)
-            lines.extend((line, False, 10, 13) for line in wrapped)
-
-    pages, page, y = [], [], 790
-    for text, bold, size, leading in lines:
-        if y - leading < 48:
-            pages.append(page)
-            page, y = [], 790
-        page.append((text, bold, size, y))
-        y -= leading
-    if page or not pages:
-        pages.append(page)
+    pages = _pdf_render_pages(title, blocks)
 
     objects = {}
     objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
     objects[3] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
     objects[4] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"
     kids = []
-    for i, page_lines in enumerate(pages):
+
+    for i, page_data in enumerate(pages):
         page_id = 5 + i * 2
         content_id = page_id + 1
         kids.append(f"{page_id} 0 R")
         stream_parts = []
-        for text, bold, size, ypos in page_lines:
-            font = "F2" if bold else "F1"
+
+        for line in page_data["lines"]:
+            font = "F2" if line["bold"] else "F1"
             stream_parts.append(
-                f"BT /{font} {size:g} Tf 50 {ypos:g} Td ({_pdf_escape(text)}) Tj ET"
+                f"BT /{font} {line['size']:g} Tf 50 {line['y']:g} Td "
+                f"({_pdf_escape(line['text'])}) Tj ET"
             )
-        stream = "\n".join(stream_parts).encode("latin-1", "replace")
-        objects[content_id] = b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"
+
+        stream = "\n".join(stream_parts).encode("latin-1", "strict")
+        objects[content_id] = (
+            b"<< /Length " + str(len(stream)).encode() +
+            b" >>\nstream\n" + stream + b"\nendstream"
+        )
         objects[page_id] = (
             f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
-            f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {content_id} 0 R >>"
+            f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> "
+            f"/Contents {content_id} 0 R >>"
         ).encode("ascii")
-    objects[2] = f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(kids)} >>".encode("ascii")
+
+    objects[2] = (
+        f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(kids)} >>"
+    ).encode("ascii")
 
     max_id = max(objects)
     out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
     offsets = [0] * (max_id + 1)
+
     for obj_id in range(1, max_id + 1):
         offsets[obj_id] = len(out)
         out.extend(f"{obj_id} 0 obj\n".encode("ascii"))
         out.extend(objects[obj_id])
         out.extend(b"\nendobj\n")
+
     xref = len(out)
     out.extend(f"xref\n0 {max_id + 1}\n".encode("ascii"))
     out.extend(b"0000000000 65535 f \n")
     for obj_id in range(1, max_id + 1):
         out.extend(f"{offsets[obj_id]:010d} 00000 n \n".encode("ascii"))
-    out.extend(f"trailer\n<< /Size {max_id + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode("ascii"))
+    out.extend(
+        f"trailer\n<< /Size {max_id + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref}\n%%EOF".encode("ascii")
+    )
     return bytes(out)
 
 
-def application_pack_documents(pack):
+def _application_pack_blocks(pack):
     name = pack["candidate_name"]
     role = pack["target_role"]
     org = pack["target_organisation"]
@@ -1456,9 +1666,11 @@ def application_pack_documents(pack):
     if role:
         cv_blocks.append(("text", f"Target role: {role}" + (f" | {org}" if org else "")))
     cv_blocks += [("heading", "PROFESSIONAL PROFILE"), ("text", cv["professional_profile"])]
+
     if cv["core_skills"]:
         cv_blocks.append(("heading", "CORE SKILLS"))
         cv_blocks.extend(("bullet", item) for item in cv["core_skills"])
+
     cv_blocks.append(("heading", "PROFESSIONAL EXPERIENCE"))
     for item in cv["experience"]:
         heading = item["role"]
@@ -1467,13 +1679,16 @@ def application_pack_documents(pack):
         cv_blocks.append(("subheading", heading))
         if item["dates"]:
             cv_blocks.append(("text", item["dates"]))
-        cv_blocks.extend(("bullet", b) for b in item["bullets"])
+        cv_blocks.extend(("bullet", bullet) for bullet in item["bullets"])
+
     if cv["education"]:
         cv_blocks.append(("heading", "EDUCATION"))
         cv_blocks.extend(("bullet", item) for item in cv["education"])
+
     if cv["certifications"]:
         cv_blocks.append(("heading", "CERTIFICATIONS / TRAINING"))
         cv_blocks.extend(("bullet", item) for item in cv["certifications"])
+
     for section in cv["additional_sections"]:
         if section["heading"] and section["items"]:
             cv_blocks.append(("heading", section["heading"].upper()))
@@ -1486,13 +1701,71 @@ def application_pack_documents(pack):
         letter_blocks.append(("text", letter["recipient"]))
     if letter["subject"]:
         letter_blocks.append(("heading", letter["subject"]))
-    letter_blocks.extend(("text", p) for p in letter["paragraphs"])
-    if letter["signoff"]:
+    letter_blocks.extend(("text", paragraph) for paragraph in letter["paragraphs"])
+
+    signoff = _normalise_letter_signoff(letter.get("signoff"), name)
+    if signoff:
         letter_blocks.append(("spacer", ""))
-        letter_blocks.append(("text", letter["signoff"]))
+        letter_blocks.append(("text", signoff))
+    if name:
+        letter_blocks.append(("text", name))
+
+    return cv_blocks, letter_blocks
+
+
+def deterministic_application_layout_issues(pack):
+    """Deterministic layout QA for the generated DOCX/PDF structure."""
+    issues = []
+    name = str(pack.get("candidate_name") or "").strip()
+    letter = pack.get("cover_letter") or {}
+
+    # The structured signoff must not carry the candidate name because the builder
+    # inserts the signature name exactly once on its own line.
+    signoff = str(letter.get("signoff") or "").strip()
+    if name and re.search(re.escape(name), signoff, re.IGNORECASE):
+        issues.append("Cover-letter signoff still contains a duplicate candidate name.")
+
+    cv_blocks, letter_blocks = _application_pack_blocks(pack)
+    docs = (
+        ("CV", name, cv_blocks),
+        ("Cover letter", f"Cover Letter — {name}", letter_blocks),
+    )
+
+    for label, title, blocks in docs:
+        pages = _pdf_render_pages(title, blocks)
+
+        for page_number, page in enumerate(pages, start=1):
+            lines = page["lines"]
+            for line in lines:
+                width = _pdf_text_width_points(
+                    line["text"], line["size"], line["bold"]
+                )
+                if width > 494:
+                    issues.append(
+                        f"{label} PDF has an over-wide line on page {page_number}."
+                    )
+                    break
+
+            # A logical heading should never be the final visible content on a page.
+            visible = [line for line in lines if str(line["text"]).strip()]
+            if visible and visible[-1]["kind"] in {"heading", "subheading", "title"}:
+                issues.append(
+                    f"{label} PDF has a heading stranded at the bottom of page {page_number}."
+                )
+
+        if len(pages) > 1 and pages[-1]["used"] < 742 * 0.24:
+            issues.append(f"{label} PDF final page is excessively sparse.")
+
+    return list(dict.fromkeys(issues))
+
+def application_pack_documents(pack):
+    name = pack["candidate_name"]
+    role = pack["target_role"]
+    cv_blocks, letter_blocks = _application_pack_blocks(pack)
 
     stem = _safe_pack_filename(name, "Candidate")
     role_stem = _safe_pack_filename(role, "Role")[:35]
+
     return [
         {
             "filename": f"{stem}_{role_stem}_Tailored_CV.docx",
@@ -1515,7 +1788,6 @@ def application_pack_documents(pack):
             "bytes": build_pdf_bytes(f"Cover Letter — {name}", letter_blocks),
         },
     ]
-
 
 def upload_whatsapp_media(file_bytes, filename, mime_type):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
@@ -1709,6 +1981,21 @@ def process_application_pack(customer_number, customer_name, customer_message):
     quality_issues = list(dict.fromkeys(
         str(item).strip() for item in quality_issues if str(item).strip()
     ))
+
+    # Separate deterministic visual/layout QA runs only after factual QA has
+    # produced a clean draft. It checks the exact same block structure used
+    # by both DOCX and PDF delivery.
+    if not quality_issues:
+        layout_issues = deterministic_application_layout_issues(pack)
+        if layout_issues:
+            quality_issues.extend(layout_issues)
+            print(
+                f"APPLICATION PACK VISUAL QA BLOCKED: {len(layout_issues)} issue(s)",
+                flush=True,
+            )
+        else:
+            print("APPLICATION PACK VISUAL QA PASSED", flush=True)
+
     if quality_issues:
         # Log only the count/category state; detailed customer facts stay in the protected dashboard.
         if audit and audit.get("requires_human"):
