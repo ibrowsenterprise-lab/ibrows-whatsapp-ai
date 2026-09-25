@@ -29,6 +29,7 @@ from flask import (
     url_for,
     render_template_string,
     abort,
+    Response,
 )
 from openai import OpenAI
 
@@ -3190,8 +3191,9 @@ def add_security_headers(response):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; worker-src 'self'; manifest-src 'self'; "
+        "form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
     )
     if request.path.startswith("/admin"):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private, max-age=0"
@@ -3234,7 +3236,14 @@ LOGIN_TEMPLATE = """
 <meta name="viewport"
       content="width=device-width, initial-scale=1">
 
+<meta name="theme-color" content="#101828">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="IBROWS">
+<link rel="manifest" href="{{ url_for('admin_manifest') }}">
+<link rel="icon" href="{{ url_for('admin_icon') }}" type="image/svg+xml">
 <title>IBROWS Admin Login</title>
+<script src="{{ url_for('admin_pwa_js') }}" defer></script>
 
 <style>
 * {
@@ -3441,6 +3450,100 @@ def admin_logout():
 
 
 # =========================================================
+# ADMIN MOBILE APP / PWA
+# =========================================================
+
+@app.route("/admin/manifest.webmanifest", methods=["GET"])
+def admin_manifest():
+    manifest = {
+        "id": "/admin/",
+        "name": "IBROWS Admin",
+        "short_name": "IBROWS",
+        "description": "IBROWS Enterprise lead and customer administration.",
+        "start_url": "/admin/leads?source=pwa",
+        "scope": "/admin/",
+        "display": "standalone",
+        "background_color": "#f5f7fa",
+        "theme_color": "#101828",
+        "orientation": "portrait-primary",
+        "icons": [{
+            "src": "/admin/icon.svg",
+            "sizes": "any",
+            "type": "image/svg+xml",
+            "purpose": "any maskable"
+        }]
+    }
+    return Response(
+        json.dumps(manifest, separators=(",", ":")),
+        mimetype="application/manifest+json",
+    )
+
+
+@app.route("/admin/icon.svg", methods=["GET"])
+def admin_icon():
+    svg = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<rect width="512" height="512" rx="112" fill="#101828"/>
+<rect x="112" y="104" width="62" height="304" rx="18" fill="#ffffff"/>
+<path d="M220 104h110c72 0 116 34 116 89 0 39-23 67-61 81 49 13 77 46 77 93 0 66-50 107-132 107H220V104zm60 57v88h46c37 0 59-15 59-44 0-29-22-44-59-44h-46zm0 143v113h53c43 0 67-20 67-57s-24-56-67-56h-53z" fill="#ffffff"/>
+</svg>'''
+    return Response(svg, mimetype="image/svg+xml")
+
+
+@app.route("/admin/sw.js", methods=["GET"])
+def admin_service_worker():
+    # Privacy-first: never cache authenticated lead/customer pages or documents.
+    javascript = r'''self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));
+self.addEventListener("fetch", event => {
+  const url = new URL(event.request.url);
+  if (url.origin === self.location.origin && url.pathname.startsWith("/admin/")) {
+    event.respondWith(fetch(event.request, {cache: "no-store"}));
+  }
+});'''
+    response = Response(javascript, mimetype="application/javascript")
+    response.headers["Service-Worker-Allowed"] = "/admin/"
+    return response
+
+
+@app.route("/admin/pwa.js", methods=["GET"])
+def admin_pwa_js():
+    javascript = r'''(() => {
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/admin/sw.js", {scope: "/admin/"}).catch(() => {});
+    });
+  }
+
+  let deferredPrompt = null;
+  const button = document.getElementById("install-app");
+  const standalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+  if (button && standalone) button.hidden = true;
+
+  window.addEventListener("beforeinstallprompt", event => {
+    event.preventDefault();
+    deferredPrompt = event;
+    if (button && !standalone) button.hidden = false;
+  });
+
+  if (button) {
+    button.addEventListener("click", async () => {
+      if (!deferredPrompt) return;
+      deferredPrompt.prompt();
+      try { await deferredPrompt.userChoice; } catch (_) {}
+      deferredPrompt = null;
+      button.hidden = true;
+    });
+  }
+
+  window.addEventListener("appinstalled", () => {
+    deferredPrompt = null;
+    if (button) button.hidden = true;
+  });
+})();'''
+    return Response(javascript, mimetype="application/javascript")
+
+
+# =========================================================
 # ADMIN LEAD DASHBOARD
 # =========================================================
 
@@ -3449,25 +3552,34 @@ DASHBOARD_TEMPLATE = """
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101828">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="IBROWS">
+<link rel="manifest" href="{{ url_for('admin_manifest') }}">
+<link rel="icon" href="{{ url_for('admin_icon') }}" type="image/svg+xml">
 <title>IBROWS Lead Dashboard</title>
 <style>
-*{box-sizing:border-box} body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif}
-header{background:#101828;color:white;padding:16px 0;position:sticky;top:0;z-index:10}.header-inner,.container{max-width:980px;margin:auto;padding:0 16px}.header-inner{display:flex;justify-content:space-between;align-items:center;gap:12px}.brand{font-size:19px;font-weight:800}.tagline{font-size:12px;color:#d0d5dd;margin-top:3px}.logout{background:transparent;color:white;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:700}
+*{box-sizing:border-box} body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:env(safe-area-inset-bottom)}
+header{background:#101828;color:white;padding:16px 0;position:sticky;top:0;z-index:10;padding-top:calc(16px + env(safe-area-inset-top))}.header-inner,.container{max-width:980px;margin:auto;padding:0 16px}.header-inner{display:flex;justify-content:space-between;align-items:center;gap:12px}.header-actions{display:flex;align-items:center;gap:7px}.brand{font-size:19px;font-weight:800}.tagline{font-size:12px;color:#d0d5dd;margin-top:3px}.logout,.install{background:transparent;color:white;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:700}.install{background:white;color:#101828;border-color:white}.install[hidden]{display:none!important}
 h1{margin:24px 0 4px;font-size:26px}.description{color:#667085;margin:0 0 18px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}.stat{background:white;padding:16px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.stat-number{font-size:26px;font-weight:800}.stat-label{color:#667085;font-size:13px;margin-top:3px}
-.tools{background:white;border-radius:12px;padding:12px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.search-row{display:flex;gap:8px}.search-row input{flex:1;min-width:0;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:15px}.search-row button{border:0;background:#101828;color:white;border-radius:9px;padding:0 16px;font-weight:700}.filters{display:flex;gap:7px;overflow-x:auto;padding-top:10px}.filter{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:20px;padding:7px 11px;font-size:13px;font-weight:700}.filter.active{background:#101828;color:white;border-color:#101828}.result-note{color:#667085;font-size:13px;margin:4px 2px 12px}
-.lead{background:white;border-radius:14px;margin-bottom:14px;padding:17px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.lead-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.customer{font-size:19px;font-weight:800}.number{margin-top:4px}.number a{color:#175cd3;text-decoration:none}.status{font-weight:800;font-size:11px;padding:7px 10px;border-radius:20px;background:#eef2f6;white-space:nowrap}.service{margin-top:12px;font-weight:800}.summary,.reason{margin-top:9px;line-height:1.5}.reason{color:#667085}.meta{margin-top:12px;color:#98a2b3;font-size:12px;line-height:1.5}.quick{display:block;text-align:center;text-decoration:none;background:#157347;color:white;border-radius:9px;padding:11px 12px;margin-top:15px;font-weight:800}.privacy-link{display:block;text-align:center;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:9px;padding:10px 12px;margin-top:8px;font-weight:700;font-size:13px}.takeover{margin-top:8px}.takeover button{width:100%;border:1px solid #d0d5dd;background:#fff;border-radius:9px;padding:11px 12px;font-weight:800}.takeover .resume{background:#101828;color:#fff;border-color:#101828}.ai-state{margin-top:8px;font-size:12px;font-weight:800;color:#667085}.actions{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:8px}.actions form{margin:0}.actions button{width:100%;height:100%;border:1px solid #d0d5dd;background:white;border-radius:8px;padding:9px 6px;font-weight:700;font-size:12px}.empty{background:white;padding:28px;border-radius:12px;text-align:center;color:#667085}.clear{display:inline-block;margin-top:10px;color:#175cd3;text-decoration:none;font-weight:700}
-@media(max-width:700px){.stats{grid-template-columns:repeat(2,1fr)}.lead-top{align-items:flex-start}.container{padding:0 12px}.header-inner{padding:0 12px}.search-row button{padding:0 12px}.actions{grid-template-columns:1fr 1fr 1fr}}
+.tools{background:white;border-radius:12px;padding:12px;margin:0 0 14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.search-row{display:flex;gap:8px}.search-row input{flex:1;min-width:0;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:15px}.search-row select{min-width:160px;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:14px;background:white;color:#101828}.search-row button{border:0;background:#101828;color:white;border-radius:9px;padding:0 16px;font-weight:700}.filters{display:flex;gap:7px;overflow-x:auto;padding-top:10px}.filter{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:20px;padding:7px 11px;font-size:13px;font-weight:700}.filter.active{background:#101828;color:white;border-color:#101828}.result-note{color:#667085;font-size:13px;margin:4px 2px 12px}
+.lead{background:white;border-radius:14px;margin-bottom:14px;padding:17px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.lead-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.customer{font-size:19px;font-weight:800}.number{margin-top:4px}.number a{color:#175cd3;text-decoration:none}.status{font-weight:800;font-size:11px;padding:7px 10px;border-radius:20px;background:#eef2f6;white-space:nowrap}.service{margin-top:12px;font-weight:800}.summary,.reason{margin-top:9px;line-height:1.5}.reason{color:#667085}.meta{margin-top:12px;color:#98a2b3;font-size:12px;line-height:1.5}.quick{display:block;text-align:center;text-decoration:none;background:#157347;color:white;border-radius:9px;padding:11px 12px;margin-top:15px;font-weight:800}.privacy-link{display:block;text-align:center;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:9px;padding:10px 12px;margin-top:8px;font-weight:700;font-size:13px}.takeover{margin-top:8px}.takeover button{width:100%;border:1px solid #d0d5dd;background:#fff;border-radius:9px;padding:11px 12px;font-weight:800}.takeover .resume{background:#101828;color:#fff;border-color:#101828}.ai-state{margin-top:8px;font-size:12px;font-weight:800;color:#667085}.actions{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:8px}.actions form{margin:0}.actions button{width:100%;height:100%;border:1px solid #d0d5dd;background:white;border-radius:8px;padding:9px 6px;font-weight:700;font-size:12px}.empty{background:white;padding:28px;border-radius:12px;text-align:center;color:#667085}.clear{display:inline-block;margin-top:10px;color:#175cd3;text-decoration:none;font-weight:700}.pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:16px 0 28px}.page-link{flex:1;text-align:center;text-decoration:none;border:1px solid #d0d5dd;background:white;color:#344054;border-radius:9px;padding:10px;font-weight:700}.page-link.disabled{opacity:.45;pointer-events:none}.page-info{font-size:13px;color:#667085;white-space:nowrap}
+@media(max-width:700px){.stats{grid-template-columns:repeat(2,1fr)}.lead-top{align-items:flex-start}.container{padding:0 12px}.header-inner{padding:0 12px}.search-row{flex-wrap:wrap}.search-row input{flex-basis:100%}.search-row select{flex:1;min-width:0}.search-row button{padding:11px 12px}.actions{grid-template-columns:1fr 1fr 1fr}}
 </style>
+<script src="{{ url_for('admin_pwa_js') }}" defer></script>
 </head>
 <body>
-<header><div class="header-inner"><div><div class="brand">IBROWS Lead Dashboard</div><div class="tagline">Kupanga zofanana, mosiyana</div></div><form method="POST" action="{{ url_for('admin_logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout" type="submit">Logout</button></form></div></header>
+<header><div class="header-inner"><div><div class="brand">IBROWS Lead Dashboard</div><div class="tagline">Kupanga zofanana, mosiyana</div></div><div class="header-actions"><button class="install" id="install-app" type="button" hidden>Install</button><form method="POST" action="{{ url_for('admin_logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout" type="submit">Logout</button></form></div></div></header>
 <div class="container">
 <h1>Business Leads</h1><p class="description">Qualified enquiries captured by the IBROWS AI Business Assistant.</p>
 <div class="stats"><div class="stat"><div class="stat-number">{{ counts.ALL }}</div><div class="stat-label">All Leads</div></div><div class="stat"><div class="stat-number">{{ counts.NEW }}</div><div class="stat-label">New</div></div><div class="stat"><div class="stat-number">{{ counts.CONTACTED }}</div><div class="stat-label">Contacted</div></div><div class="stat"><div class="stat-number">{{ counts.CLOSED }}</div><div class="stat-label">Closed</div></div></div>
-<div class="tools"><form class="search-row" method="GET" action="{{ url_for('admin_leads') }}"><input name="q" value="{{ search_query }}" placeholder="Search name, number, service or enquiry"><input type="hidden" name="status" value="{{ status_filter }}"><button type="submit">Search</button></form><div class="filters">{% for item in ['ALL','NEW','CONTACTED','CLOSED'] %}<a class="filter {% if status_filter == item %}active{% endif %}" href="{{ url_for('admin_leads', status=item, q=search_query) }}">{{ item.title() }}</a>{% endfor %}</div></div>
-<div class="result-note">Showing {{ leads|length }} lead{% if leads|length != 1 %}s{% endif %}{% if search_query %} matching “{{ search_query }}”{% endif %}.</div>
+<div class="tools"><form class="search-row" method="GET" action="{{ url_for('admin_leads') }}"><input name="q" value="{{ search_query }}" placeholder="Search name, number, service or enquiry"><select name="service" aria-label="Service"><option value="">All services</option>{% for service in services %}<option value="{{ service }}" {% if service_filter == service %}selected{% endif %}>{{ service }}</option>{% endfor %}</select><input type="hidden" name="status" value="{{ status_filter }}"><button type="submit">Search</button></form><div class="filters">{% for item in ['ALL','NEW','CONTACTED','CLOSED'] %}<a class="filter {% if status_filter == item %}active{% endif %}" href="{{ url_for('admin_leads', status=item, q=search_query, service=service_filter) }}">{{ item.title() }}</a>{% endfor %}</div></div>
+<div class="result-note">Showing {{ first_result }}–{{ last_result }} of {{ total_filtered }} lead{% if total_filtered != 1 %}s{% endif %}{% if search_query %} matching “{{ search_query }}”{% endif %}{% if service_filter %} in {{ service_filter }}{% endif %}.</div>
 {% if leads %}{% for lead in leads %}<div class="lead"><div class="lead-top"><div><div class="customer">{{ lead.customer_name or 'WhatsApp Customer' }}</div><div class="number"><a href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">+{{ lead.customer_number }}</a></div></div><div class="status">{{ lead.status }}</div></div><div class="service">{{ lead.service or 'General Enquiry' }}</div><div class="summary">{{ lead.summary or 'No summary available.' }}</div>{% if lead.handover_reason %}<div class="reason"><strong>Human follow-up:</strong> {{ lead.handover_reason }}</div>{% endif %}<div class="meta">Created: {{ lead.created_at.strftime('%d %b %Y %H:%M') }} &nbsp;|&nbsp; Updated: {{ lead.updated_at.strftime('%d %b %Y %H:%M') }}</div><a class="quick" href="https://wa.me/{{ lead.customer_number }}" target="_blank" rel="noopener noreferrer">Open WhatsApp Customer</a><a class="privacy-link" href="{{ url_for('admin_customer_privacy', customer_number=lead.customer_number) }}">Customer Data & Privacy</a><div class="ai-state">AI: {% if lead.ai_paused %}PAUSED — human takeover active{% else %}ACTIVE{% endif %}</div><form class="takeover" method="POST" action="{{ url_for('admin_ai_takeover', customer_number=lead.customer_number) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="paused" value="{% if lead.ai_paused %}0{% else %}1{% endif %}"><button class="{% if lead.ai_paused %}resume{% endif %}" type="submit">{% if lead.ai_paused %}Resume AI Assistant{% else %}Pause AI — Human Takeover{% endif %}</button></form><div class="actions">{% for target,label in [('NEW','Mark New'),('CONTACTED','Contacted'),('CLOSED','Close Lead')] %}{% if lead.status != target %}<form method="POST" action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ target }}"><button type="submit">{{ label }}</button></form>{% else %}<button type="button" disabled>{{ label }}</button>{% endif %}{% endfor %}</div></div>{% endfor %}{% else %}<div class="empty">No leads match this view.<br><a class="clear" href="{{ url_for('admin_leads') }}">Clear search and filters</a></div>{% endif %}
+{% if total_pages > 1 %}<div class="pagination"><a class="page-link {% if page <= 1 %}disabled{% endif %}" href="{{ prev_url }}">Previous</a><div class="page-info">Page {{ page }} of {{ total_pages }}</div><a class="page-link {% if page >= total_pages %}disabled{% endif %}" href="{{ next_url }}">Next</a></div>{% endif %}
 </div></body></html>
 """
 
@@ -3476,25 +3588,39 @@ h1{margin:24px 0 4px;font-size:26px}.description{color:#667085;margin:0 0 18px}.
 @admin_required
 def admin_leads():
     rows = get_all_leads()
-    leads = []
+    all_leads = []
     for row in rows:
-        leads.append({
+        all_leads.append({
             "id": row[0], "customer_number": row[1], "customer_name": row[2],
             "service": row[3], "summary": row[4], "handover_reason": row[5],
             "status": row[6], "created_at": row[7], "updated_at": row[8]
         })
 
     paused_customers = get_paused_customers()
-    for lead in leads:
+    for lead in all_leads:
         lead["ai_paused"] = lead["customer_number"] in paused_customers
 
     status_filter = request.args.get("status", "ALL").strip().upper()
     if status_filter not in {"ALL", "NEW", "CONTACTED", "CLOSED"}:
         status_filter = "ALL"
     search_query = request.args.get("q", "").strip()[:100]
+    service_filter = request.args.get("service", "").strip()[:120]
 
+    services = sorted({
+        str(lead.get("service") or "").strip()
+        for lead in all_leads
+        if str(lead.get("service") or "").strip()
+    }, key=str.casefold)
+
+    leads = list(all_leads)
     if status_filter != "ALL":
         leads = [lead for lead in leads if lead["status"] == status_filter]
+
+    if service_filter:
+        leads = [
+            lead for lead in leads
+            if str(lead.get("service") or "").casefold() == service_filter.casefold()
+        ]
 
     if search_query:
         needle = search_query.casefold()
@@ -3505,13 +3631,46 @@ def admin_leads():
             return needle in searchable
         leads = [lead for lead in leads if matches(lead)]
 
+    per_page = 20
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except (TypeError, ValueError):
+        page = 1
+
+    total_filtered = len(leads)
+    total_pages = max(1, (total_filtered + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    start_index = (page - 1) * per_page
+    end_index = min(start_index + per_page, total_filtered)
+    paged_leads = leads[start_index:end_index]
+
+    if total_filtered:
+        first_result = start_index + 1
+        last_result = end_index
+    else:
+        first_result = 0
+        last_result = 0
+
+    common_args = {"status": status_filter, "q": search_query, "service": service_filter}
+    prev_url = url_for("admin_leads", page=max(1, page - 1), **common_args)
+    next_url = url_for("admin_leads", page=min(total_pages, page + 1), **common_args)
+
     return render_template_string(
         DASHBOARD_TEMPLATE,
-        leads=leads,
+        leads=paged_leads,
         counts=get_lead_counts(),
         csrf_token=get_csrf_token(),
         status_filter=status_filter,
-        search_query=search_query
+        search_query=search_query,
+        service_filter=service_filter,
+        services=services,
+        total_filtered=total_filtered,
+        page=page,
+        total_pages=total_pages,
+        first_result=first_result,
+        last_result=last_result,
+        prev_url=prev_url,
+        next_url=next_url,
     )
 
 
