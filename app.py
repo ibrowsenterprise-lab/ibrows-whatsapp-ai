@@ -1,4 +1,5 @@
 import os
+import hmac
 import re
 import json
 import base64
@@ -54,6 +55,7 @@ BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
 NOTIFICATION_EMAIL = os.environ.get("NOTIFICATION_EMAIL") or "ibrowsenterprise@gmail.com"
 BREVO_SENDER_EMAIL = os.environ.get("BREVO_SENDER_EMAIL") or "ibrowsenterprise@gmail.com"
 BREVO_SENDER_NAME = os.environ.get("BREVO_SENDER_NAME") or "IBROWS Enterprise"
+FOLLOWUP_CRON_SECRET = os.environ.get("FOLLOWUP_CRON_SECRET")
 LEAD_DASHBOARD_URL = "https://ibrows-whatsapp-ai-1.onrender.com/admin/leads"
 ADMIN_TIMEZONE = ZoneInfo("Africa/Blantyre")
 UTC_TIMEZONE = ZoneInfo("UTC")
@@ -233,6 +235,21 @@ def init_database():
             """)
 
             cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS follow_up_notified_at TIMESTAMPTZ
+            """)
+
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS follow_up_notification_claimed_at TIMESTAMPTZ
+            """)
+
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS follow_up_notification_error TEXT
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS lead_notes (
                     id BIGSERIAL PRIMARY KEY,
                     lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
@@ -249,6 +266,14 @@ def init_database():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_leads_follow_up
                 ON leads(follow_up_at)
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_leads_due_reminders
+                ON leads(follow_up_at)
+                WHERE status <> 'CLOSED'
+                  AND follow_up_at IS NOT NULL
+                  AND follow_up_notified_at IS NULL
             """)
 
             cur.execute("""
@@ -3090,6 +3115,196 @@ Kupanga zofanana, mosiyana
         return False
 
 
+
+def claim_due_follow_up_reminders(limit=20):
+    """
+    Atomically claim due follow-ups. Stale claims older than 15 minutes are
+    recoverable so a crashed worker cannot permanently suppress a reminder.
+    """
+    limit = max(1, min(int(limit), 50))
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    customer_number,
+                    customer_name,
+                    service,
+                    summary,
+                    priority,
+                    follow_up_at
+                FROM leads
+                WHERE status <> 'CLOSED'
+                  AND follow_up_at IS NOT NULL
+                  AND follow_up_at <= NOW()
+                  AND follow_up_notified_at IS NULL
+                  AND (
+                        follow_up_notification_claimed_at IS NULL
+                        OR follow_up_notification_claimed_at
+                           < NOW() - INTERVAL '15 minutes'
+                  )
+                ORDER BY follow_up_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+                """,
+                (limit,)
+            )
+            rows = cur.fetchall()
+
+            for row in rows:
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET follow_up_notification_claimed_at = NOW(),
+                        follow_up_notification_error = NULL
+                    WHERE id = %s
+                      AND follow_up_notified_at IS NULL
+                    """,
+                    (row[0],)
+                )
+        conn.commit()
+
+    return [
+        {
+            "id": row[0],
+            "customer_number": row[1],
+            "customer_name": row[2],
+            "service": canonicalize_service(row[3]),
+            "summary": row[4],
+            "priority": row[5] or "NORMAL",
+            "follow_up_at": row[6],
+        }
+        for row in rows
+    ]
+
+
+def finish_follow_up_reminder(lead_id, success, error=None):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if success:
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET follow_up_notified_at = NOW(),
+                        follow_up_notification_claimed_at = NULL,
+                        follow_up_notification_error = NULL
+                    WHERE id = %s
+                    """,
+                    (lead_id,)
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET follow_up_notification_claimed_at = NULL,
+                        follow_up_notification_error = %s
+                    WHERE id = %s
+                    """,
+                    (str(error or "Unknown reminder error")[:500], lead_id)
+                )
+        conn.commit()
+
+
+def send_follow_up_reminder_email(lead):
+    if not BREVO_API_KEY or not NOTIFICATION_EMAIL or not BREVO_SENDER_EMAIL:
+        return False, "Brevo configuration incomplete"
+
+    follow_up_local = lead["follow_up_at"].astimezone(ADMIN_TIMEZONE)
+    display_name = lead.get("customer_name") or "WhatsApp Customer"
+    customer_number = lead.get("customer_number") or ""
+    service = lead.get("service") or "General Enquiry"
+    priority = lead.get("priority") or "NORMAL"
+    summary = lead.get("summary") or "No summary available."
+
+    subject = f"IBROWS Follow-up Due: {display_name} — {service}"
+    body = f"""IBROWS customer follow-up is now due.
+
+Lead ID: {lead['id']}
+Customer: {display_name}
+WhatsApp: +{customer_number}
+Service: {service}
+Priority: {priority}
+Scheduled follow-up: {follow_up_local.strftime('%d %B %Y at %H:%M')} Malawi time
+
+Lead summary:
+{summary}
+
+Open WhatsApp:
+https://wa.me/{customer_number}
+
+Lead dashboard:
+{LEAD_DASHBOARD_URL}
+
+IBROWS Enterprise
+Kupanga zofanana, mosiyana
+"""
+
+    payload = {
+        "sender": {
+            "name": BREVO_SENDER_NAME,
+            "email": BREVO_SENDER_EMAIL,
+        },
+        "to": [{"email": NOTIFICATION_EMAIL}],
+        "subject": subject,
+        "textContent": body,
+    }
+
+    try:
+        response = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "accept": "application/json",
+                "api-key": BREVO_API_KEY,
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=10,
+        )
+        if 200 <= response.status_code < 300:
+            print(f"FOLLOW-UP REMINDER EMAIL SENT: {lead['id']}", flush=True)
+            return True, None
+
+        error = f"Brevo HTTP {response.status_code}"
+        print(
+            f"FOLLOW-UP REMINDER EMAIL FAILED: {lead['id']} — {error}",
+            flush=True,
+        )
+        return False, error
+    except Exception as error:
+        label = f"{type(error).__name__}: {str(error)[:180]}"
+        print(
+            f"FOLLOW-UP REMINDER EMAIL FAILED: {lead['id']} — {label}",
+            flush=True,
+        )
+        return False, label
+
+
+def process_due_follow_up_reminders(limit=20):
+    claimed = claim_due_follow_up_reminders(limit=limit)
+    sent = 0
+    failed = 0
+
+    for lead in claimed:
+        success, error = send_follow_up_reminder_email(lead)
+        finish_follow_up_reminder(lead["id"], success, error)
+        if success:
+            sent += 1
+        else:
+            failed += 1
+
+    print(
+        f"FOLLOW-UP REMINDER CHECK: due={len(claimed)} sent={sent} failed={failed}",
+        flush=True,
+    )
+    return {
+        "claimed": len(claimed),
+        "sent": sent,
+        "failed": failed,
+    }
+
+
+
 def get_all_leads():
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -3104,6 +3319,7 @@ def get_all_leads():
                     status,
                     priority,
                     follow_up_at,
+                    follow_up_notified_at,
                     created_at,
                     updated_at
                 FROM leads
@@ -3198,6 +3414,9 @@ def update_lead_status(lead_id, status):
                     UPDATE leads
                     SET status = %s,
                         follow_up_at = NULL,
+                        follow_up_notified_at = NULL,
+                        follow_up_notification_claimed_at = NULL,
+                        follow_up_notification_error = NULL,
                         updated_at = NOW()
                     WHERE id = %s
                     """,
@@ -3241,11 +3460,20 @@ def update_lead_follow_up(lead_id, follow_up_at):
             cur.execute(
                 """
                 UPDATE leads
-                SET follow_up_at = %s,
+                SET follow_up_notified_at =
+                        CASE WHEN follow_up_at IS DISTINCT FROM %s
+                             THEN NULL ELSE follow_up_notified_at END,
+                    follow_up_notification_claimed_at =
+                        CASE WHEN follow_up_at IS DISTINCT FROM %s
+                             THEN NULL ELSE follow_up_notification_claimed_at END,
+                    follow_up_notification_error =
+                        CASE WHEN follow_up_at IS DISTINCT FROM %s
+                             THEN NULL ELSE follow_up_notification_error END,
+                    follow_up_at = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (follow_up_at, lead_id)
+                (follow_up_at, follow_up_at, follow_up_at, follow_up_at, lead_id)
             )
         conn.commit()
 
@@ -3293,11 +3521,27 @@ def update_lead_management(lead_id, priority, follow_up_at, note_text=""):
                 """
                 UPDATE leads
                 SET priority = %s,
+                    follow_up_notified_at =
+                        CASE WHEN follow_up_at IS DISTINCT FROM %s
+                             THEN NULL ELSE follow_up_notified_at END,
+                    follow_up_notification_claimed_at =
+                        CASE WHEN follow_up_at IS DISTINCT FROM %s
+                             THEN NULL ELSE follow_up_notification_claimed_at END,
+                    follow_up_notification_error =
+                        CASE WHEN follow_up_at IS DISTINCT FROM %s
+                             THEN NULL ELSE follow_up_notification_error END,
                     follow_up_at = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (priority, follow_up_at, lead_id)
+                (
+                    priority,
+                    follow_up_at,
+                    follow_up_at,
+                    follow_up_at,
+                    follow_up_at,
+                    lead_id,
+                )
             )
             if cur.rowcount != 1:
                 raise ValueError("Lead not found.")
@@ -3621,6 +3865,34 @@ Kupanga zofanana, mosiyana
 """
 
 
+
+@app.route("/tasks/followup-reminders", methods=["POST"])
+def follow_up_reminder_task():
+    if not FOLLOWUP_CRON_SECRET:
+        print("FOLLOW-UP REMINDER TASK BLOCKED: FOLLOWUP_CRON_SECRET missing", flush=True)
+        return Response(
+            json.dumps({"ok": False, "error": "task not configured"}),
+            status=503,
+            mimetype="application/json",
+        )
+
+    supplied = request.headers.get("X-IBROWS-CRON-SECRET", "")
+    if not supplied or not hmac.compare_digest(supplied, FOLLOWUP_CRON_SECRET):
+        return Response(
+            json.dumps({"ok": False, "error": "unauthorized"}),
+            status=401,
+            mimetype="application/json",
+        )
+
+    result = process_due_follow_up_reminders(limit=20)
+    result["ok"] = True
+    return Response(
+        json.dumps(result, separators=(",", ":")),
+        mimetype="application/json",
+    )
+
+
+
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
 
@@ -3829,6 +4101,7 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 .badge.priority-URGENT{background:#fee4e2;color:#b42318}.badge.priority-HIGH{background:#fff3d6;color:#93370d}.badge.priority-LOW{background:#ecfdf3;color:#027a48}
 .service{margin-top:11px;font-weight:800}.summary,.reason{margin-top:8px;line-height:1.45;font-size:14px}.reason{color:#667085}
 .followup{margin-top:9px;padding:9px 10px;border-radius:9px;background:#f9fafb;font-size:13px;font-weight:700}.followup.overdue{background:#fff1f0;color:#b42318}.followup.soon{background:#fff7e6;color:#93370d}
+.reminder-sent{margin-top:5px;color:#027a48;font-size:11px;font-weight:700}
 .notes{margin-top:9px;border-top:1px solid #eaecf0;padding-top:8px}.note{font-size:13px;line-height:1.4;margin:5px 0}.note time{color:#98a2b3;font-size:11px}
 .meta{margin-top:9px;color:#98a2b3;font-size:11px;line-height:1.5}.quick{display:block;text-align:center;text-decoration:none;background:#157347;color:white;border-radius:9px;padding:10px 12px;margin-top:13px;font-weight:800}
 .privacy-link{display:block;text-align:center;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:9px;padding:9px 12px;margin-top:7px;font-weight:700;font-size:12px}
@@ -3897,6 +4170,7 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 {% if lead.follow_up_at %}
 <div class="followup {% if lead.is_overdue %}overdue{% elif lead.due_soon %}soon{% endif %}">
 {% if lead.is_overdue %}OVERDUE — {% elif lead.due_soon %}DUE SOON — {% endif %}Follow up {{ lead.follow_up_label }}
+{% if lead.reminder_sent_label %}<div class="reminder-sent">Email reminder sent {{ lead.reminder_sent_label }}</div>{% endif %}
 </div>
 {% endif %}
 
@@ -3988,8 +4262,9 @@ def admin_leads():
             "status": row[6],
             "priority": row[7] or "NORMAL",
             "follow_up_at": row[8],
-            "created_at": row[9],
-            "updated_at": row[10],
+            "follow_up_notified_at": row[9],
+            "created_at": row[10],
+            "updated_at": row[11],
         })
 
     paused_customers = get_paused_customers()
@@ -4021,6 +4296,12 @@ def admin_leads():
         else:
             lead["follow_up_label"] = ""
             lead["follow_up_value"] = ""
+
+        notified_at = lead.get("follow_up_notified_at")
+        lead["reminder_sent_label"] = (
+            notified_at.astimezone(ADMIN_TIMEZONE).strftime("%d %b %Y at %H:%M")
+            if notified_at else ""
+        )
 
         lead_notes = notes_map.get(lead["id"], [])
         for note in lead_notes:
