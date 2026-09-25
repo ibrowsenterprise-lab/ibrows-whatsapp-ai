@@ -361,6 +361,26 @@ def init_database():
             """)
 
             cur.execute("""
+                ALTER TABLE business_documents
+                ADD COLUMN IF NOT EXISTS due_soon_notified_at TIMESTAMPTZ
+            """)
+
+            cur.execute("""
+                ALTER TABLE business_documents
+                ADD COLUMN IF NOT EXISTS overdue_notified_at TIMESTAMPTZ
+            """)
+
+            cur.execute("""
+                ALTER TABLE business_documents
+                ADD COLUMN IF NOT EXISTS invoice_notification_claimed_at TIMESTAMPTZ
+            """)
+
+            cur.execute("""
+                ALTER TABLE business_documents
+                ADD COLUMN IF NOT EXISTS invoice_notification_error TEXT
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS lead_notes (
                     id BIGSERIAL PRIMARY KEY,
                     lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
@@ -3436,6 +3456,300 @@ Kupanga zofanana, mosiyana
         return False, label
 
 
+
+def claim_due_invoice_reminders(limit=20):
+    """
+    Claim admin-only invoice reminders.
+    Due-soon: once when an unpaid/part-paid invoice is within 3 days of due date.
+    Overdue: once after its due date passes.
+    """
+    now_utc = datetime.now(UTC_TIMEZONE)
+    today_local = datetime.now(ADMIN_TIMEZONE).date()
+    claimed = []
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    d.id, d.lead_id, d.document_number, d.issued_at,
+                    d.due_soon_notified_at, d.overdue_notified_at,
+                    l.customer_number, l.customer_name, l.service,
+                    l.estimated_value, COALESCE(l.value_currency, 'MWK'),
+                    COALESCE(SUM(
+                        CASE
+                            WHEN p.currency = COALESCE(l.value_currency, 'MWK')
+                            THEN p.amount ELSE 0
+                        END
+                    ), 0) AS paid_total
+                FROM business_documents d
+                JOIN leads l ON l.id = d.lead_id
+                LEFT JOIN lead_payments p ON p.lead_id = l.id
+                WHERE d.doc_type = 'invoice'
+                  AND l.merged_into_lead_id IS NULL
+                  AND l.estimated_value IS NOT NULL
+                  AND (
+                    d.invoice_notification_claimed_at IS NULL
+                    OR d.invoice_notification_claimed_at < NOW() - INTERVAL '30 minutes'
+                  )
+                GROUP BY
+                    d.id, d.lead_id, d.document_number, d.issued_at,
+                    d.due_soon_notified_at, d.overdue_notified_at,
+                    d.invoice_notification_claimed_at,
+                    l.customer_number, l.customer_name, l.service,
+                    l.estimated_value, l.value_currency
+                ORDER BY d.issued_at ASC, d.id ASC
+                """
+            )
+            rows = cur.fetchall()
+
+            for row in rows:
+                (
+                    document_id, lead_id, document_number, issued_at,
+                    due_soon_notified_at, overdue_notified_at,
+                    customer_number, customer_name, service,
+                    estimated_value, currency, paid_total
+                ) = row
+
+                estimated_value = Decimal(estimated_value)
+                paid_total = Decimal(paid_total or 0)
+                balance = estimated_value - paid_total
+                if balance <= 0:
+                    continue
+
+                due_local = issued_at.astimezone(ADMIN_TIMEZONE) + timedelta(
+                    days=BUSINESS_INVOICE_DUE_DAYS
+                )
+                days_to_due = (due_local.date() - today_local).days
+
+                reminder_kind = None
+                if days_to_due < 0 and overdue_notified_at is None:
+                    reminder_kind = "OVERDUE"
+                elif (
+                    0 <= days_to_due <= RECEIVABLE_DUE_SOON_DAYS
+                    and due_soon_notified_at is None
+                ):
+                    reminder_kind = "DUE_SOON"
+
+                if reminder_kind is None:
+                    continue
+
+                cur.execute(
+                    """
+                    UPDATE business_documents
+                    SET invoice_notification_claimed_at = NOW(),
+                        invoice_notification_error = NULL
+                    WHERE id = %s
+                      AND (
+                        invoice_notification_claimed_at IS NULL
+                        OR invoice_notification_claimed_at < NOW() - INTERVAL '30 minutes'
+                      )
+                    """,
+                    (document_id,),
+                )
+                if cur.rowcount != 1:
+                    continue
+
+                claimed.append({
+                    "document_id": document_id,
+                    "lead_id": lead_id,
+                    "document_number": document_number,
+                    "issued_at": issued_at,
+                    "due_at": due_local.astimezone(UTC_TIMEZONE),
+                    "days_to_due": days_to_due,
+                    "kind": reminder_kind,
+                    "customer_number": customer_number,
+                    "customer_name": customer_name or "WhatsApp Customer",
+                    "service": canonicalize_service(service),
+                    "estimated_value": estimated_value,
+                    "paid_total": paid_total,
+                    "balance": balance,
+                    "currency": currency or "MWK",
+                })
+                if len(claimed) >= limit:
+                    break
+
+        conn.commit()
+
+    return claimed
+
+
+def finish_invoice_reminder(item, success, error=None):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if success:
+                notified_column = (
+                    "overdue_notified_at"
+                    if item["kind"] == "OVERDUE"
+                    else "due_soon_notified_at"
+                )
+                cur.execute(
+                    f"""
+                    UPDATE business_documents
+                    SET {notified_column} = NOW(),
+                        invoice_notification_claimed_at = NULL,
+                        invoice_notification_error = NULL
+                    WHERE id = %s
+                    """,
+                    (item["document_id"],),
+                )
+                label = (
+                    "Overdue invoice admin reminder sent."
+                    if item["kind"] == "OVERDUE"
+                    else "Due-soon invoice admin reminder sent."
+                )
+                _activity_insert(
+                    cur,
+                    item["lead_id"],
+                    "INVOICE_REMINDER",
+                    f"{label} {item['document_number']}",
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE business_documents
+                    SET invoice_notification_claimed_at = NULL,
+                        invoice_notification_error = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        str(error or "Unknown invoice reminder error")[:500],
+                        item["document_id"],
+                    ),
+                )
+        conn.commit()
+
+
+def send_invoice_admin_reminder_email(item):
+    if not BREVO_API_KEY or not NOTIFICATION_EMAIL or not BREVO_SENDER_EMAIL:
+        return False, "Brevo configuration incomplete"
+
+    due_local = item["due_at"].astimezone(ADMIN_TIMEZONE)
+    display_name = item["customer_name"]
+    balance_label = _format_crm_amount(item["balance"], item["currency"])
+    value_label = _format_crm_amount(item["estimated_value"], item["currency"])
+    paid_label = _format_crm_amount(item["paid_total"], item["currency"])
+
+    if item["kind"] == "OVERDUE":
+        overdue_days = abs(item["days_to_due"])
+        timing = (
+            f"OVERDUE by {overdue_days} day"
+            f"{'' if overdue_days == 1 else 's'}"
+        )
+        subject = (
+            f"IBROWS Invoice Overdue: {item['document_number']} — "
+            f"{display_name}"
+        )
+    else:
+        days = item["days_to_due"]
+        if days == 0:
+            timing = "DUE TODAY"
+        elif days == 1:
+            timing = "Due tomorrow"
+        else:
+            timing = f"Due in {days} days"
+        subject = (
+            f"IBROWS Invoice Due Soon: {item['document_number']} — "
+            f"{display_name}"
+        )
+
+    receivables_url = f"{LEAD_DASHBOARD_URL.rsplit('/admin/leads', 1)[0]}/admin/finance/receivables"
+    body = f"""IBROWS invoice payment reminder for admin.
+
+Invoice: {item['document_number']}
+Status: {timing}
+Customer: {display_name}
+WhatsApp: +{item['customer_number']}
+Service: {item['service']}
+Invoice value: {value_label}
+Paid: {paid_label}
+Outstanding: {balance_label}
+Due date: {due_local.strftime('%d %B %Y')}
+
+Open customer WhatsApp:
+https://wa.me/{item['customer_number']}
+
+Accounts Receivable:
+{receivables_url}
+
+This is an internal IBROWS reminder. No message has been sent automatically to the customer.
+
+IBROWS Enterprise
+Kupanga zofanana, mosiyana
+"""
+
+    payload = {
+        "sender": {
+            "name": BREVO_SENDER_NAME,
+            "email": BREVO_SENDER_EMAIL,
+        },
+        "to": [{"email": NOTIFICATION_EMAIL}],
+        "subject": subject,
+        "textContent": body,
+    }
+
+    try:
+        response = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "accept": "application/json",
+                "api-key": BREVO_API_KEY,
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=10,
+        )
+        if 200 <= response.status_code < 300:
+            print(
+                f"INVOICE REMINDER EMAIL SENT: "
+                f"{item['document_number']} {item['kind']}",
+                flush=True,
+            )
+            return True, None
+
+        error = f"Brevo HTTP {response.status_code}"
+        print(
+            f"INVOICE REMINDER EMAIL FAILED: "
+            f"{item['document_number']} — {error}",
+            flush=True,
+        )
+        return False, error
+    except Exception as error:
+        label = f"{type(error).__name__}: {str(error)[:180]}"
+        print(
+            f"INVOICE REMINDER EMAIL FAILED: "
+            f"{item['document_number']} — {label}",
+            flush=True,
+        )
+        return False, label
+
+
+def process_due_invoice_reminders(limit=20):
+    claimed = claim_due_invoice_reminders(limit=limit)
+    sent = 0
+    failed = 0
+
+    for item in claimed:
+        success, error = send_invoice_admin_reminder_email(item)
+        finish_invoice_reminder(item, success, error)
+        if success:
+            sent += 1
+        else:
+            failed += 1
+
+    print(
+        f"INVOICE REMINDER CHECK: due={len(claimed)} "
+        f"sent={sent} failed={failed}",
+        flush=True,
+    )
+    return {
+        "claimed": len(claimed),
+        "sent": sent,
+        "failed": failed,
+    }
+
+
+
 def process_due_follow_up_reminders(limit=20):
     claimed = claim_due_follow_up_reminders(limit=limit)
     sent = 0
@@ -4854,6 +5168,8 @@ def get_accounts_receivable_data(status_filter="all"):
                     d.issued_at,
                     d.last_sent_at,
                     COALESCE(d.send_count, 0),
+                    d.due_soon_notified_at,
+                    d.overdue_notified_at,
                     l.customer_number,
                     l.customer_name,
                     l.service,
@@ -4873,6 +5189,7 @@ def get_accounts_receivable_data(status_filter="all"):
                 GROUP BY
                     d.id, d.lead_id, d.document_number, d.issued_at,
                     d.last_sent_at, d.send_count,
+                    d.due_soon_notified_at, d.overdue_notified_at,
                     l.customer_number, l.customer_name, l.service,
                     l.estimated_value, l.value_currency
                 ORDER BY d.issued_at DESC, d.id DESC
@@ -4894,7 +5211,8 @@ def get_accounts_receivable_data(status_filter="all"):
     for row in rows:
         (
             document_id, lead_id, document_number, issued_at,
-            last_sent_at, send_count, customer_number, customer_name,
+            last_sent_at, send_count, due_soon_notified_at,
+            overdue_notified_at, customer_number, customer_name,
             service, estimated_value, currency, paid_total
         ) = row
 
@@ -5001,6 +5319,17 @@ def get_accounts_receivable_data(status_filter="all"):
             "payment_status": payment_status,
             "send_count": sent_count,
             "sent_label": sent_label,
+            "due_soon_notified_at": due_soon_notified_at,
+            "overdue_notified_at": overdue_notified_at,
+            "admin_reminder_label": (
+                "Overdue reminder sent to admin"
+                if overdue_notified_at
+                else (
+                    "Due-soon reminder sent to admin"
+                    if due_soon_notified_at
+                    else ""
+                )
+            ),
         }
         invoices.append(invoice)
 
@@ -6054,8 +6383,13 @@ def follow_up_reminder_task():
             mimetype="application/json",
         )
 
-    result = process_due_follow_up_reminders(limit=20)
-    result["ok"] = True
+    follow_up_result = process_due_follow_up_reminders(limit=20)
+    invoice_result = process_due_invoice_reminders(limit=20)
+    result = {
+        "ok": True,
+        "follow_up": follow_up_result,
+        "invoice": invoice_result,
+    }
     return Response(
         json.dumps(result, separators=(",", ":")),
         mimetype="application/json",
@@ -6907,7 +7241,7 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 <div><span>Balance</span><b>{{ invoice.balance_label }}</b></div>
 </div>
 
-<div class="meta">Issued {{ invoice.issued_label }} · Due {{ invoice.due_label }}<br>{{ invoice.sent_label }}</div>
+<div class="meta">Issued {{ invoice.issued_label }} · Due {{ invoice.due_label }}<br>{{ invoice.sent_label }}{% if invoice.admin_reminder_label %}<br><b>{{ invoice.admin_reminder_label }}</b>{% endif %}</div>
 
 <div class="actions">
 <a href="{{ url_for('admin_business_document_download', lead_id=invoice.lead_id, doc_type='invoice') }}">Download invoice</a>
