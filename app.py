@@ -10,6 +10,7 @@ import threading
 import socket
 import ipaddress
 import io
+import csv
 import zipfile
 import textwrap
 from html.parser import HTMLParser
@@ -7427,7 +7428,7 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 </style>
 </head>
 <body>
-<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_monthly_history') }}">History</a><a class="back" href="{{ url_for('admin_financial_reports', period=finance.period) }}">Reports</a><a class="back" href="{{ url_for('admin_profitability', period=finance.period) }}">Profitability</a><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
+<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_monthly_history') }}">History</a><a class="back" href="{{ url_for('admin_finance_export_csv') }}">Export</a><a class="back" href="{{ url_for('admin_financial_reports', period=finance.period) }}">Reports</a><a class="back" href="{{ url_for('admin_profitability', period=finance.period) }}">Profitability</a><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
 <div class="wrap">
 <h1>Payments & Revenue</h1>
 <p class="sub">Track money actually received, current accepted work and outstanding customer balances.</p>
@@ -7877,6 +7878,131 @@ def admin_financial_report_pdf():
     safe_period=re.sub(r"[^A-Za-z0-9_-]+","_",report["period_label"]).strip("_")
     response.headers["Content-Disposition"]=f'attachment; filename="IBROWS_Financial_Summary_{safe_period}.pdf"'
     response.headers["Cache-Control"]="no-store"
+    return response
+
+
+def _csv_text(headers, rows):
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow(["" if value is None else value for value in row])
+    return output.getvalue().encode("utf-8-sig")
+
+
+def _export_local_datetime(value):
+    if not value:
+        return ""
+    try:
+        return value.astimezone(ADMIN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value)
+
+
+@app.route("/admin/finance/export.csv", methods=["GET"])
+@admin_required
+def admin_finance_export_csv():
+    """Download a ZIP of accountant-friendly CSV finance records."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT p.id,p.lead_id,l.customer_name,l.customer_number,l.service,
+                       p.amount,COALESCE(p.currency,'MWK'),p.payment_method,
+                       p.reference,p.payment_note,p.received_at
+                FROM lead_payments p
+                JOIN leads l ON l.id=p.lead_id
+                WHERE l.merged_into_lead_id IS NULL
+                ORDER BY p.received_at,p.id
+            """)
+            payments = cur.fetchall()
+            cur.execute("""
+                SELECT id,amount,COALESCE(currency,'MWK'),category,service,
+                       description,payment_method,reference,expense_date
+                FROM business_expenses
+                ORDER BY expense_date,id
+            """)
+            expenses = cur.fetchall()
+            cur.execute("""
+                SELECT d.id,d.document_number,d.doc_type,d.lead_id,
+                       l.customer_name,l.customer_number,l.service,
+                       l.estimated_value,COALESCE(l.value_currency,'MWK'),
+                       d.issued_at,d.last_sent_at,COALESCE(d.send_count,0),
+                       COALESCE(SUM(CASE WHEN p.currency=COALESCE(l.value_currency,'MWK')
+                                         THEN p.amount ELSE 0 END),0)
+                FROM business_documents d
+                JOIN leads l ON l.id=d.lead_id
+                LEFT JOIN lead_payments p ON p.lead_id=l.id
+                WHERE l.merged_into_lead_id IS NULL
+                GROUP BY d.id,d.document_number,d.doc_type,d.lead_id,
+                         l.customer_name,l.customer_number,l.service,
+                         l.estimated_value,l.value_currency,d.issued_at,
+                         d.last_sent_at,d.send_count
+                ORDER BY d.issued_at,d.id
+            """)
+            documents = cur.fetchall()
+
+    payment_rows=[]
+    for r in payments:
+        payment_rows.append(list(r[:10])+[_export_local_datetime(r[10])])
+    expense_rows=[]
+    for r in expenses:
+        expense_rows.append(list(r[:8])+[_export_local_datetime(r[8])])
+    document_rows=[]
+    for r in documents:
+        value=Decimal(r[7] or 0); paid=Decimal(r[12] or 0)
+        balance=max(value-paid,Decimal("0")) if r[2]=="invoice" else ""
+        document_rows.append(list(r[:9])+[_export_local_datetime(r[9]),_export_local_datetime(r[10]),r[11],paid,balance])
+
+    monthly_rows=[]
+    service_monthly_rows=[]
+    for month in get_monthly_bookkeeping_history(36):
+        currencies=set(month.get("received",{}))|set(month.get("expenses",{}))
+        for currency in sorted(currencies):
+            monthly_rows.append([
+                month["key"],month["label"],currency,
+                month["received"].get(currency,Decimal("0")),
+                month["expenses"].get(currency,Decimal("0")),
+                month["net"].get(currency,Decimal("0")),
+                month["payment_count"],month["expense_count"],
+            ])
+        for service in month.get("service_rows",[]):
+            rev={x["currency"]:x["amount"] for x in service.get("revenue_lines",[])}
+            exp={x["currency"]:x["amount"] for x in service.get("expense_lines",[])}
+            net={x["currency"]:x["amount"] for x in service.get("net_lines",[])}
+            for currency in sorted(set(rev)|set(exp)|set(net)):
+                service_monthly_rows.append([
+                    month["key"],month["label"],service["service"],currency,
+                    rev.get(currency,Decimal("0")),exp.get(currency,Decimal("0")),
+                    net.get(currency,Decimal("0")),
+                ])
+
+    files={
+        "payments.csv": _csv_text(
+            ["payment_id","lead_id","customer_name","customer_number","service","amount","currency","payment_method","reference","note","received_at_malawi"],
+            payment_rows),
+        "expenses.csv": _csv_text(
+            ["expense_id","amount","currency","category","related_service","description","payment_method","reference","expense_date_malawi"],
+            expense_rows),
+        "business_documents.csv": _csv_text(
+            ["document_id","document_number","document_type","lead_id","customer_name","customer_number","service","service_value","currency","issued_at_malawi","last_sent_at_malawi","send_count","paid_total","invoice_balance"],
+            document_rows),
+        "monthly_summary.csv": _csv_text(
+            ["month","month_label","currency","payments_received","business_expenses","net_cash","payment_count","expense_count"],
+            monthly_rows),
+        "monthly_service_summary.csv": _csv_text(
+            ["month","month_label","service","currency","payments_received","assigned_expenses","net_cash_contribution"],
+            service_monthly_rows),
+    }
+    memory=io.BytesIO()
+    with zipfile.ZipFile(memory,"w",compression=zipfile.ZIP_DEFLATED) as archive:
+        for filename,data in files.items():
+            archive.writestr(filename,data)
+    memory.seek(0)
+    stamp=datetime.now(ADMIN_TIMEZONE).strftime("%Y-%m-%d")
+    response=Response(memory.getvalue(),mimetype="application/zip")
+    response.headers["Content-Disposition"]=f'attachment; filename="IBROWS_Finance_Export_{stamp}.zip"'
+    response.headers["Cache-Control"]="no-store"
+    print(f"FINANCE CSV EXPORT DOWNLOADED: files={len(files)}",flush=True)
     return response
 
 
