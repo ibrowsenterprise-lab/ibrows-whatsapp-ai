@@ -335,6 +335,25 @@ def init_database():
             """)
 
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS business_expense_budgets (
+                    id BIGSERIAL PRIMARY KEY,
+                    budget_year INTEGER NOT NULL,
+                    budget_month INTEGER NOT NULL CHECK (budget_month BETWEEN 1 AND 12),
+                    amount NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+                    currency TEXT NOT NULL DEFAULT 'MWK',
+                    category TEXT NOT NULL DEFAULT 'OTHER',
+                    service TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (budget_year, budget_month, currency, category, service)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_business_expense_budgets_month
+                ON business_expense_budgets(budget_year, budget_month)
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS business_document_sequences (
                     document_year INTEGER NOT NULL,
                     doc_type TEXT NOT NULL,
@@ -7428,7 +7447,7 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 </style>
 </head>
 <body>
-<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_monthly_history') }}">History</a><a class="back" href="{{ url_for('admin_finance_export_csv') }}">Export</a><a class="back" href="{{ url_for('admin_financial_reports', period=finance.period) }}">Reports</a><a class="back" href="{{ url_for('admin_profitability', period=finance.period) }}">Profitability</a><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
+<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_budget_dashboard') }}">Budgets</a><a class="back" href="{{ url_for('admin_monthly_history') }}">History</a><a class="back" href="{{ url_for('admin_finance_export_csv') }}">Export</a><a class="back" href="{{ url_for('admin_financial_reports', period=finance.period) }}">Reports</a><a class="back" href="{{ url_for('admin_profitability', period=finance.period) }}">Profitability</a><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
 <div class="wrap">
 <h1>Payments & Revenue</h1>
 <p class="sub">Track money actually received, current accepted work and outstanding customer balances.</p>
@@ -10316,6 +10335,108 @@ except Exception as error:
 # =========================================================
 # START APPLICATION
 # =========================================================
+
+
+BUDGET_CATEGORIES = ["TRANSPORT","AIRTIME","INTERNET","SUPPLIES","MARKETING","FUEL","UTILITIES","RENT","SALARIES","OTHER"]
+
+
+def get_budget_dashboard_data(year=None, month=None):
+    now = datetime.now(ADMIN_TIMEZONE)
+    try: year = int(year or now.year)
+    except Exception: year = now.year
+    try: month = int(month or now.month)
+    except Exception: month = now.month
+    if month < 1 or month > 12: month = now.month
+    start_local = datetime(year, month, 1, tzinfo=ADMIN_TIMEZONE)
+    if month == 12: end_local = datetime(year + 1, 1, 1, tzinfo=ADMIN_TIMEZONE)
+    else: end_local = datetime(year, month + 1, 1, tzinfo=ADMIN_TIMEZONE)
+    start_utc, end_utc = start_local.astimezone(UTC_TIMEZONE), end_local.astimezone(UTC_TIMEZONE)
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,budget_year,budget_month,amount,currency,category,service
+                           FROM business_expense_budgets
+                           WHERE budget_year=%s AND budget_month=%s
+                           ORDER BY currency,category,COALESCE(service,'')""", (year,month))
+            budgets=cur.fetchall()
+            cur.execute("""SELECT COALESCE(currency,'MWK'),category,service,SUM(amount)
+                           FROM business_expenses
+                           WHERE expense_date >= %s AND expense_date < %s
+                           GROUP BY COALESCE(currency,'MWK'),category,service""", (start_utc,end_utc))
+            actuals=cur.fetchall()
+    actual_map={}
+    for currency,category,service,total in actuals:
+        actual_map[(currency or 'MWK',(category or 'OTHER').upper(),service or '')]=Decimal(str(total or 0))
+    rows=[]
+    totals={}
+    for bid,by,bm,amount,currency,category,service in budgets:
+        amount=Decimal(str(amount or 0)); currency=currency or 'MWK'; category=(category or 'OTHER').upper(); service=service or ''
+        # A general category budget includes all spending in that category. A service budget only includes that service.
+        if service:
+            spent=actual_map.get((currency,category,service),Decimal('0'))
+        else:
+            spent=sum((v for (c,cat,svc),v in actual_map.items() if c==currency and cat==category),Decimal('0'))
+        remaining=amount-spent
+        pct=float((spent/amount*100) if amount else 0)
+        state='Over budget' if spent>amount else ('Near limit' if pct>=80 else 'On track')
+        rows.append({'id':bid,'amount':amount,'currency':currency,'category':category.title(),'category_code':category,'service':service or 'General business','service_value':service,'spent':spent,'remaining':remaining,'percent':min(pct,100.0),'raw_percent':pct,'state':state})
+        t=totals.setdefault(currency,{'budget':Decimal('0'),'spent':Decimal('0')}); t['budget']+=amount; t['spent']+=spent
+    total_rows=[]
+    for currency,t in sorted(totals.items()):
+        total_rows.append({'currency':currency,'budget':t['budget'],'spent':t['spent'],'remaining':t['budget']-t['spent']})
+    return {'year':year,'month':month,'month_label':start_local.strftime('%B %Y'),'rows':rows,'totals':total_rows}
+
+
+BUDGET_TEMPLATE = """
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101828"><title>IBROWS Budgets</title>
+<style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:32px}header{background:#101828;color:#fff}.wrap{max-width:980px;margin:auto;padding:0 14px}.top{display:flex;justify-content:space-between;align-items:center;padding:16px 0}.brand{font-size:20px;font-weight:800}.back{color:#fff;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:800;font-size:12px}h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;line-height:1.4}.card{background:#fff;border-radius:13px;padding:14px;margin-top:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.metric{background:#f9fafb;border-radius:10px;padding:11px}.metric small{color:#667085;font-weight:800}.metric b{display:block;font-size:18px;margin-top:5px}label{display:block;font-size:12px;font-weight:800;margin:11px 0 5px}input,select{width:100%;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:15px;background:#fff}.btn{border:0;border-radius:9px;background:#101828;color:#fff;padding:12px;font-size:14px;font-weight:800;width:100%;margin-top:13px}.danger{background:#fff;color:#b42318;border:1px solid #fda29b;padding:7px 9px;border-radius:8px;font-weight:800}.row{padding:13px 0;border-bottom:1px solid #eaecf0}.row:last-child{border:0}.head{display:flex;justify-content:space-between;gap:10px}.name{font-weight:800}.muted{color:#98a2b3;font-size:12px}.bar{height:9px;background:#eaecf0;border-radius:9px;overflow:hidden;margin:9px 0}.fill{height:100%;background:#101828}.over{color:#b42318;font-weight:800}.ok{color:#067647;font-weight:800}.near{color:#b54708;font-weight:800}.msg{padding:11px;border-radius:10px;background:#ecfdf3;color:#067647;font-weight:800;margin-top:14px}@media(max-width:620px){.grid{grid-template-columns:1fr}}</style></head>
+<body><header><div class="wrap top"><div class="brand">IBROWS Budgets</div><a class="back" href="{{ url_for('admin_finance') }}">Back to Finance</a></div></header><main class="wrap"><h1>Monthly Expense Budgets</h1><p class="sub">Set spending limits and compare them with expenses already recorded. Currencies remain separate.</p>
+{% if message %}<div class="msg">{{ message }}</div>{% endif %}
+<div class="card"><form method="GET"><div class="grid"><div><label>Year</label><input type="number" name="year" value="{{ data.year }}" min="2020" max="2100"></div><div><label>Month</label><select name="month">{% for n,label in months %}<option value="{{ n }}" {% if n==data.month %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div></div><button class="btn">View month</button></form></div>
+{% if data.totals %}<div class="card"><h2>{{ data.month_label }}</h2><div class="grid">{% for t in data.totals %}<div class="metric"><small>Budget · {{ t.currency }}</small><b>{{ t.currency }} {{ '{:,.0f}'.format(t.budget) }}</b></div><div class="metric"><small>Spent</small><b>{{ t.currency }} {{ '{:,.0f}'.format(t.spent) }}</b></div><div class="metric"><small>Remaining</small><b class="{% if t.remaining < 0 %}over{% endif %}">{{ t.currency }} {{ '{:,.0f}'.format(t.remaining) }}</b></div>{% endfor %}</div></div>{% endif %}
+<div class="card"><h2>Add / update budget</h2><form method="POST" action="{{ url_for('admin_budget_save') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="year" value="{{ data.year }}"><input type="hidden" name="month" value="{{ data.month }}"><div class="grid"><div><label>Amount</label><input name="amount" type="number" min="0.01" step="0.01" required placeholder="e.g. 50000"></div><div><label>Currency</label><select name="currency"><option>MWK</option><option>USD</option><option>ZAR</option><option>EUR</option><option>GBP</option></select></div><div><label>Category</label><select name="category">{% for c in categories %}<option value="{{ c }}">{{ c.title() }}</option>{% endfor %}</select></div><div><label>Related service (optional)</label><input name="service" placeholder="e.g. CV & Cover Letter"></div></div><button class="btn">Save budget</button></form></div>
+<div class="card"><h2>Budget progress · {{ data.month_label }}</h2>{% if data.rows %}{% for r in data.rows %}<div class="row"><div class="head"><div><div class="name">{{ r.category }} · {{ r.service }}</div><div class="muted">Budget {{ r.currency }} {{ '{:,.0f}'.format(r.amount) }} · Spent {{ r.currency }} {{ '{:,.0f}'.format(r.spent) }}</div></div><div class="{% if r.state=='Over budget' %}over{% elif r.state=='Near limit' %}near{% else %}ok{% endif %}">{{ r.state }}</div></div><div class="bar"><div class="fill" style="width:{{ r.percent }}%"></div></div><div class="muted">Remaining {{ r.currency }} {{ '{:,.0f}'.format(r.remaining) }} · {{ '%.0f'|format(r.raw_percent) }}% used</div><form method="POST" action="{{ url_for('admin_budget_delete', budget_id=r.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="year" value="{{ data.year }}"><input type="hidden" name="month" value="{{ data.month }}"><button class="danger" style="margin-top:9px">Delete</button></form></div>{% endfor %}{% else %}<div class="muted">No budgets set for this month yet.</div>{% endif %}</div></main></body></html>
+"""
+
+@app.route('/admin/finance/budgets', methods=['GET'])
+@admin_required
+def admin_budget_dashboard():
+    data=get_budget_dashboard_data(request.args.get('year'),request.args.get('month'))
+    months=[(i,datetime(2000,i,1).strftime('%B')) for i in range(1,13)]
+    return render_template_string(BUDGET_TEMPLATE,data=data,months=months,categories=BUDGET_CATEGORIES,csrf_token=get_csrf_token(),message=request.args.get('message',''))
+
+@app.route('/admin/finance/budgets/save', methods=['POST'])
+@admin_required
+def admin_budget_save():
+    require_valid_csrf()
+    try:
+        year=int(request.form.get('year')); month=int(request.form.get('month')); amount=Decimal(request.form.get('amount','0'))
+        if not (2020<=year<=2100 and 1<=month<=12 and amount>0): raise ValueError()
+    except Exception:
+        return redirect(url_for('admin_budget_dashboard',message='Invalid budget values.'))
+    currency=(request.form.get('currency') or 'MWK').strip().upper()[:8]
+    category=(request.form.get('category') or 'OTHER').strip().upper()[:80]
+    service=(request.form.get('service') or '').strip()
+    service_db=service or None
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO business_expense_budgets(budget_year,budget_month,amount,currency,category,service,updated_at)
+                           VALUES(%s,%s,%s,%s,%s,%s,NOW())
+                           ON CONFLICT (budget_year,budget_month,currency,category,service)
+                           DO UPDATE SET amount=EXCLUDED.amount,updated_at=NOW()""",(year,month,amount,currency,category,service_db))
+        conn.commit()
+    print(f'BUSINESS BUDGET SAVED: {year}-{month:02d} {currency} {amount} {category}',flush=True)
+    return redirect(url_for('admin_budget_dashboard',year=year,month=month,message='Budget saved.'))
+
+@app.route('/admin/finance/budgets/<int:budget_id>/delete', methods=['POST'])
+@admin_required
+def admin_budget_delete(budget_id):
+    require_valid_csrf()
+    year=request.form.get('year'); month=request.form.get('month')
+    with get_db() as conn:
+        with conn.cursor() as cur: cur.execute('DELETE FROM business_expense_budgets WHERE id=%s',(budget_id,))
+        conn.commit()
+    print(f'BUSINESS BUDGET DELETED: id={budget_id}',flush=True)
+    return redirect(url_for('admin_budget_dashboard',year=year,month=month,message='Budget deleted.'))
 
 if __name__ == "__main__":
 
