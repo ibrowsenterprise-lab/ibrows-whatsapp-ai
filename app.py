@@ -328,6 +328,10 @@ def init_database():
                 CREATE INDEX IF NOT EXISTS idx_business_expenses_date
                 ON business_expenses(expense_date DESC, id DESC)
             """)
+            cur.execute("""
+                ALTER TABLE business_expenses
+                ADD COLUMN IF NOT EXISTS service TEXT
+            """)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS business_document_sequences (
@@ -5171,7 +5175,7 @@ def get_expense_dashboard_data(period="month"):
             if start_utc is None:
                 cur.execute("""
                     SELECT id, amount, currency, category, description,
-                           payment_method, reference, expense_date
+                           payment_method, reference, expense_date, service
                     FROM business_expenses
                     ORDER BY expense_date DESC, id DESC
                     LIMIT 100
@@ -5179,7 +5183,7 @@ def get_expense_dashboard_data(period="month"):
             else:
                 cur.execute("""
                     SELECT id, amount, currency, category, description,
-                           payment_method, reference, expense_date
+                           payment_method, reference, expense_date, service
                     FROM business_expenses
                     WHERE expense_date >= %s
                     ORDER BY expense_date DESC, id DESC
@@ -5187,7 +5191,7 @@ def get_expense_dashboard_data(period="month"):
                 """, (start_utc,))
             rows = cur.fetchall()
 
-    for expense_id, amount, currency, category, description, method, reference, expense_date in rows:
+    for expense_id, amount, currency, category, description, method, reference, expense_date, service in rows:
         amount = Decimal(amount)
         currency = currency or "MWK"
         totals[currency] = totals.get(currency, Decimal("0")) + amount
@@ -5211,6 +5215,8 @@ def get_expense_dashboard_data(period="month"):
             "date_label": expense_date.astimezone(
                 ADMIN_TIMEZONE
             ).strftime("%d %b %Y %H:%M"),
+            "service": canonicalize_service(service) if service else "",
+            "service_label": canonicalize_service(service) if service else "General business",
         })
 
     category_rows = [
@@ -5225,6 +5231,52 @@ def get_expense_dashboard_data(period="month"):
         "category_rows": category_rows,
     }
 
+
+
+def get_service_profitability_data(period="month"):
+    period = period if period in FINANCE_PERIODS else "month"
+    start_utc = _finance_period_start(period)
+    services = {}
+    def bucket(name):
+        name = canonicalize_service(name) if name else "General business"
+        return services.setdefault(name, {"service":name,"revenue":{},"expenses":{},"net":{},"payment_count":0,"expense_count":0})
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            sql = """SELECT l.service,p.currency,COALESCE(SUM(p.amount),0),COUNT(p.id)
+                     FROM lead_payments p JOIN leads l ON l.id=p.lead_id
+                     WHERE l.merged_into_lead_id IS NULL"""
+            params=[]
+            if start_utc is not None: sql += " AND p.received_at >= %s"; params.append(start_utc)
+            sql += " GROUP BY l.service,p.currency"
+            cur.execute(sql,params); payments=cur.fetchall()
+            sql = """SELECT service,currency,COALESCE(SUM(amount),0),COUNT(id)
+                     FROM business_expenses WHERE service IS NOT NULL AND BTRIM(service)<>''"""
+            params=[]
+            if start_utc is not None: sql += " AND expense_date >= %s"; params.append(start_utc)
+            sql += " GROUP BY service,currency"
+            cur.execute(sql,params); expenses=cur.fetchall()
+            sql = """SELECT currency,COALESCE(SUM(amount),0),COUNT(id)
+                     FROM business_expenses WHERE service IS NULL OR BTRIM(service)=''"""
+            params=[]
+            if start_utc is not None: sql += " AND expense_date >= %s"; params.append(start_utc)
+            sql += " GROUP BY currency"
+            cur.execute(sql,params); overhead=cur.fetchall()
+    for service,currency,total,count in payments:
+        b=bucket(service); b["revenue"][currency]=Decimal(total); b["payment_count"]+=int(count)
+    for service,currency,total,count in expenses:
+        b=bucket(service); b["expenses"][currency]=Decimal(total); b["expense_count"]+=int(count)
+    for currency,total,count in overhead:
+        b=bucket(None); b["expenses"][currency]=Decimal(total); b["expense_count"]+=int(count)
+    rows=[]
+    for b in services.values():
+        for cur in set(b["revenue"])|set(b["expenses"]):
+            b["net"][cur]=b["revenue"].get(cur,Decimal("0"))-b["expenses"].get(cur,Decimal("0"))
+        b["revenue_lines"]=_crm_amount_lines(b["revenue"])
+        b["expense_lines"]=_crm_amount_lines(b["expenses"])
+        b["net_lines"]=[{"currency":c,"amount":a,"label":_format_crm_amount(a,c)} for c,a in sorted(b["net"].items())]
+        rows.append(b)
+    rows.sort(key=lambda x:(x["service"]=="General business",x["service"].lower()))
+    return rows
 
 def _finance_net_lines(received_lines, expense_totals):
     received = {
@@ -7214,7 +7266,7 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 </style>
 </head>
 <body>
-<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
+<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_profitability', period=finance.period) }}">Profitability</a><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
 <div class="wrap">
 <h1>Payments & Revenue</h1>
 <p class="sub">Track money actually received, current accepted work and outstanding customer balances.</p>
@@ -7287,6 +7339,23 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 
 
 
+PROFITABILITY_TEMPLATE = """
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>IBROWS Profitability</title><style>
+*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif}header{background:#101828;color:white}.wrap{max-width:980px;margin:auto;padding:14px}.top{display:flex;justify-content:space-between;align-items:center}.back{color:white;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:9px;font-weight:bold}.periods{display:flex;gap:7px;overflow:auto;margin:12px 0}.period{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;background:white;border-radius:18px;padding:8px 11px;font-weight:bold}.period.active{background:#101828;color:white}.card{background:white;border-radius:13px;padding:15px;margin:12px 0;box-shadow:0 2px 8px #0000000d}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.metric{background:#f9fafb;border-radius:10px;padding:10px}.label{font-size:11px;color:#667085;font-weight:bold}.value{font-size:16px;font-weight:bold;margin-top:6px;line-height:1.5}.meta{font-size:11px;color:#98a2b3;margin-top:10px}.empty{color:#98a2b3}@media(max-width:620px){.grid{grid-template-columns:1fr}}
+</style><script src="{{ url_for('admin_pwa_js') }}" defer></script></head><body>
+<header><div class="wrap top"><h2>IBROWS Profitability</h2><a class="back" href="{{ url_for('admin_finance',period=period) }}">Back to Finance</a></div></header><main class="wrap">
+<h1>Profitability by Service</h1><p>Payments actually received minus expenses assigned to each service. General overhead remains separate. Currencies are never combined.</p>
+<div class="periods">{% for k,v in periods.items() %}<a class="period {% if period==k %}active{% endif %}" href="{{ url_for('admin_profitability',period=k) }}">{{ v }}</a>{% endfor %}</div>
+{% if rows %}{% for row in rows %}<div class="card"><h2>{{ row.service }}</h2><div class="grid">
+<div class="metric"><div class="label">Payments received</div><div class="value">{% if row.revenue_lines %}{% for x in row.revenue_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div>
+<div class="metric"><div class="label">Assigned expenses</div><div class="value">{% if row.expense_lines %}{% for x in row.expense_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div>
+<div class="metric"><div class="label">Net cash contribution</div><div class="value">{% if row.net_lines %}{% for x in row.net_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">No activity</span>{% endif %}</div></div>
+</div><div class="meta">{{ row.payment_count }} payment{% if row.payment_count!=1 %}s{% endif %} · {{ row.expense_count }} assigned expense{% if row.expense_count!=1 %}s{% endif %}</div></div>{% endfor %}{% else %}<div class="card empty">No service activity for this period.</div>{% endif %}
+<div class="card meta">Net cash contribution is a management cash-flow measure, not formal accounting profit. General overhead is not allocated automatically.</div>
+</main></body></html>
+"""
+
+
 EXPENSES_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -7328,6 +7397,7 @@ label{display:block;font-size:12px;font-weight:800;margin:11px 0 5px}input,selec
 <div><label>Amount</label><input name="amount" inputmode="decimal" placeholder="e.g. 15000" required></div>
 <div><label>Currency</label><select name="currency"><option>MWK</option><option>USD</option><option>EUR</option><option>GBP</option><option>ZAR</option></select></div>
 <div><label>Category</label><select name="category">{% for key,label in categories.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></div>
+<div><label>Related service</label><select name="service"><option value="">General business / overhead</option>{% for service in services %}<option value="{{ service }}">{{ service }}</option>{% endfor %}</select></div>
 <div><label>Payment method</label><select name="payment_method">{% for key,label in payment_methods.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></div>
 <div><label>Expense date</label><input type="date" name="expense_date" value="{{ today }}"></div>
 <div><label>Reference (optional)</label><input name="reference" maxlength="120" placeholder="Receipt / transaction ref"></div>
@@ -7344,7 +7414,7 @@ label{display:block;font-size:12px;font-weight:800;margin:11px 0 5px}input,selec
 <div class="card"><h2 style="margin:0 0 5px">Expense history · {{ periods[period] }}</h2>
 {% if expenses.recent %}
 {% for item in expenses.recent %}
-<div class="row"><div class="row-head"><div><div class="name">{{ item.category_label }}</div><div class="meta">{{ item.description }}<br>{{ item.method_label }}{% if item.reference %} · Ref: {{ item.reference }}{% endif %} · {{ item.date_label }}</div></div><div><div class="amount">{{ item.amount_label }}</div><form method="POST" action="{{ url_for('admin_expenses_delete', expense_id=item.id) }}" onsubmit="return confirm('Delete this expense entry?');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="period" value="{{ period }}"><button class="danger" type="submit">Delete</button></form></div></div></div>
+<div class="row"><div class="row-head"><div><div class="name">{{ item.category_label }}</div><div class="meta">{{ item.description }}<br>{{ item.service_label }} · {{ item.method_label }}{% if item.reference %} · Ref: {{ item.reference }}{% endif %} · {{ item.date_label }}</div></div><div><div class="amount">{{ item.amount_label }}</div><form method="POST" action="{{ url_for('admin_expenses_delete', expense_id=item.id) }}" onsubmit="return confirm('Delete this expense entry?');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="period" value="{{ period }}"><button class="danger" type="submit">Delete</button></form></div></div></div>
 {% endfor %}
 {% else %}<div class="empty">No expenses recorded in this period.</div>{% endif %}
 </div>
@@ -7640,6 +7710,14 @@ def admin_finance():
 
 
 
+@app.route("/admin/finance/profitability", methods=["GET"])
+@admin_required
+def admin_profitability():
+    period=request.args.get("period","month").strip().lower()
+    if period not in FINANCE_PERIODS: period="month"
+    return render_template_string(PROFITABILITY_TEMPLATE,rows=get_service_profitability_data(period),period=period,periods=FINANCE_PERIODS)
+
+
 @app.route("/admin/finance/expenses", methods=["GET"])
 @admin_required
 def admin_expenses():
@@ -7657,6 +7735,7 @@ def admin_expenses():
         periods=FINANCE_PERIODS,
         categories=EXPENSE_CATEGORIES,
         payment_methods=PAYMENT_METHODS,
+        services=sorted({canonicalize_service(x) for x in SERVICE_OPTIONS}),
         csrf_token=get_csrf_token(),
         today=datetime.now(ADMIN_TIMEZONE).strftime("%Y-%m-%d"),
         message=request.args.get("message", ""),
@@ -7677,6 +7756,8 @@ def admin_expenses_add():
     category = request.form.get("category", "OTHER").strip().upper()
     method = request.form.get("payment_method", "OTHER").strip().upper()
     description = request.form.get("description", "").strip()
+    service = request.form.get("service", "").strip()
+    service = canonicalize_service(service) if service else None
     reference = request.form.get("reference", "").strip()[:120] or None
     raw_date = request.form.get("expense_date", "").strip()
 
@@ -7719,10 +7800,10 @@ def admin_expenses_add():
                 """
                 INSERT INTO business_expenses
                     (amount, currency, category, description,
-                     payment_method, reference, expense_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                     payment_method, reference, expense_date, service)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (amount, currency, category, description, method, reference, expense_dt),
+                (amount, currency, category, description, method, reference, expense_dt, service),
             )
         conn.commit()
 
