@@ -311,6 +311,25 @@ def init_database():
             """)
 
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS business_expenses (
+                    id BIGSERIAL PRIMARY KEY,
+                    amount NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+                    currency TEXT NOT NULL DEFAULT 'MWK',
+                    category TEXT NOT NULL DEFAULT 'OTHER',
+                    description TEXT NOT NULL,
+                    payment_method TEXT NOT NULL DEFAULT 'OTHER',
+                    reference TEXT,
+                    expense_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_business_expenses_date
+                ON business_expenses(expense_date DESC, id DESC)
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS business_document_sequences (
                     document_year INTEGER NOT NULL,
                     doc_type TEXT NOT NULL,
@@ -5121,6 +5140,119 @@ FINANCE_PERIODS = {
 }
 
 
+EXPENSE_CATEGORIES = {
+    "TRANSPORT": "Transport",
+    "AIRTIME_DATA": "Airtime & Data",
+    "MARKETING": "Marketing",
+    "SUPPLIES": "Supplies & Materials",
+    "SOFTWARE": "Software & Subscriptions",
+    "UTILITIES": "Utilities",
+    "WAGES": "Wages & Labour",
+    "RENT": "Rent",
+    "BANK_FEES": "Bank / Mobile Money Fees",
+    "OTHER": "Other",
+}
+
+
+def _expense_category_label(value):
+    value = str(value or "OTHER").strip().upper()
+    return EXPENSE_CATEGORIES.get(value, value.replace("_", " ").title())
+
+
+def get_expense_dashboard_data(period="month"):
+    period = period if period in FINANCE_PERIODS else "month"
+    start_utc = _finance_period_start(period)
+    totals = {}
+    categories = {}
+    recent = []
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if start_utc is None:
+                cur.execute("""
+                    SELECT id, amount, currency, category, description,
+                           payment_method, reference, expense_date
+                    FROM business_expenses
+                    ORDER BY expense_date DESC, id DESC
+                    LIMIT 100
+                """)
+            else:
+                cur.execute("""
+                    SELECT id, amount, currency, category, description,
+                           payment_method, reference, expense_date
+                    FROM business_expenses
+                    WHERE expense_date >= %s
+                    ORDER BY expense_date DESC, id DESC
+                    LIMIT 100
+                """, (start_utc,))
+            rows = cur.fetchall()
+
+    for expense_id, amount, currency, category, description, method, reference, expense_date in rows:
+        amount = Decimal(amount)
+        currency = currency or "MWK"
+        totals[currency] = totals.get(currency, Decimal("0")) + amount
+        label = _expense_category_label(category)
+        bucket = categories.setdefault(label, {})
+        bucket[currency] = bucket.get(currency, Decimal("0")) + amount
+        recent.append({
+            "id": expense_id,
+            "amount": amount,
+            "amount_label": _format_crm_amount(amount, currency),
+            "currency": currency,
+            "category": category,
+            "category_label": label,
+            "description": description,
+            "method_label": PAYMENT_METHODS.get(
+                method or "OTHER",
+                str(method or "OTHER").replace("_", " ").title(),
+            ),
+            "reference": reference or "",
+            "expense_date": expense_date,
+            "date_label": expense_date.astimezone(
+                ADMIN_TIMEZONE
+            ).strftime("%d %b %Y %H:%M"),
+        })
+
+    category_rows = [
+        {"category": label, "amounts": _crm_amount_lines(amounts)}
+        for label, amounts in sorted(categories.items())
+    ]
+    return {
+        "totals": totals,
+        "total_lines": _crm_amount_lines(totals),
+        "count": len(recent),
+        "recent": recent[:40],
+        "category_rows": category_rows,
+    }
+
+
+def _finance_net_lines(received_lines, expense_totals):
+    received = {
+        item["currency"]: Decimal(item["amount"])
+        for item in (received_lines or [])
+    }
+    currencies = set(received) | set(expense_totals or {})
+    net = {}
+    for currency in currencies:
+        net[currency] = (
+            received.get(currency, Decimal("0"))
+            - Decimal((expense_totals or {}).get(currency, Decimal("0")))
+        )
+    # Keep zero lines here so the admin can see a true zero cash result.
+    order = ["MWK", "USD", "EUR", "GBP", "ZAR"]
+    lines = []
+    for currency in order + sorted(currencies - set(order)):
+        if currency not in currencies:
+            continue
+        amount = net[currency]
+        lines.append({
+            "currency": currency,
+            "amount": amount,
+            "label": _format_crm_amount(amount, currency),
+        })
+    return lines
+
+
 def _finance_period_start(period):
     now_local = datetime.now(ADMIN_TIMEZONE)
     if period == "month":
@@ -6590,7 +6722,7 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:14px 0}
 .stat{display:block;text-decoration:none;color:#101828;background:white;padding:13px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
 .stat-number{font-size:23px;font-weight:800}.stat-label{color:#667085;font-size:11px;margin-top:3px}
-.pipeline{background:white;border-radius:12px;padding:12px;margin:0 0 12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.pipeline h2{font-size:16px;margin:0 0 9px}.pipeline-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.pipe{background:#f9fafb;border-radius:10px;padding:10px}.pipe-title{font-size:11px;font-weight:800;color:#667085;margin-bottom:5px}.pipe-value{font-size:13px;font-weight:800;line-height:1.5}.pipe-empty{color:#98a2b3;font-weight:600}.pipe-note{font-size:10px;color:#98a2b3;margin-top:6px;line-height:1.35}
+.pipeline{background:white;border-radius:12px;padding:12px;margin:0 0 12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.pipeline h2{font-size:16px;margin:0 0 9px}.pipeline-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.pipe{background:#f9fafb;border-radius:10px;padding:10px}.pipe-title{font-size:11px;font-weight:800;color:#667085;margin-bottom:5px}.pipe-value{font-size:13px;font-weight:800;line-height:1.5}.pipe-empty{color:#98a2b3;font-weight:600}.pipe-note{font-size:10px;color:#98a2b3;margin-top:6px;line-height:1.35}
 .stat.attention{border:1px solid #f2b8a0}
 .tools{background:white;border-radius:12px;padding:11px;margin:0 0 12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
 .search-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(125px,180px) minmax(105px,140px) minmax(120px,150px) auto;gap:7px}
@@ -7082,7 +7214,7 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 </style>
 </head>
 <body>
-<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px"><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
+<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
 <div class="wrap">
 <h1>Payments & Revenue</h1>
 <p class="sub">Track money actually received, current accepted work and outstanding customer balances.</p>
@@ -7098,6 +7230,8 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 <div class="card"><div class="metric-title">Current accepted value</div><div class="metric-value">{% if finance.accepted_total %}{% for item in finance.accepted_total %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div>
 <div class="card"><div class="metric-title">Outstanding accepted balance</div><div class="metric-value">{% if finance.outstanding %}{% for item in finance.outstanding %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div>
 <div class="card"><div class="metric-title">Payment activity</div><div class="metric-value">{{ finance.payment_count }} payment{% if finance.payment_count != 1 %}s{% endif %}</div><div class="note">{{ finance.customer_count }} paying customer{% if finance.customer_count != 1 %}s{% endif %} · {{ finance.outstanding_count }} outstanding accepted lead{% if finance.outstanding_count != 1 %}s{% endif %}</div></div>
+<div class="card"><div class="metric-title">Business expenses · {{ finance.period_label }}</div><div class="metric-value">{% if finance.expenses %}{% for item in finance.expenses %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">No expenses</span>{% endif %}</div><div class="note">{{ finance.expense_count }} expense entr{% if finance.expense_count == 1 %}y{% else %}ies{% endif %}</div></div>
+<div class="card"><div class="metric-title">Net cash · {{ finance.period_label }}</div><div class="metric-value">{% if finance.net_cash %}{% for item in finance.net_cash %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">No activity</span>{% endif %}</div><div class="note">Payments received minus recorded expenses. Different currencies stay separate.</div></div>
 </div>
 
 <div class="section">
@@ -7146,6 +7280,74 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 <div class="note">This is money received, not quoted or invoiced value.</div>
 </div>
 
+</div>
+</body>
+</html>
+"""
+
+
+
+EXPENSES_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101828">
+<title>IBROWS Expenses</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:32px}
+header{background:#101828;color:#fff;position:sticky;top:0;z-index:10}.wrap{max-width:980px;margin:auto;padding:0 14px}.top{display:flex;justify-content:space-between;align-items:center;padding:16px 0}.brand{font-size:20px;font-weight:800}.back{color:#fff;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:800;font-size:12px}
+h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-height:1.4}.periods{display:flex;gap:7px;overflow-x:auto;padding:2px 0 13px}.period{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;background:#fff;border-radius:18px;padding:7px 11px;font-size:12px;font-weight:800}.period.active{background:#101828;color:#fff;border-color:#101828}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.card{background:#fff;border-radius:13px;padding:14px;box-shadow:0 2px 8px rgba(0,0,0,.05);margin-bottom:12px}.metric-title{font-size:11px;color:#667085;font-weight:800}.metric-value{font-size:20px;font-weight:800;line-height:1.45;margin-top:5px}.empty{color:#98a2b3;font-size:13px;font-weight:600}
+label{display:block;font-size:12px;font-weight:800;margin:11px 0 5px}input,select,textarea{width:100%;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:15px;background:#fff}textarea{min-height:74px;resize:vertical}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}.btn{width:100%;border:0;border-radius:9px;background:#101828;color:#fff;padding:12px;font-size:14px;font-weight:800;margin-top:13px}.danger{background:#fff;color:#b42318;border:1px solid #fda29b;padding:8px 10px;border-radius:8px;font-weight:800;font-size:11px}
+.row{padding:12px 0;border-bottom:1px solid #eaecf0}.row:last-child{border-bottom:0}.row-head{display:flex;justify-content:space-between;gap:12px}.name{font-weight:800;font-size:14px}.amount{font-weight:800;text-align:right}.meta{font-size:11px;color:#98a2b3;margin-top:4px;line-height:1.45}.method-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.method{background:#f9fafb;border-radius:10px;padding:10px}.method b{display:block;font-size:13px}.method span{font-size:12px;color:#475467;line-height:1.5}
+.flash{padding:10px;border-radius:9px;margin:10px 0;font-size:13px;font-weight:700}.ok{background:#ecfdf3;color:#027a48}.err{background:#fef3f2;color:#b42318}
+@media(max-width:620px){.grid,.form-grid,.method-grid{grid-template-columns:1fr}.wrap{padding-left:11px;padding-right:11px}}
+</style>
+<script src="{{ url_for('admin_pwa_js') }}" defer></script>
+</head>
+<body>
+<header><div class="wrap top"><div class="brand">IBROWS Expenses</div><a class="back" href="{{ url_for('admin_finance', period=period) }}">Back to Finance</a></div></header>
+<div class="wrap">
+<h1>Expenses & Net Cash</h1>
+<p class="sub">Record business spending and compare it with money actually received. Currencies are never converted or combined.</p>
+{% if message %}<div class="flash {{ 'ok' if message_type == 'ok' else 'err' }}">{{ message }}</div>{% endif %}
+<div class="periods">{% for key,label in periods.items() %}<a class="period {% if period == key %}active{% endif %}" href="{{ url_for('admin_expenses', period=key) }}">{{ label }}</a>{% endfor %}</div>
+
+<div class="grid">
+<div class="card"><div class="metric-title">Expenses · {{ periods[period] }}</div><div class="metric-value">{% if expenses.total_lines %}{% for item in expenses.total_lines %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">No expenses</span>{% endif %}</div></div>
+<div class="card"><div class="metric-title">Net cash · {{ periods[period] }}</div><div class="metric-value">{% if net_cash %}{% for item in net_cash %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">No activity</span>{% endif %}</div><div class="meta">Payments received minus recorded expenses.</div></div>
+</div>
+
+<div class="card">
+<h2 style="margin:0 0 5px">Add expense</h2>
+<form method="POST" action="{{ url_for('admin_expenses_add') }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="period" value="{{ period }}">
+<div class="form-grid">
+<div><label>Amount</label><input name="amount" inputmode="decimal" placeholder="e.g. 15000" required></div>
+<div><label>Currency</label><select name="currency"><option>MWK</option><option>USD</option><option>EUR</option><option>GBP</option><option>ZAR</option></select></div>
+<div><label>Category</label><select name="category">{% for key,label in categories.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></div>
+<div><label>Payment method</label><select name="payment_method">{% for key,label in payment_methods.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></div>
+<div><label>Expense date</label><input type="date" name="expense_date" value="{{ today }}"></div>
+<div><label>Reference (optional)</label><input name="reference" maxlength="120" placeholder="Receipt / transaction ref"></div>
+</div>
+<label>Description</label><textarea name="description" maxlength="500" placeholder="What was this expense for?" required></textarea>
+<button class="btn" type="submit">Save expense</button>
+</form>
+</div>
+
+{% if expenses.category_rows %}
+<div class="card"><h2 style="margin:0 0 10px">Spending by category</h2><div class="method-grid">{% for row in expenses.category_rows %}<div class="method"><b>{{ row.category }}</b><span>{% for item in row.amounts %}{{ item.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</span></div>{% endfor %}</div></div>
+{% endif %}
+
+<div class="card"><h2 style="margin:0 0 5px">Expense history · {{ periods[period] }}</h2>
+{% if expenses.recent %}
+{% for item in expenses.recent %}
+<div class="row"><div class="row-head"><div><div class="name">{{ item.category_label }}</div><div class="meta">{{ item.description }}<br>{{ item.method_label }}{% if item.reference %} · Ref: {{ item.reference }}{% endif %} · {{ item.date_label }}</div></div><div><div class="amount">{{ item.amount_label }}</div><form method="POST" action="{{ url_for('admin_expenses_delete', expense_id=item.id) }}" onsubmit="return confirm('Delete this expense entry?');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="period" value="{{ period }}"><button class="danger" type="submit">Delete</button></form></div></div></div>
+{% endfor %}
+{% else %}<div class="empty">No expenses recorded in this period.</div>{% endif %}
+</div>
 </div>
 </body>
 </html>
@@ -7422,6 +7624,13 @@ def admin_finance():
         period = "month"
 
     finance = get_finance_dashboard_data(period)
+    expenses = get_expense_dashboard_data(period)
+    finance["expenses"] = expenses["total_lines"]
+    finance["expense_count"] = expenses["count"]
+    finance["net_cash"] = _finance_net_lines(
+        finance["received"],
+        expenses["totals"],
+    )
     return render_template_string(
         FINANCE_DASHBOARD_TEMPLATE,
         finance=finance,
@@ -7429,6 +7638,120 @@ def admin_finance():
         current_year=datetime.now(ADMIN_TIMEZONE).year,
     )
 
+
+
+@app.route("/admin/finance/expenses", methods=["GET"])
+@admin_required
+def admin_expenses():
+    period = request.args.get("period", "month").strip().lower()
+    if period not in FINANCE_PERIODS:
+        period = "month"
+    expenses = get_expense_dashboard_data(period)
+    finance = get_finance_dashboard_data(period)
+    net_cash = _finance_net_lines(finance["received"], expenses["totals"])
+    return render_template_string(
+        EXPENSES_TEMPLATE,
+        expenses=expenses,
+        net_cash=net_cash,
+        period=period,
+        periods=FINANCE_PERIODS,
+        categories=EXPENSE_CATEGORIES,
+        payment_methods=PAYMENT_METHODS,
+        csrf_token=get_csrf_token(),
+        today=datetime.now(ADMIN_TIMEZONE).strftime("%Y-%m-%d"),
+        message=request.args.get("message", ""),
+        message_type=request.args.get("message_type", "ok"),
+    )
+
+
+@app.route("/admin/finance/expenses/add", methods=["POST"])
+@admin_required
+def admin_expenses_add():
+    validate_csrf()
+    period = request.form.get("period", "month")
+    if period not in FINANCE_PERIODS:
+        period = "month"
+
+    raw_amount = request.form.get("amount", "").strip().replace(",", "")
+    currency = request.form.get("currency", "MWK").strip().upper()
+    category = request.form.get("category", "OTHER").strip().upper()
+    method = request.form.get("payment_method", "OTHER").strip().upper()
+    description = request.form.get("description", "").strip()
+    reference = request.form.get("reference", "").strip()[:120] or None
+    raw_date = request.form.get("expense_date", "").strip()
+
+    try:
+        amount = Decimal(raw_amount)
+        if amount <= 0 or amount > Decimal("999999999999.99"):
+            raise ValueError
+    except Exception:
+        return redirect(url_for(
+            "admin_expenses", period=period,
+            message="Enter a valid expense amount greater than zero.",
+            message_type="err",
+        ))
+
+    if currency not in {"MWK", "USD", "EUR", "GBP", "ZAR"}:
+        currency = "MWK"
+    if category not in EXPENSE_CATEGORIES:
+        category = "OTHER"
+    if method not in PAYMENT_METHODS:
+        method = "OTHER"
+    if not description:
+        return redirect(url_for(
+            "admin_expenses", period=period,
+            message="Expense description is required.",
+            message_type="err",
+        ))
+
+    try:
+        local_date = datetime.strptime(raw_date, "%Y-%m-%d").date() if raw_date else datetime.now(ADMIN_TIMEZONE).date()
+        expense_dt = datetime(
+            local_date.year, local_date.month, local_date.day, 12, 0,
+            tzinfo=ADMIN_TIMEZONE,
+        ).astimezone(UTC_TIMEZONE)
+    except Exception:
+        expense_dt = datetime.now(UTC_TIMEZONE)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO business_expenses
+                    (amount, currency, category, description,
+                     payment_method, reference, expense_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (amount, currency, category, description, method, reference, expense_dt),
+            )
+        conn.commit()
+
+    print(f"BUSINESS EXPENSE SAVED: {currency} {amount} {category}", flush=True)
+    return redirect(url_for(
+        "admin_expenses", period=period,
+        message="Expense saved.",
+        message_type="ok",
+    ))
+
+
+@app.route("/admin/finance/expenses/<int:expense_id>/delete", methods=["POST"])
+@admin_required
+def admin_expenses_delete(expense_id):
+    validate_csrf()
+    period = request.form.get("period", "month")
+    if period not in FINANCE_PERIODS:
+        period = "month"
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM business_expenses WHERE id=%s", (expense_id,))
+            deleted = cur.rowcount
+        conn.commit()
+    print(f"BUSINESS EXPENSE DELETED: id={expense_id} deleted={deleted}", flush=True)
+    return redirect(url_for(
+        "admin_expenses", period=period,
+        message="Expense deleted." if deleted else "Expense entry was not found.",
+        message_type="ok" if deleted else "err",
+    ))
 
 
 
