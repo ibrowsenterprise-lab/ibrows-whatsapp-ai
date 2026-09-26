@@ -5278,6 +5278,40 @@ def get_service_profitability_data(period="month"):
     rows.sort(key=lambda x:(x["service"]=="General business",x["service"].lower()))
     return rows
 
+
+
+def get_monthly_bookkeeping_history(limit_months=36):
+    months = {}
+    def month_bucket(dt):
+        local_dt=dt.astimezone(ADMIN_TIMEZONE); key=local_dt.strftime("%Y-%m")
+        return months.setdefault(key,{"key":key,"label":local_dt.strftime("%B %Y"),"received":{},"expenses":{},"net":{},"payment_count":0,"expense_count":0,"services":{}})
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT p.amount,COALESCE(p.currency,'MWK'),p.received_at,l.service FROM lead_payments p JOIN leads l ON l.id=p.lead_id WHERE l.merged_into_lead_id IS NULL ORDER BY p.received_at DESC")
+            payment_rows=cur.fetchall()
+            cur.execute("SELECT amount,COALESCE(currency,'MWK'),expense_date,service FROM business_expenses ORDER BY expense_date DESC")
+            expense_rows=cur.fetchall()
+    for amount,currency,dt,service in payment_rows:
+        b=month_bucket(dt); amount=Decimal(amount); currency=currency or "MWK"
+        b["received"][currency]=b["received"].get(currency,Decimal("0"))+amount; b["payment_count"]+=1
+        name=canonicalize_service(service) if service else "General business"; sb=b["services"].setdefault(name,{"revenue":{},"expenses":{}}); sb["revenue"][currency]=sb["revenue"].get(currency,Decimal("0"))+amount
+    for amount,currency,dt,service in expense_rows:
+        b=month_bucket(dt); amount=Decimal(amount); currency=currency or "MWK"
+        b["expenses"][currency]=b["expenses"].get(currency,Decimal("0"))+amount; b["expense_count"]+=1
+        name=canonicalize_service(service) if service else "General business"; sb=b["services"].setdefault(name,{"revenue":{},"expenses":{}}); sb["expenses"][currency]=sb["expenses"].get(currency,Decimal("0"))+amount
+    rows=[]
+    for key in sorted(months,reverse=True)[:max(1,int(limit_months))]:
+        b=months[key]; currencies=set(b["received"])|set(b["expenses"])
+        for c in currencies: b["net"][c]=b["received"].get(c,Decimal("0"))-b["expenses"].get(c,Decimal("0"))
+        b["received_lines"]=_crm_amount_lines(b["received"]); b["expense_lines"]=_crm_amount_lines(b["expenses"]); b["net_lines"]=[{"currency":c,"amount":a,"label":_format_crm_amount(a,c)} for c,a in sorted(b["net"].items())]
+        sr=[]
+        for name,sb in sorted(b["services"].items()):
+            net={c:sb["revenue"].get(c,Decimal("0"))-sb["expenses"].get(c,Decimal("0")) for c in set(sb["revenue"])|set(sb["expenses"])}
+            sr.append({"service":name,"revenue_lines":_crm_amount_lines(sb["revenue"]),"expense_lines":_crm_amount_lines(sb["expenses"]),"net_lines":[{"currency":c,"amount":a,"label":_format_crm_amount(a,c)} for c,a in sorted(net.items())]})
+        b["service_rows"]=sr; rows.append(b)
+    return rows
+
+
 def _finance_net_lines(received_lines, expense_totals):
     received = {
         item["currency"]: Decimal(item["amount"])
@@ -7341,6 +7375,12 @@ def admin_leads():
 
 
 
+
+
+MONTHLY_HISTORY_TEMPLATE = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101828"><title>IBROWS Monthly History</title><style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:36px}header{background:#101828;color:#fff;position:sticky;top:0;z-index:10}.wrap{max-width:980px;margin:auto;padding:0 14px}.top{display:flex;justify-content:space-between;align-items:center;padding:16px 0;gap:10px}.brand{font-size:20px;font-weight:800}.back{color:#fff;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:800;font-size:12px}h1{font-size:27px;margin:22px 0 5px}.sub{color:#667085;line-height:1.45;margin:0 0 15px}.month,.note{background:#fff;border-radius:14px;padding:15px;margin-bottom:14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.month h2{margin:0 0 12px;font-size:21px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.metric{background:#f9fafb;border-radius:10px;padding:11px}.label{font-size:11px;color:#667085;font-weight:800}.value{font-size:17px;font-weight:800;line-height:1.45;margin-top:5px}.meta,.note{font-size:11px;color:#98a2b3;line-height:1.45}.services{margin-top:13px;border-top:1px solid #eaecf0;padding-top:9px}.service{display:grid;grid-template-columns:1.5fr 1fr 1fr 1fr;gap:7px;padding:8px 0;border-bottom:1px solid #f2f4f7;font-size:11px}.service b{font-size:12px}.head{color:#667085;font-weight:800}.empty{color:#98a2b3}@media(max-width:620px){.grid{grid-template-columns:1fr}.service{grid-template-columns:1.3fr 1fr 1fr 1fr;font-size:10px}.wrap{padding-left:11px;padding-right:11px}}</style><script src="{{ url_for('admin_pwa_js') }}" defer></script></head><body><header><div class="wrap top"><div class="brand">IBROWS History</div><a class="back" href="{{ url_for('admin_finance') }}">Back to Finance</a></div></header><main class="wrap"><h1>Monthly Bookkeeping</h1><p class="sub">Compare revenue, expenses and net cash month by month. Currencies are never combined.</p><div class="note">Up to 36 months of recorded activity. Figures are rebuilt from your saved payments and expenses.</div>{% if rows %}{% for row in rows %}<section class="month"><h2>{{ row.label }}</h2><div class="grid"><div class="metric"><div class="label">Payments received</div><div class="value">{% if row.received_lines %}{% for x in row.received_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div><div class="metric"><div class="label">Business expenses</div><div class="value">{% if row.expense_lines %}{% for x in row.expense_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div><div class="metric"><div class="label">Net cash</div><div class="value">{% for x in row.net_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</div></div></div><div class="meta">{{ row.payment_count }} payment{% if row.payment_count != 1 %}s{% endif %} · {{ row.expense_count }} expense entr{% if row.expense_count == 1 %}y{% else %}ies{% endif %}</div>{% if row.service_rows %}<div class="services"><div class="service head"><div>Service</div><div>Received</div><div>Expenses</div><div>Net</div></div>{% for svc in row.service_rows %}<div class="service"><div><b>{{ svc.service }}</b></div><div>{% for x in svc.revenue_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</div><div>{% for x in svc.expense_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</div><div>{% for x in svc.net_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</div></div>{% endfor %}</div>{% endif %}</section>{% endfor %}{% else %}<div class="month empty">No bookkeeping activity has been recorded yet.</div>{% endif %}</main></body></html>
+"""
+
 FINANCIAL_REPORTS_TEMPLATE = """
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101828"><title>IBROWS Financial Reports</title>
 <style>
@@ -7387,7 +7427,7 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 </style>
 </head>
 <body>
-<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_financial_reports', period=finance.period) }}">Reports</a><a class="back" href="{{ url_for('admin_profitability', period=finance.period) }}">Profitability</a><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
+<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_monthly_history') }}">History</a><a class="back" href="{{ url_for('admin_financial_reports', period=finance.period) }}">Reports</a><a class="back" href="{{ url_for('admin_profitability', period=finance.period) }}">Profitability</a><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
 <div class="wrap">
 <h1>Payments & Revenue</h1>
 <p class="sub">Track money actually received, current accepted work and outstanding customer balances.</p>
@@ -7806,6 +7846,13 @@ Issued {{ doc.issued_label }}
 </html>
 """
 
+
+
+
+@app.route("/admin/finance/history", methods=["GET"])
+@admin_required
+def admin_monthly_history():
+    return render_template_string(MONTHLY_HISTORY_TEMPLATE, rows=get_monthly_bookkeeping_history(36))
 
 @app.route("/admin/finance/reports", methods=["GET"])
 @admin_required
