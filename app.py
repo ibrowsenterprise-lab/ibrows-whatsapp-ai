@@ -5766,6 +5766,105 @@ def get_finance_dashboard_data(period="month"):
 
 
 
+
+def get_financial_report_data(period="month"):
+    period = period if period in FINANCE_PERIODS else "month"
+    finance = get_finance_dashboard_data(period)
+    expenses = get_expense_dashboard_data(period)
+    profitability = get_service_profitability_data(period)
+    receivables = get_accounts_receivable_data("all")
+    return {
+        "period": period,
+        "period_label": FINANCE_PERIODS[period],
+        "generated_label": datetime.now(ADMIN_TIMEZONE).strftime("%d %b %Y %H:%M"),
+        "received": finance["received"],
+        "payment_count": finance["payment_count"],
+        "customer_count": finance["customer_count"],
+        "expenses": expenses["total_lines"],
+        "expense_count": expenses["count"],
+        "net_cash": _finance_net_lines(finance["received"], expenses["totals"]),
+        "accepted_total": finance["accepted_total"],
+        "outstanding": finance["outstanding"],
+        "outstanding_count": finance["outstanding_count"],
+        "profitability": profitability,
+        "receivable_count": receivables["invoice_count"],
+        "overdue": receivables["overdue"],
+        "due_soon": receivables["due_soon"],
+    }
+
+
+def _report_line_labels(lines):
+    return ", ".join(x["label"] for x in (lines or [])) or "None"
+
+
+def _financial_report_pdf(report):
+    commands=[]
+    logo_w=150.0
+    logo_h=logo_w*(IBROWS_LOGO_JPEG_HEIGHT/IBROWS_LOGO_JPEG_WIDTH)
+    commands.append(f"q {logo_w:g} 0 0 {logo_h:g} 42 {795-logo_h:g} cm /Logo Do Q")
+    commands.append("0.12 0.12 0.16 rg")
+    commands.append("BT /F2 20 Tf 335 796 Td (FINANCIAL SUMMARY) Tj ET")
+    commands.append(f"BT /F1 9 Tf 335 778 Td ({_pdf_escape('Period: '+report['period_label'])}) Tj ET")
+    commands.append(f"BT /F1 9 Tf 335 764 Td ({_pdf_escape('Generated: '+report['generated_label'])}) Tj ET")
+    commands.append("0.39 0.08 0.35 RG 2 w 42 724 m 553 724 l S")
+    commands.append("0 0 0 rg")
+    y=694
+    commands.append("BT /F2 13 Tf 42 694 Td (Cash summary) Tj ET"); y-=28
+    summary=[
+        ("Payments received",_report_line_labels(report["received"])),
+        ("Business expenses",_report_line_labels(report["expenses"])),
+        ("Net cash",_report_line_labels(report["net_cash"])),
+        ("Current accepted value",_report_line_labels(report["accepted_total"])),
+        ("Outstanding accepted balance",_report_line_labels(report["outstanding"])),
+    ]
+    for label,value in summary:
+        commands.append("0.94 0.94 0.95 RG 0.6 w")
+        commands.append(f"42 {y:g} 511 25 re S")
+        commands.append(f"BT /F1 9.5 Tf 52 {y+8:g} Td ({_pdf_escape(label)}) Tj ET")
+        commands.append(f"BT /F2 10 Tf 330 {y+8:g} Td ({_pdf_escape(value)}) Tj ET")
+        y-=25
+    y-=20
+    commands.append(f"BT /F2 13 Tf 42 {y:g} Td (Service performance) Tj ET"); y-=24
+    for row in report["profitability"][:10]:
+        value=_report_line_labels(row["net_lines"])
+        text=f"{row['service']}: {value}"
+        for line in _business_pdf_wrap(text,size=9,width=500)[:2]:
+            commands.append(f"BT /F1 9 Tf 52 {y:g} Td ({_pdf_escape(line)}) Tj ET"); y-=13
+        if y<185: break
+    y-=8
+    commands.append(f"BT /F2 13 Tf 42 {y:g} Td (Receivables) Tj ET"); y-=22
+    rec=[
+        f"Generated invoices: {report['receivable_count']}",
+        f"Outstanding accepted leads: {report['outstanding_count']}",
+        "Due soon: "+_report_line_labels(report["due_soon"]),
+        "Overdue: "+_report_line_labels(report["overdue"]),
+    ]
+    for line in rec:
+        commands.append(f"BT /F1 9 Tf 52 {y:g} Td ({_pdf_escape(line)}) Tj ET"); y-=15
+    commands.append("0.85 0.85 0.87 RG 0.8 w 42 96 m 553 96 l S")
+    commands.append("0.35 0.35 0.38 rg")
+    commands.append("BT /F2 9 Tf 42 76 Td (Prepared by IBROWS Enterprise.) Tj ET")
+    footer=_pdf_escape(IBROWS_BUSINESS_TAGLINE+" | "+IBROWS_BUSINESS_EMAIL)
+    commands.append(f"BT /F1 8 Tf 42 62 Td ({footer}) Tj ET")
+    content="\n".join(commands).encode("latin-1","strict")
+    logo_bytes=base64.b64decode(IBROWS_LOGO_JPEG_B64)
+    objects={
+      1:b"<< /Type /Catalog /Pages 2 0 R >>",
+      2:b"<< /Type /Pages /Kids [6 0 R] /Count 1 >>",
+      3:b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      4:b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+      5:(b"<< /Type /XObject /Subtype /Image "+f"/Width {IBROWS_LOGO_JPEG_WIDTH} /Height {IBROWS_LOGO_JPEG_HEIGHT} ".encode()+b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode "+f"/Length {len(logo_bytes)} >>\nstream\n".encode()+logo_bytes+b"\nendstream"),
+      6:b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> /XObject << /Logo 5 0 R >> >> /Contents 7 0 R >>",
+      7:b"<< /Length "+str(len(content)).encode()+b" >>\nstream\n"+content+b"\nendstream",
+    }
+    out=bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"); offsets=[0]*8
+    for i in range(1,8):
+        offsets[i]=len(out); out.extend(f"{i} 0 obj\n".encode()); out.extend(objects[i]); out.extend(b"\nendobj\n")
+    xref=len(out); out.extend(b"xref\n0 8\n0000000000 65535 f \n")
+    for i in range(1,8): out.extend(f"{offsets[i]:010d} 00000 n \n".encode())
+    out.extend(f"trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode())
+    return bytes(out)
+
 def get_pipeline_summary():
     """
     Business-wide commercial summary.
@@ -7242,6 +7341,28 @@ def admin_leads():
 
 
 
+FINANCIAL_REPORTS_TEMPLATE = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101828"><title>IBROWS Financial Reports</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:30px}header{background:#101828;color:white}.wrap{max-width:980px;margin:auto;padding:0 14px}.top{display:flex;justify-content:space-between;align-items:center;padding:16px 0}.back,.download{color:white;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:9px 11px;font-weight:800;font-size:12px}.download{background:#101828;display:inline-block;margin:5px 0 14px}.periods{display:flex;gap:7px;overflow:auto;margin:12px 0}.period{white-space:nowrap;text-decoration:none;color:#344054;border:1px solid #d0d5dd;background:white;border-radius:18px;padding:8px 11px;font-weight:bold}.period.active{background:#101828;color:white}.cards{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}.card{background:white;border-radius:13px;padding:14px;margin-bottom:10px;box-shadow:0 2px 8px #0000000d}.label{font-size:11px;color:#667085;font-weight:800}.value{font-size:18px;font-weight:800;line-height:1.45;margin-top:5px}.service{padding:9px 0;border-bottom:1px solid #eaecf0}.service:last-child{border-bottom:0}.muted{color:#98a2b3;font-size:12px}@media(max-width:620px){.cards{grid-template-columns:1fr}}
+</style><script src="{{ url_for('admin_pwa_js') }}" defer></script></head><body>
+<header><div class="wrap top"><h2>IBROWS Reports</h2><a class="back" href="{{ url_for('admin_finance',period=report.period) }}">Back to Finance</a></div></header>
+<main class="wrap"><h1>Financial Summary</h1><p>Management summary generated from recorded payments, expenses, accepted work and invoices.</p>
+<div class="periods">{% for k,v in periods.items() %}<a class="period {% if report.period==k %}active{% endif %}" href="{{ url_for('admin_financial_reports',period=k) }}">{{ v }}</a>{% endfor %}</div>
+<a class="download" href="{{ url_for('admin_financial_report_pdf',period=report.period) }}">Download PDF report</a>
+<div class="cards">
+<div class="card"><div class="label">Payments received · {{ report.period_label }}</div><div class="value">{% for x in report.received %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}<span class="muted">None</span>{% endfor %}</div><div class="muted">{{ report.payment_count }} payment(s) · {{ report.customer_count }} paying customer(s)</div></div>
+<div class="card"><div class="label">Business expenses</div><div class="value">{% for x in report.expenses %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}<span class="muted">None</span>{% endfor %}</div><div class="muted">{{ report.expense_count }} expense entry/entries</div></div>
+<div class="card"><div class="label">Net cash</div><div class="value">{% for x in report.net_cash %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}<span class="muted">None</span>{% endfor %}</div></div>
+<div class="card"><div class="label">Outstanding accepted balance</div><div class="value">{% for x in report.outstanding %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}<span class="muted">None</span>{% endfor %}</div><div class="muted">{{ report.outstanding_count }} outstanding accepted lead(s)</div></div>
+</div>
+<div class="card"><h2>Service performance</h2>{% for row in report.profitability %}<div class="service"><b>{{ row.service }}</b><div class="muted">Net cash contribution</div>{% for x in row.net_lines %}<b>{{ x.label }}</b>{% if not loop.last %}<br>{% endif %}{% else %}<span class="muted">No activity</span>{% endfor %}</div>{% else %}<span class="muted">No service activity.</span>{% endfor %}</div>
+<div class="card"><h2>Receivables snapshot</h2><div>Generated invoices: <b>{{ report.receivable_count }}</b></div><div>Due soon: <b>{% for x in report.due_soon %}{{ x.label }}{% if not loop.last %}, {% endif %}{% else %}None{% endfor %}</b></div><div>Overdue: <b>{% for x in report.overdue %}{{ x.label }}{% if not loop.last %}, {% endif %}{% else %}None{% endfor %}</b></div></div>
+<div class="card muted">This is a management cash-flow summary, not audited financial statements. Different currencies remain separate and no FX conversion is applied. Generated {{ report.generated_label }}.</div>
+</main></body></html>
+"""
+
+
 FINANCE_DASHBOARD_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -7266,7 +7387,7 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 </style>
 </head>
 <body>
-<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_profitability', period=finance.period) }}">Profitability</a><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
+<header><div class="wrap top"><div class="brand">IBROWS Finance</div><div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end"><a class="back" href="{{ url_for('admin_financial_reports', period=finance.period) }}">Reports</a><a class="back" href="{{ url_for('admin_profitability', period=finance.period) }}">Profitability</a><a class="back" href="{{ url_for('admin_expenses', period=finance.period) }}">Expenses</a><a class="back" href="{{ url_for('admin_receivables') }}">Invoices</a><a class="back" href="{{ url_for('admin_leads') }}">Back to Leads</a></div></div></header>
 <div class="wrap">
 <h1>Payments & Revenue</h1>
 <p class="sub">Track money actually received, current accepted work and outstanding customer balances.</p>
@@ -7684,6 +7805,32 @@ Issued {{ doc.issued_label }}
 </body>
 </html>
 """
+
+
+@app.route("/admin/finance/reports", methods=["GET"])
+@admin_required
+def admin_financial_reports():
+    period=request.args.get("period","month").strip().lower()
+    if period not in FINANCE_PERIODS: period="month"
+    return render_template_string(
+        FINANCIAL_REPORTS_TEMPLATE,
+        report=get_financial_report_data(period),
+        periods=FINANCE_PERIODS,
+    )
+
+
+@app.route("/admin/finance/reports.pdf", methods=["GET"])
+@admin_required
+def admin_financial_report_pdf():
+    period=request.args.get("period","month").strip().lower()
+    if period not in FINANCE_PERIODS: period="month"
+    report=get_financial_report_data(period)
+    pdf=_financial_report_pdf(report)
+    response=Response(pdf,mimetype="application/pdf")
+    safe_period=re.sub(r"[^A-Za-z0-9_-]+","_",report["period_label"]).strip("_")
+    response.headers["Content-Disposition"]=f'attachment; filename="IBROWS_Financial_Summary_{safe_period}.pdf"'
+    response.headers["Cache-Control"]="no-store"
+    return response
 
 
 @app.route("/admin/finance", methods=["GET"])
