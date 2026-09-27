@@ -7432,7 +7432,7 @@ def admin_leads():
 
 
 MONTHLY_HISTORY_TEMPLATE = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101828"><title>IBROWS Monthly History</title><style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:36px}header{background:#101828;color:#fff;position:sticky;top:0;z-index:10}.wrap{max-width:980px;margin:auto;padding:0 14px}.top{display:flex;justify-content:space-between;align-items:center;padding:16px 0;gap:10px}.brand{font-size:20px;font-weight:800}.back{color:#fff;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:800;font-size:12px}h1{font-size:27px;margin:22px 0 5px}.sub{color:#667085;line-height:1.45;margin:0 0 15px}.month,.note{background:#fff;border-radius:14px;padding:15px;margin-bottom:14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.month h2{margin:0 0 12px;font-size:21px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.metric{background:#f9fafb;border-radius:10px;padding:11px}.label{font-size:11px;color:#667085;font-weight:800}.value{font-size:17px;font-weight:800;line-height:1.45;margin-top:5px}.meta,.note{font-size:11px;color:#98a2b3;line-height:1.45}.services{margin-top:13px;border-top:1px solid #eaecf0;padding-top:9px}.service{display:grid;grid-template-columns:1.5fr 1fr 1fr 1fr;gap:7px;padding:8px 0;border-bottom:1px solid #f2f4f7;font-size:11px}.service b{font-size:12px}.head{color:#667085;font-weight:800}.empty{color:#98a2b3}@media(max-width:620px){.grid{grid-template-columns:1fr}.service{grid-template-columns:1.3fr 1fr 1fr 1fr;font-size:10px}.wrap{padding-left:11px;padding-right:11px}}</style><script src="{{ url_for('admin_pwa_js') }}" defer></script></head><body><header><div class="wrap top"><div class="brand">IBROWS History</div><a class="back" href="{{ url_for('admin_finance') }}">Back to Finance</a></div></header><main class="wrap"><h1>Monthly Bookkeeping</h1><p class="sub">Compare revenue, expenses and net cash month by month. Currencies are never combined.</p><div class="note">Up to 36 months of recorded activity. Figures are rebuilt from your saved payments and expenses.</div>{% if rows %}{% for row in rows %}<section class="month"><h2>{{ row.label }}</h2><div class="grid"><div class="metric"><div class="label">Payments received</div><div class="value">{% if row.received_lines %}{% for x in row.received_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div><div class="metric"><div class="label">Business expenses</div><div class="value">{% if row.expense_lines %}{% for x in row.expense_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div><div class="metric"><div class="label">Net cash</div><div class="value">{% for x in row.net_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</div></div></div><div class="meta">{{ row.payment_count }} payment{% if row.payment_count != 1 %}s{% endif %} · {{ row.expense_count }} expense entr{% if row.expense_count == 1 %}y{% else %}ies{% endif %}</div>{% if row.service_rows %}<div class="services"><div class="service head"><div>Service</div><div>Received</div><div>Expenses</div><div>Net</div></div>{% for svc in row.service_rows %}<div class="service"><div><b>{{ svc.service }}</b></div><div>{% for x in svc.revenue_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</div><div>{% for x in svc.expense_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</div><div>{% for x in svc.net_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</div></div>{% endfor %}</div>{% endif %}</section>{% endfor %}{% else %}<div class="month empty">No bookkeeping activity has been recorded yet.</div>{% endif %}</main></body></html>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101828"><title>IBROWS Monthly History</title><style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:36px}header{background:#101828;color:#fff;position:sticky;top:0;z-index:10}.wrap{max-width:980px;margin:auto;padding:0 14px}.top{display:flex;justify-content:space-between;align-items:center;padding:16px 0;gap:10px}.brand{font-size:20px;font-weight:800}.back{color:#fff;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:800;font-size:12px}h1{font-size:27px;margin:22px 0 5px}.sub{color:#667085;line-height:1.45;margin:0 0 15px}.month,.note{background:#fff;border-radius:14px;padding:15px;margin-bottom:14px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.month h2{margin:0 0 12px;font-size:21px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.metric{background:#f9fafb;border-radius:10px;padding:11px}.label{font-size:11px;color:#667085;font-weight:800}.value{font-size:17px;font-weight:800;line-height:1.45;margin-top:5px}.meta,.note{font-size:11px;color:#98a2b3;line-height:1.45}.services{margin-top:13px;border-top:1px solid #eaecf0;padding-top:9px}.service{display:grid;grid-template-columns:1.5fr 1fr 1fr 1fr;gap:7px;padding:8px 0;border-bottom:1px solid #f2f4f7;font-size:11px}.service b{font-size:12px}.head{color:#667085;font-weight:800}.empty{color:#98a2b3}@media(max-width:620px){.grid{grid-template-columns:1fr}.service{grid-template-columns:1.3fr 1fr 1fr 1fr;font-size:10px}.wrap{padding-left:11px;padding-right:11px}}</style><script src="{{ url_for('admin_pwa_js') }}" defer></script></head><body><header><div class="wrap top"><div class="brand">IBROWS History</div><a class="back" href="{{ url_for('admin_finance') }}">Back to Finance</a></div></header><main class="wrap"><h1>Monthly Bookkeeping</h1><p class="sub">Compare revenue, expenses and net cash month by month. Currencies are never combined.</p><div class="note">Up to 36 months of recorded activity. Figures are rebuilt from your saved payments and expenses.</div>{% if rows %}{% for row in rows %}<section class="month"><h2>{{ row.label }}</h2><div class="grid"><div class="metric"><div class="label">Payments received</div><div class="value">{% if row.received_lines %}{% for x in row.received_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div><div class="metric"><div class="label">Business expenses</div><div class="value">{% if row.expense_lines %}{% for x in row.expense_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}<span class="empty">None</span>{% endif %}</div></div><div class="metric"><div class="label">Net cash</div><div class="value">{% for x in row.net_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% endfor %}</div></div></div><div class="meta">{{ row.payment_count }} payment{% if row.payment_count != 1 %}s{% endif %} · {{ row.expense_count }} expense entr{% if row.expense_count == 1 %}y{% else %}ies{% endif %}</div>{% if row.service_rows %}<div class="services"><div class="service head"><div>Service</div><div>Received</div><div>Expenses</div><div>Net</div></div>{% for svc in row.service_rows %}<div class="service"><div><b>{{ svc.service }}</b></div><div>{% for x in svc.revenue_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</div><div>{% for x in svc.expense_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</div><div>{% for x in svc.net_lines %}{{ x.label }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</div></div>{% endfor %}</div>{% endif %}</section>{% endfor %}{% else %}<div class="month empty">No bookkeeping activity has been recorded yet.</div>{% endif %}<section class="month"><h2>Voided payment audit</h2><div class="meta" style="margin-bottom:10px">Voided payments are retained here for accountability but are excluded from revenue, balances and net cash.</div>{% if voided_payments %}{% for v in voided_payments %}<div style="padding:10px 0;border-bottom:1px solid #eaecf0"><div><b>{{ v.customer_name }}</b> · <b>{{ v.amount_label }}</b> · <span style="color:#b42318;font-weight:800">VOIDED</span></div><div class="meta">{{ v.service }} · {{ v.payment_method }}{% if v.reference %} · Ref {{ v.reference }}{% endif %}</div><div class="meta">Originally received: {{ v.original_received_label or 'Unknown' }} · Voided: {{ v.voided_label }}</div><div class="meta" style="color:#667085">Reason: {{ v.void_reason }}</div></div>{% endfor %}{% else %}<div class="empty">No voided payments recorded.</div>{% endif %}</section></main></body></html>
 """
 
 FINANCIAL_REPORTS_TEMPLATE = """
@@ -7909,10 +7909,51 @@ Issued {{ doc.issued_label }}
 
 
 
+def get_payment_void_audit(limit=100):
+    """Return immutable voided-payment snapshots for admin audit/history views."""
+    try:
+        limit = max(1, min(int(limit), 500))
+    except Exception:
+        limit = 100
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT v.original_payment_id, v.lead_id,
+                       COALESCE(l.customer_name,'Customer'), COALESCE(l.customer_number,''),
+                       COALESCE(l.service,'General Enquiry'), v.amount,
+                       COALESCE(v.currency,'MWK'), v.payment_method, v.reference,
+                       v.payment_note, v.original_received_at, v.void_reason, v.voided_at
+                FROM payment_void_audit v
+                LEFT JOIN leads l ON l.id=v.lead_id
+                ORDER BY v.voided_at DESC, v.id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+    result=[]
+    for r in rows:
+        result.append({
+            "original_payment_id": r[0], "lead_id": r[1], "customer_name": r[2],
+            "customer_number": r[3], "service": r[4], "amount": r[5],
+            "currency": r[6], "payment_method": PAYMENT_METHODS.get(r[7], r[7] or "Other"),
+            "reference": r[8] or "", "payment_note": r[9] or "",
+            "original_received_label": _export_local_datetime(r[10]),
+            "void_reason": r[11], "voided_label": _export_local_datetime(r[12]),
+            "amount_label": _format_crm_amount(r[5], r[6]),
+        })
+    return result
+
+
 @app.route("/admin/finance/history", methods=["GET"])
 @admin_required
 def admin_monthly_history():
-    return render_template_string(MONTHLY_HISTORY_TEMPLATE, rows=get_monthly_bookkeeping_history(36))
+    return render_template_string(
+        MONTHLY_HISTORY_TEMPLATE,
+        rows=get_monthly_bookkeeping_history(36),
+        voided_payments=get_payment_void_audit(100),
+    )
 
 @app.route("/admin/finance/reports", methods=["GET"])
 @admin_required
@@ -7975,6 +8016,17 @@ def admin_finance_export_csv():
             """)
             payments = cur.fetchall()
             cur.execute("""
+                SELECT v.original_payment_id,v.lead_id,
+                       COALESCE(l.customer_name,'Customer'),COALESCE(l.customer_number,''),
+                       COALESCE(l.service,'General Enquiry'),v.amount,
+                       COALESCE(v.currency,'MWK'),v.payment_method,v.reference,
+                       v.payment_note,v.original_received_at,v.void_reason,v.voided_at
+                FROM payment_void_audit v
+                LEFT JOIN leads l ON l.id=v.lead_id
+                ORDER BY v.voided_at,v.id
+            """)
+            voided_payments = cur.fetchall()
+            cur.execute("""
                 SELECT id,amount,COALESCE(currency,'MWK'),category,service,
                        description,payment_method,reference,expense_date
                 FROM business_expenses
@@ -8003,6 +8055,11 @@ def admin_finance_export_csv():
     payment_rows=[]
     for r in payments:
         payment_rows.append(list(r[:10])+[_export_local_datetime(r[10])])
+    voided_payment_rows=[]
+    for r in voided_payments:
+        voided_payment_rows.append(list(r[:10])+[
+            _export_local_datetime(r[10]), r[11], _export_local_datetime(r[12])
+        ])
     expense_rows=[]
     for r in expenses:
         expense_rows.append(list(r[:8])+[_export_local_datetime(r[8])])
@@ -8039,6 +8096,9 @@ def admin_finance_export_csv():
         "payments.csv": _csv_text(
             ["payment_id","lead_id","customer_name","customer_number","service","amount","currency","payment_method","reference","note","received_at_malawi"],
             payment_rows),
+        "voided_payments.csv": _csv_text(
+            ["original_payment_id","lead_id","customer_name","customer_number","service","amount","currency","payment_method","reference","note","original_received_at_malawi","void_reason","voided_at_malawi"],
+            voided_payment_rows),
         "expenses.csv": _csv_text(
             ["expense_id","amount","currency","category","related_service","description","payment_method","reference","expense_date_malawi"],
             expense_rows),
