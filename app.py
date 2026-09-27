@@ -6228,8 +6228,9 @@ def update_lead_management(
     payment_reference="",
     payment_note="",
     payment_request_token="",
+    payment_confirmed=False,
 ):
-    """Save lead management fields and optionally record one immutable payment."""
+    """Save lead management fields and optionally record one explicitly confirmed immutable payment."""
     allowed = {"LOW", "NORMAL", "HIGH", "URGENT"}
     priority = str(priority or "").strip().upper()
     if priority not in allowed:
@@ -6246,6 +6247,14 @@ def update_lead_management(
     payment_reference = " ".join(str(payment_reference or "").split()).strip()[:120]
     payment_note = " ".join(str(payment_note or "").split()).strip()[:500]
     payment_request_token = str(payment_request_token or "").strip()[:160]
+
+    payment_confirmed = bool(payment_confirmed)
+
+    # Safety: never create a payment merely because a browser/autofill supplied
+    # a value in the optional amount field. Recording money requires an explicit
+    # confirmation checkbox from the administrator.
+    if payment_amount is not None and not payment_confirmed:
+        payment_amount = None
 
     if payment_amount is not None and not payment_request_token:
         raise ValueError("Missing payment request token.")
@@ -7128,6 +7137,7 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 <label>Record payment received <span style="font-weight:400;color:#98a2b3">(optional · {{ lead.value_currency }})</span></label>
 <input type="number" name="payment_amount" min="0.01" step="0.01" inputmode="decimal" placeholder="e.g. 2500">
 <input type="hidden" name="payment_request_token" value="{{ lead.payment_token }}">
+<label class="clear-follow" style="margin-top:10px"><input type="checkbox" name="payment_confirmed" value="1"> Confirm that this payment was actually received</label>
 </div>
 
 <div>
@@ -8484,6 +8494,7 @@ def admin_lead_operations(lead_id):
                 payment_reference=request.form.get("payment_reference", ""),
                 payment_note=request.form.get("payment_note", ""),
                 payment_request_token=request.form.get("payment_request_token", ""),
+                payment_confirmed=(request.form.get("payment_confirmed") == "1"),
             )
 
         # Backward-compatible handling for an already-open older dashboard page.
