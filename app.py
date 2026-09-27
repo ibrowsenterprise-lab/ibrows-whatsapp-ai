@@ -10407,7 +10407,7 @@ def admin_budget_dashboard():
 @app.route('/admin/finance/budgets/save', methods=['POST'])
 @admin_required
 def admin_budget_save():
-    require_valid_csrf()
+    validate_csrf()
     try:
         year=int(request.form.get('year')); month=int(request.form.get('month')); amount=Decimal(request.form.get('amount','0'))
         if not (2020<=year<=2100 and 1<=month<=12 and amount>0): raise ValueError()
@@ -10430,7 +10430,7 @@ def admin_budget_save():
 @app.route('/admin/finance/budgets/<int:budget_id>/delete', methods=['POST'])
 @admin_required
 def admin_budget_delete(budget_id):
-    require_valid_csrf()
+    validate_csrf()
     year=request.form.get('year'); month=request.form.get('month')
     with get_db() as conn:
         with conn.cursor() as cur: cur.execute('DELETE FROM business_expense_budgets WHERE id=%s',(budget_id,))
