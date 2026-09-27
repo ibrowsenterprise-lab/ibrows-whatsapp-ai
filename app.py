@@ -8148,6 +8148,7 @@ def admin_finance():
         finance=finance,
         periods=FINANCE_PERIODS,
         current_year=datetime.now(ADMIN_TIMEZONE).year,
+        csrf_token=get_csrf_token(),
     )
 
 
