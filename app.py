@@ -311,6 +311,30 @@ def init_database():
                 ON lead_payments(lead_id, received_at DESC)
             """)
 
+            # Keep an immutable audit snapshot whenever an administrator voids
+            # a mistaken payment. The original ledger row is then removed so all
+            # existing finance totals, reports, exports and balances stay correct.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS payment_void_audit (
+                    id BIGSERIAL PRIMARY KEY,
+                    original_payment_id BIGINT NOT NULL UNIQUE,
+                    lead_id BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+                    amount NUMERIC(14,2) NOT NULL,
+                    currency TEXT NOT NULL,
+                    payment_method TEXT NOT NULL,
+                    reference TEXT,
+                    payment_note TEXT,
+                    request_token TEXT,
+                    original_received_at TIMESTAMPTZ,
+                    void_reason TEXT NOT NULL,
+                    voided_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_payment_void_audit_lead
+                ON payment_void_audit(lead_id, voided_at DESC)
+            """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS business_expenses (
                     id BIGSERIAL PRIMARY KEY,
@@ -7452,7 +7476,7 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 .section{background:white;border-radius:13px;padding:14px;margin-top:13px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.section h2{font-size:18px;margin:0 0 11px}.note{font-size:11px;color:#98a2b3;line-height:1.4;margin-top:7px}
 .row{padding:11px 0;border-bottom:1px solid #eaecf0}.row:last-child{border-bottom:0}.row-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.name{font-weight:800;font-size:14px}.amount{font-weight:800;text-align:right}.meta{font-size:11px;color:#98a2b3;margin-top:4px;line-height:1.45}.service{font-size:12px;color:#667085;margin-top:3px}.customer-link{color:#175cd3;text-decoration:none;font-weight:700}.balance{color:#b42318}
 .method-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.method{background:#f9fafb;border-radius:10px;padding:10px}.method b{display:block;font-size:13px}.method span{font-size:12px;line-height:1.5;color:#475467}
-.month-row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #eaecf0}.month-row:last-child{border-bottom:0}.month-row b{text-align:right}
+.month-row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #eaecf0}.month-row:last-child{border-bottom:0}.month-row b{text-align:right}.void-form{margin-top:8px;display:flex;gap:7px;align-items:center;flex-wrap:wrap}.void-reason{flex:1;min-width:190px;padding:8px 9px;border:1px solid #d0d5dd;border-radius:8px;font-size:12px}.void-btn{border:1px solid #fda29b;background:#fff;color:#b42318;border-radius:8px;padding:8px 10px;font-weight:800;font-size:11px}
 @media(max-width:760px){.cards{grid-template-columns:1fr 1fr}.method-grid{grid-template-columns:1fr}.wrap{padding-left:11px;padding-right:11px}}
 </style>
 </head>
@@ -7484,6 +7508,12 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 <div class="row">
 <div class="row-head"><div><div class="name"><a class="customer-link" href="{{ url_for('admin_customer_history', customer_number=payment.customer_number, return_to=url_for('admin_finance', period=finance.period)) }}">{{ payment.customer_name }}</a></div><div class="service">{{ payment.service }} · {{ payment.method_label }}{% if payment.reference %} · Ref: {{ payment.reference }}{% endif %}</div></div><div class="amount">{{ payment.amount_label }}</div></div>
 <div class="meta">{{ payment.received_label }}</div>
+<form class="void-form" method="POST" action="{{ url_for('admin_void_payment', payment_id=payment.id) }}" onsubmit="return confirm('Void {{ payment.amount_label }} payment? This removes it from financial totals but keeps an audit record.');">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<input type="hidden" name="return_to" value="{{ url_for('admin_finance', period=finance.period) }}">
+<input class="void-reason" type="text" name="void_reason" maxlength="300" required placeholder="Reason for voiding (required)">
+<button class="void-btn" type="submit">Void payment</button>
+</form>
 </div>
 {% endfor %}
 {% else %}<div class="empty">No payments recorded in this period.</div>{% endif %}
@@ -8033,6 +8063,69 @@ def admin_finance_export_csv():
     response.headers["Cache-Control"]="no-store"
     print(f"FINANCE CSV EXPORT DOWNLOADED: files={len(files)}",flush=True)
     return response
+
+
+def void_payment_with_audit(payment_id, void_reason):
+    void_reason = " ".join(str(void_reason or "").split()).strip()[:300]
+    if not void_reason:
+        raise ValueError("Void reason is required.")
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, lead_id, amount, currency, payment_method, reference,
+                       payment_note, request_token, received_at
+                FROM lead_payments
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (payment_id,),
+            )
+            payment = cur.fetchone()
+            if not payment:
+                raise ValueError("Payment not found or already voided.")
+
+            (original_id, lead_id, amount, currency, payment_method, reference,
+             payment_note, request_token, received_at) = payment
+
+            cur.execute(
+                """
+                INSERT INTO payment_void_audit (
+                    original_payment_id, lead_id, amount, currency, payment_method,
+                    reference, payment_note, request_token, original_received_at,
+                    void_reason
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (original_id, lead_id, amount, currency, payment_method, reference,
+                 payment_note, request_token, received_at, void_reason),
+            )
+
+            # Receipt document rows point at individual payments. ON DELETE SET NULL
+            # preserves any issued document record while the mistaken ledger entry
+            # itself is removed from every finance calculation.
+            cur.execute("DELETE FROM lead_payments WHERE id = %s", (original_id,))
+            _activity_insert(
+                cur,
+                lead_id,
+                "PAYMENT_VOIDED",
+                f"Payment voided: {_format_crm_amount(amount, currency)} via "
+                f"{PAYMENT_METHODS.get(payment_method, payment_method)}. Reason: {void_reason}",
+            )
+        conn.commit()
+
+
+@app.route("/admin/finance/payments/<int:payment_id>/void", methods=["POST"])
+@admin_required
+def admin_void_payment(payment_id):
+    validate_csrf()
+    return_to = _safe_admin_return_path(request.form.get("return_to"))
+    try:
+        void_payment_with_audit(payment_id, request.form.get("void_reason", ""))
+    except (ValueError, TypeError):
+        abort(400)
+    return redirect(return_to)
 
 
 @app.route("/admin/finance", methods=["GET"])
