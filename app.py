@@ -170,8 +170,14 @@ APPLICATION_PACK_QA_MAX_REPAIR_ATTEMPTS = 1
 # These are business-approved values. Customer claims, screenshots, copied
 # transaction references, or WhatsApp messages never change ledger status.
 CAREER_SERVICE_DEFAULT_PRICES_MWK = {
+    # Canonical paid career-service labels used by the authoritative ledger
+    # context. Keep these service-specific so money recorded for one package
+    # never unlocks another package.
     "CV & Cover Letter": Decimal("5000"),
+    "Single Job Application": Decimal("2000"),
+    "Opportunity Alerts": Decimal("20000"),
     "Career Assist": Decimal("50000"),
+    "Career Assist Pro": Decimal("100000"),
     "Scholarship Search": Decimal("60000"),
 }
 
@@ -1895,11 +1901,15 @@ def handle_numbered_service_menu(customer_number, customer_name, customer_messag
                 ),
             }
         if selected == "SINGLE_APPLICATION":
+            gate_reply = single_job_application_payment_gate(customer_number, customer_name)
+            if gate_reply is not None:
+                return {"action": "REPLY", "reply": gate_reply}
             return {
                 "action": "REPLY",
                 "reply": (
-                    "Single Job Application assistance is MK2,000. Please send the vacancy advert or official link "
-                    "and tell me which role you want to apply for. Paid application work starts after the relevant payment is verified."
+                    "Your MK2,000 Single Job Application payment is verified and active. "
+                    "Please send the job advert, application link, or exact job title and employer. "
+                    "If your current CV is already on file with IBROWS, you do not need to resend it unless it has changed."
                 ),
             }
         if selected == "CAREER_ASSIST":
@@ -4171,9 +4181,20 @@ def canonicalize_service(service):
         "whatsapp ai assistant": "WhatsApp AI Assistant",
         "ai business assistant": "WhatsApp AI Assistant",
         "career assist": "Career Assist",
+        "career assist pro": "Career Assist Pro",
+        "opportunity alerts": "Opportunity Alerts",
+        "opportunity alert": "Opportunity Alerts",
+        "job alerts": "Opportunity Alerts",
+        "job alert": "Opportunity Alerts",
+        "single job application": "Single Job Application",
+        "single application": "Single Job Application",
+        "job application": "Single Job Application",
+        "application assistance": "Single Job Application",
         "scholarship search": "Scholarship Search",
         "cv and cover letter": "CV & Cover Letter",
         "cv & cover letter": "CV & Cover Letter",
+        "one-off cv + cover letter": "CV & Cover Letter",
+        "one off cv + cover letter": "CV & Cover Letter",
         "business services": "Business Services",
         "business registration": "Business Registration",
         "graphic design": "Graphic Design",
@@ -4309,6 +4330,125 @@ def build_verified_payment_context(customer_number):
     if not any_open:
         lines.append("- No open paid-career-service ledger record is currently available for this customer.")
     return [{"role": "user", "content": "\n".join(lines)}]
+
+
+def ensure_single_job_application_lead(customer_number, customer_name):
+    """Create/update the service-specific MK2,000 Single Job Application lead."""
+    required = CAREER_SERVICE_DEFAULT_PRICES_MWK["Single Job Application"]
+    lead_id, is_new = create_or_update_lead(
+        customer_number=customer_number,
+        customer_name=customer_name,
+        service="Single Job Application",
+        summary=(
+            "Customer requested one paid job application. Vacancy details and "
+            "verified service-specific payment are required before execution."
+        ),
+        handover_reason=(
+            "Single Job Application workflow: verify the MK2,000 payment and "
+            "continue once the vacancy/application details are available."
+        ),
+    )
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET estimated_value = COALESCE(estimated_value, %s),
+                    value_currency = CASE WHEN estimated_value IS NULL THEN 'MWK' ELSE value_currency END,
+                    quote_status = CASE
+                        WHEN quote_status IN ('NOT_STARTED', 'DRAFT') THEN 'ACCEPTED'
+                        ELSE quote_status
+                    END,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (required, lead_id),
+            )
+        conn.commit()
+    if is_new:
+        try:
+            send_new_lead_email(
+                lead_id=lead_id,
+                customer_name=customer_name,
+                customer_number=customer_number,
+                service="Single Job Application",
+                summary="Customer requested one paid job application; payment verification is required.",
+                handover_reason="Verify the MK2,000 Single Job Application payment and vacancy details.",
+            )
+        except Exception as notify_error:
+            print(
+                f"SINGLE JOB APPLICATION LEAD NOTIFICATION ERROR: {type(notify_error).__name__}",
+                flush=True,
+            )
+    return lead_id
+
+
+def single_job_application_payment_gate(customer_number, customer_name):
+    """Return None only when the MK2,000 Single Job Application payment is verified."""
+    required = CAREER_SERVICE_DEFAULT_PRICES_MWK["Single Job Application"]
+    state = get_verified_service_payment_state(
+        customer_number, "Single Job Application", required
+    )
+    if state["status"] == "PAID":
+        return None
+
+    # Ensure the ledger has a dedicated service lead before asking staff/customer
+    # to verify payment. This prevents a MK2,000 payment from being attached to
+    # an unrelated CV, Career Assist, or general enquiry entitlement.
+    try:
+        ensure_single_job_application_lead(customer_number, customer_name)
+        state = get_verified_service_payment_state(
+            customer_number, "Single Job Application", required
+        )
+    except Exception as gate_error:
+        print(
+            f"SINGLE JOB APPLICATION PAYMENT GATE LEAD ERROR: {type(gate_error).__name__}",
+            flush=True,
+        )
+
+    channels = approved_payment_channels_text()
+    if state["status"] == "PART_PAID":
+        balance = state["balance"] if state["balance"] is not None else required - state["paid"]
+        return (
+            f"The Single Job Application fee is MK{required:,.0f}. "
+            f"The IBROWS ledger currently shows MK{state['paid']:,.0f} verified for this service, "
+            f"with MK{balance:,.0f} remaining. Application work starts after the full "
+            "service payment is verified, unless an authorized IBROWS admin records an approved exception.\n\n"
+            "Please also send the job advert, application link, or exact job title and employer if you have not already done so.\n\n"
+            "Approved payment channels:\n" + channels +
+            "\n\nDo not send your PIN, OTP, password, or security codes."
+        )
+
+    return (
+        f"The Single Job Application fee is MK{required:,.0f}. "
+        "Application work starts only after the payment is verified in the IBROWS ledger. "
+        "A screenshot, transaction reference, or customer message by itself does not mark payment as confirmed.\n\n"
+        "Please send the job advert, application link, or exact job title and employer if you have not already done so.\n\n"
+        "Approved payment channels:\n" + channels +
+        "\n\nAfter payment, send the transaction reference or payment confirmation for IBROWS verification. "
+        "Do not send your PIN, OTP, password, or security codes."
+    )
+
+
+def detect_single_job_application_request(customer_message):
+    """Detect an explicit one-job application request without confusing it with the CV pack."""
+    text = " ".join(str(customer_message or "").lower().split())
+    if not text:
+        return False
+    if any(term in text for term in ("cv and cover letter", "cv & cover letter", "application pack")):
+        return False
+    exact_or_named = any(phrase in text for phrase in (
+        "single job application", "one job application", "job application assistance",
+        "apply for one job", "apply for this job", "apply to this job",
+        "proceed with my job application", "continue my job application",
+        "start my job application", "submit my job application",
+    ))
+    action_job = (
+        any(word in text for word in ("apply", "application", "proceed", "continue", "start", "submit"))
+        and "job" in text
+        and any(word in text for word in ("apply", "application"))
+    )
+    return exact_or_named or action_job
 
 
 def ensure_cv_package_lead(customer_number, customer_name):
@@ -10793,6 +10933,25 @@ def receive_webhook():
             print("LOCAL HUMAN HANDOVER ACTIVATED", flush=True)
             return "EVENT_RECEIVED", 200
 
+        # The MK2,000 Single Job Application has its own service-specific ledger
+        # entitlement. Gate it deterministically before the general AI so a verified
+        # payment cannot be mistaken for an unverified customer claim, and so money
+        # recorded for another package cannot unlock this service.
+        if message_type == "text" and detect_single_job_application_request(customer_message):
+            single_gate_reply = single_job_application_payment_gate(
+                customer_number=customer_number,
+                customer_name=customer_name,
+            )
+            if single_gate_reply is not None:
+                save_message(customer_number, "user", customer_message)
+                save_message(customer_number, "assistant", single_gate_reply)
+                store_pending_reply(message_id, single_gate_reply)
+                sent = send_whatsapp_message(customer_number, single_gate_reply)
+                finish_whatsapp_message(message_id, sent)
+                print("SINGLE JOB APPLICATION BLOCKED — PAYMENT NOT VERIFIED", flush=True)
+                return "EVENT_RECEIVED", 200
+            print("SINGLE JOB APPLICATION PAYMENT VERIFIED", flush=True)
+
         if message_type == "text" and (
             is_application_pack_active(customer_number)
             or detect_application_pack_request(customer_message)
@@ -11217,7 +11376,8 @@ When lead_required is true:
 
 service:
 Use ONE stable IBROWS service category. Prefer these exact labels when applicable:
-Career Assist, Scholarship Search, CV & Cover Letter, Business Registration,
+Career Assist, Career Assist Pro, Opportunity Alerts, Scholarship Search,
+CV & Cover Letter, Single Job Application, Business Registration,
 Business Services, Website Development, WhatsApp AI Assistant, Graphic Design,
 Branding, Social Media Management, Photo Restoration, Cleaning Services, Car Wash,
 Fumigation, Landscaping, Construction, Agro Services, General Enquiry.
@@ -11377,6 +11537,10 @@ PAID CAREER-SERVICE RULES:
 - Never say a refund, payment, waiver, discount, transfer, account change, or deletion was processed
   unless the system explicitly confirms it.
 - When INTERNAL VERIFIED PAYMENT STATUS is supplied, treat it as authoritative.
+- For Single Job Application, use ONLY the ledger line labelled "Single Job Application".
+  If that line is PAID, do not ask the customer to pay or say payment still needs verification.
+  Ask only for genuinely missing vacancy/application details and continue the paid workflow.
+  A CV & Cover Letter, Career Assist, Scholarship Search or other payment must never unlock it.
 
 APPROVED PAYMENT CHANNELS:
 FCB — Account 0041502003599 — IBROWS Enterprise
