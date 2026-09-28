@@ -11629,25 +11629,37 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     """
     today_label = datetime.now(ADMIN_TIMEZONE).strftime("%d %B %Y")
     request_text = str(customer_request or "")[:2600]
+    request_lower = request_text.lower()
+    broad_match_request = any(marker in request_lower for marker in (
+        "better fit", "better match", "best fit", "match my cv", "matching my cv",
+        "using my verified cv", "up to 5", "five current", "5 current",
+        "malawi first", "remote roles", "remote opportunities", "alternatives",
+    ))
     prompt = (
-        f"Today is {today_label}. Find CURRENT job vacancies for this request:\n"
+        f"Today is {today_label}. Perform a FRESH live search for CURRENT job vacancies for this request:\n"
         f"{request_text}\n\n"
-        "Search broadly across Malawi employers and reputable vacancy sources relevant to "
+        "Search broadly across multiple Malawi employers and reputable vacancy sources relevant to "
         "the requested field. Prefer original employer, government, embassy, NGO, university, "
-        "bank, telecom, technology-company and other primary vacancy pages. You may use job "
-        "boards for discovery, but verify against the original source where reasonably possible. "
-        "Return only vacancies whose current/open status is supported by live-web evidence. "
-        "Do not use or mention any vacancy from prior conversation memory. Do not invent job "
-        "titles, employers, deadlines, salaries, requirements or URLs. For each verified match, "
-        "give job title, employer, location/remote status, closing date or explicit open-until-filled "
-        "status, and a direct vacancy/application URL. If fewer than the requested number can be "
-        "verified, return the verified subset. Keep the result concise."
+        "bank, telecom, technology-company and other primary vacancy pages. Use current job boards "
+        "for discovery when useful, but verify against the original source where reasonably possible. "
+        "Freshness is mandatory: before returning each vacancy, compare any stated closing date with "
+        f"today ({today_label}) and OMIT the role if the deadline is before today. If a page has no "
+        "deadline, return it only when the live page clearly supports that applications are currently "
+        "open or the role is explicitly open until filled. Do not return a role merely because an old "
+        "vacancy page still exists in search results. Search more than one employer/source before "
+        "concluding that few matches exist. Do not use or mention any vacancy from prior conversation "
+        "memory. Do not invent job titles, employers, deadlines, salaries, requirements or URLs. "
+        "For each verified current match, give job title, employer, location/remote status, closing "
+        "date or explicit open-until-filled status, and a direct vacancy/application URL. If fewer "
+        "than the requested number can genuinely be verified after a broad search, return the verified "
+        "subset and clearly say the fresh search found fewer current matches. Keep the result concise."
     )
 
-    # Approximate location improves local-result relevance without using any precise address.
+    # Broader CV-matching searches need more retrieval context than a simple one-role lookup.
+    # This still stays bounded for the synchronous WhatsApp webhook.
     responses_tool = {
         "type": "web_search",
-        "search_context_size": "low",
+        "search_context_size": "medium" if broad_match_request else "low",
         "external_web_access": True,
     }
 
@@ -11734,9 +11746,12 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         "Do not claim a vacancy is open unless the evidence supports that status. Do not charge "
         "the customer the Single Job Application fee merely for opportunity discovery. Present "
         "verified matches with direct source/application links. If fewer than requested are "
-        "verified, give the verified subset and explain the limitation. Do not fall back to "
-        "expired roles and do not ask an active Career Assist customer to supply vacancy links "
-        "merely because one source was empty.\n\n" + summary
+        "verified, give the verified subset and explain the limitation. IMPORTANT: this context "
+        "already IS the fresh live search for the customer's current request. Never tell the "
+        "customer that a fresh live search is still needed or that you will search later. Instead "
+        "say the fresh search was completed and found only the verified current matches available "
+        "in this evidence. Do not fall back to expired roles and do not ask an active Career Assist "
+        "customer to supply vacancy links merely because one source was empty.\n\n" + summary
     )
     if sources_text:
         context_text += "\n\nSOURCE URLS FROM LIVE VACANCY SEARCH:\n" + sources_text
@@ -12583,6 +12598,10 @@ PAID CAREER-SERVICE RULES:
 - When INTERNAL ACTIVE CAREER ASSIST LIVE VACANCY SEARCH context is supplied, use it
   to answer the vacancy-search request. Prefer verified current vacancies and direct
   employer/application links. Never invent availability or present expired jobs as open.
+  That context already represents the fresh live search for this request. Do NOT say a fresh
+  search is still needed, promise to search later, or ask the customer to retry merely because
+  fewer matches were verified. State that the fresh search was completed and report the verified
+  subset actually found.
 - If the context says LIVE_SEARCH_UNAVAILABLE, do not fall back to an old ERA result,
   a previous vacancy advert, or an earlier closing date. State that the fresh live search
   could not be completed right now because the search service did not return usable current
