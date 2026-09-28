@@ -190,6 +190,12 @@ CAREER_PACKAGE_PRICES_MWK = {
     "Single Job Application": Decimal("2000"),
 }
 
+# Career Assist is a time-limited monthly entitlement. A verified payment
+# makes the service eligible for activation; the paid month starts only when an
+# authenticated IBROWS admin activates it. One activation lasts one calendar
+# month from the activation timestamp, after which that entitlement is consumed.
+CAREER_ASSIST_MONTHLY_PRICE_MWK = CAREER_SERVICE_DEFAULT_PRICES_MWK["Career Assist"]
+
 IBROWS_PAYMENT_CHANNELS = (
     ("FCB", "0041502003599", "IBROWS Enterprise"),
     ("FDH Bank", "1040000630751", "IBROWS Cleaning Service"),
@@ -358,6 +364,22 @@ def init_database():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_leads_entitlement_consumed
                 ON leads(entitlement_consumed_at)
+            """)
+
+            # Time-limited service lifecycle fields. These are nullable so older
+            # one-off services remain unaffected. Career Assist uses them for a
+            # one-month activation term and renewal enforcement.
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS service_started_at TIMESTAMPTZ
+            """)
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS service_expires_at TIMESTAMPTZ
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_leads_service_expires
+                ON leads(service_expires_at)
             """)
 
             cur.execute("""
@@ -4306,8 +4328,264 @@ def get_verified_service_payment_state(customer_number, service, fallback_requir
     }
 
 
+def expire_career_assist_entitlements(customer_number=None):
+    """Consume expired Career Assist monthly entitlements.
+
+    Expiry is enforced whenever the customer interacts, the admin dashboard is
+    opened, or the scheduled reminder task runs. Financial payment rows are kept
+    intact for audit/accounting; only the service entitlement is closed/consumed.
+    """
+    params = []
+    customer_clause = ""
+    if customer_number:
+        customer_clause = " AND customer_number = %s"
+        params.append(customer_number)
+
+    expired = []
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, customer_number, service_expires_at
+                FROM leads
+                WHERE LOWER(TRIM(COALESCE(service, ''))) = 'career assist'
+                  AND service_expires_at IS NOT NULL
+                  AND service_expires_at <= NOW()
+                  AND entitlement_consumed_at IS NULL
+                  AND merged_into_lead_id IS NULL
+                  AND privacy_deleted_at IS NULL
+                  {customer_clause}
+                FOR UPDATE
+                """,
+                tuple(params),
+            )
+            rows = cur.fetchall()
+            for lead_id, number, expires_at in rows:
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET entitlement_consumed_at = COALESCE(service_expires_at, NOW()),
+                        entitlement_consumed_reason = %s,
+                        status = 'CLOSED',
+                        handover_reason = %s,
+                        follow_up_at = NULL,
+                        follow_up_notified_at = NULL,
+                        follow_up_notification_claimed_at = NULL,
+                        follow_up_notification_error = NULL,
+                        updated_at = NOW()
+                    WHERE id = %s
+                      AND entitlement_consumed_at IS NULL
+                    """,
+                    (
+                        "Career Assist monthly entitlement consumed when its one-month service term expired.",
+                        "Career Assist term expired. A new MK50,000 payment and new activation are required for renewal.",
+                        lead_id,
+                    ),
+                )
+                if cur.rowcount == 1:
+                    cur.execute(
+                        """
+                        INSERT INTO lead_notes (lead_id, note_text)
+                        VALUES (%s, %s)
+                        """,
+                        (
+                            lead_id,
+                            "Career Assist monthly term expired. Entitlement consumed; renewal requires a new MK50,000 payment.",
+                        ),
+                    )
+                    _activity_insert(
+                        cur,
+                        lead_id,
+                        "SERVICE_EXPIRED",
+                        "Career Assist one-month entitlement expired and was consumed; renewal requires a new payment.",
+                    )
+                    expired.append((lead_id, number, expires_at))
+        conn.commit()
+
+    for lead_id, number, expires_at in expired:
+        print(
+            f"CAREER ASSIST ENTITLEMENT EXPIRED: lead={lead_id} customer={number} expires_at={expires_at}",
+            flush=True,
+        )
+    return len(expired)
+
+
+def get_career_assist_lifecycle_state(customer_number):
+    """Return authoritative Career Assist activation/expiry state."""
+    expire_career_assist_entitlements(customer_number)
+    required = CAREER_ASSIST_MONTHLY_PRICE_MWK
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    l.id, l.status, l.entitlement_consumed_at,
+                    l.service_started_at, l.service_expires_at,
+                    COALESCE(l.value_currency, 'MWK'),
+                    COALESCE((
+                        SELECT SUM(p.amount)
+                        FROM lead_payments p
+                        WHERE p.lead_id = l.id
+                          AND p.currency = 'MWK'
+                    ), 0) AS paid_total
+                FROM leads l
+                WHERE l.customer_number = %s
+                  AND LOWER(TRIM(COALESCE(l.service, ''))) = 'career assist'
+                  AND l.merged_into_lead_id IS NULL
+                  AND l.privacy_deleted_at IS NULL
+                ORDER BY l.updated_at DESC, l.id DESC
+                LIMIT 1
+                """,
+                (customer_number,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return {
+            "lead_id": None, "state": "NOT_ENROLLED", "paid": Decimal("0"),
+            "required": required, "started_at": None, "expires_at": None,
+        }
+
+    lead_id, status, consumed_at, started_at, expires_at, currency, paid_total = row
+    paid = Decimal(paid_total or 0)
+    now_utc = datetime.now(UTC_TIMEZONE)
+
+    if consumed_at is not None:
+        state = "EXPIRED" if started_at is not None else "CONSUMED"
+    elif started_at is not None and expires_at is not None and expires_at > now_utc:
+        state = "ACTIVE"
+    elif paid >= required and currency == "MWK":
+        state = "PAID_AWAITING_ACTIVATION"
+    elif paid > 0:
+        state = "PART_PAID"
+    else:
+        state = "NOT_PAID"
+
+    return {
+        "lead_id": lead_id, "state": state, "paid": paid, "required": required,
+        "started_at": started_at, "expires_at": expires_at, "status": status,
+    }
+
+
+def activate_career_assist_entitlement(lead_id):
+    """Activate one verified MK50,000 Career Assist payment for one month.
+
+    Activation is an explicit authenticated-admin action. It never happens from a
+    customer payment claim or screenshot. The term begins at activation and ends
+    one calendar month later. The same payment cannot be reactivated after expiry.
+    """
+    required = CAREER_ASSIST_MONTHLY_PRICE_MWK
+
+    # Consume any already-expired term first so an old payment cannot be revived.
+    expire_career_assist_entitlements()
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT l.customer_number, l.service, l.status,
+                       l.entitlement_consumed_at, l.service_started_at,
+                       l.service_expires_at, COALESCE(l.value_currency, 'MWK'),
+                       COALESCE((
+                           SELECT SUM(p.amount)
+                           FROM lead_payments p
+                           WHERE p.lead_id = l.id
+                             AND p.currency = 'MWK'
+                       ), 0) AS paid_total
+                FROM leads l
+                WHERE l.id = %s
+                  AND l.merged_into_lead_id IS NULL
+                  AND l.privacy_deleted_at IS NULL
+                FOR UPDATE OF l
+                """,
+                (lead_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("Career Assist lead not found.")
+
+            (customer_number, service, status, consumed_at, started_at,
+             expires_at, currency, paid_total) = row
+
+            if canonicalize_service(service) != "Career Assist":
+                raise ValueError("Lead is not a Career Assist service.")
+            if consumed_at is not None:
+                raise ValueError("This Career Assist monthly entitlement is already consumed/expired.")
+            if str(status or "").strip().upper() == "CLOSED":
+                raise ValueError("A closed Career Assist lead cannot be activated. Reopen or create a new service lead first.")
+
+            now_utc = datetime.now(UTC_TIMEZONE)
+            if started_at is not None and expires_at is not None and expires_at > now_utc:
+                return {
+                    "lead_id": lead_id, "already_active": True,
+                    "started_at": started_at, "expires_at": expires_at,
+                }
+
+            paid_total = Decimal(paid_total or 0)
+            if currency != "MWK":
+                raise ValueError("Career Assist entitlement currency is not MWK.")
+            if paid_total < required:
+                raise ValueError("Career Assist entitlement is not fully paid.")
+
+            cur.execute(
+                """
+                UPDATE leads
+                SET estimated_value = %s,
+                    value_currency = 'MWK',
+                    quote_status = 'ACCEPTED',
+                    service_started_at = NOW(),
+                    service_expires_at = NOW() + INTERVAL '1 month',
+                    status = 'CONTACTED',
+                    handover_reason = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND entitlement_consumed_at IS NULL
+                RETURNING service_started_at, service_expires_at
+                """,
+                (
+                    required,
+                    "Career Assist activated for one month. Provide search/application support within the agreed customer scope until expiry.",
+                    lead_id,
+                ),
+            )
+            activated = cur.fetchone()
+            if not activated:
+                raise ValueError("Career Assist activation could not be recorded.")
+            started_at, expires_at = activated
+
+            cur.execute(
+                """
+                INSERT INTO lead_notes (lead_id, note_text)
+                VALUES (%s, %s)
+                """,
+                (
+                    lead_id,
+                    "Admin activated Career Assist after verified MK50,000 payment. One-month service term started.",
+                ),
+            )
+            _activity_insert(
+                cur,
+                lead_id,
+                "SERVICE_ACTIVATED",
+                "Career Assist activated after verified MK50,000 payment; one-month entitlement started.",
+            )
+        conn.commit()
+
+    print(
+        f"CAREER ASSIST ACTIVATED: lead={lead_id} customer={customer_number} expires_at={expires_at}",
+        flush=True,
+    )
+    return {
+        "lead_id": lead_id, "already_active": False,
+        "started_at": started_at, "expires_at": expires_at,
+    }
+
+
 def build_verified_payment_context(customer_number):
     """Supply model-visible payment facts without exposing references or bank data."""
+    # Enforce monthly expiry before exposing payment/service state to the model.
+    expire_career_assist_entitlements(customer_number)
     lines = [
         "INTERNAL VERIFIED PAYMENT STATUS. This is authoritative business ledger context, "
         "not a customer claim. A screenshot/message/reference alone is never VERIFIED. "
@@ -4329,6 +4607,33 @@ def build_verified_payment_context(customer_number):
         )
     if not any_open:
         lines.append("- No open paid-career-service ledger record is currently available for this customer.")
+
+    career_assist = get_career_assist_lifecycle_state(customer_number)
+    ca_state = career_assist["state"]
+    if ca_state == "ACTIVE":
+        started = career_assist["started_at"].astimezone(ADMIN_TIMEZONE).strftime("%d %b %Y %H:%M")
+        expires = career_assist["expires_at"].astimezone(ADMIN_TIMEZONE).strftime("%d %b %Y %H:%M")
+        lines.append(
+            f"- Career Assist activation: ACTIVE; started {started} Malawi time; "
+            f"expires {expires} Malawi time. Do not request another payment before expiry unless the customer is purchasing a separate service."
+        )
+    elif ca_state == "PAID_AWAITING_ACTIVATION":
+        lines.append(
+            "- Career Assist activation: PAID_AWAITING_ACTIVATION. MK50,000 is verified, "
+            "but the monthly term has not started. Do not say Career Assist is active until an IBROWS admin activates it."
+        )
+    elif ca_state == "EXPIRED":
+        lines.append(
+            "- Career Assist activation: EXPIRED. The previous monthly entitlement is consumed; "
+            "a new MK50,000 service-specific payment and a new admin activation are required for renewal."
+        )
+    elif ca_state == "PART_PAID":
+        lines.append(
+            f"- Career Assist activation: PART_PAID; verified MWK {career_assist['paid']:,.0f} of MWK {career_assist['required']:,.0f}. Not active."
+        )
+    elif ca_state == "NOT_PAID":
+        lines.append("- Career Assist activation: NOT_PAID. Not active.")
+
     return [{"role": "user", "content": "\n".join(lines)}]
 
 
@@ -6736,7 +7041,9 @@ def get_all_leads():
                     created_at,
                     updated_at,
                     entitlement_consumed_at,
-                    entitlement_consumed_reason
+                    entitlement_consumed_reason,
+                    service_started_at,
+                    service_expires_at
                 FROM leads
                 WHERE merged_into_lead_id IS NULL
                   AND privacy_deleted_at IS NULL
@@ -8393,10 +8700,12 @@ def follow_up_reminder_task():
             mimetype="application/json",
         )
 
+    expired_career_assist = expire_career_assist_entitlements()
     follow_up_result = process_due_follow_up_reminders(limit=20)
     invoice_result = process_due_invoice_reminders(limit=20)
     result = {
         "ok": True,
+        "career_assist_expired": expired_career_assist,
         "follow_up": follow_up_result,
         "invoice": invoice_result,
     }
@@ -8751,6 +9060,22 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 </form>
 {% endif %}
 
+{% if lead.service == 'Career Assist' %}
+    {% if lead.career_assist_active %}
+<div class="completed-service">Career Assist ACTIVE{% if lead.service_expires_label %} · expires {{ lead.service_expires_label }}{% endif %}</div>
+    {% elif lead.entitlement_consumed_at and lead.service_started_at %}
+<div class="completed-service" style="background:#fff4e5;color:#b54708">Career Assist term expired — renewal requires a new MK50,000 payment{% if lead.service_expires_label %} · expired {{ lead.service_expires_label }}{% endif %}</div>
+    {% elif lead.can_activate_career_assist %}
+<form class="complete-service" method="POST" action="{{ url_for('admin_career_assist_activate', lead_id=lead.id) }}" onsubmit="return confirm('Activate Career Assist now? The one-month term starts immediately. After it expires, this MK50,000 entitlement cannot be reused and renewal requires a new payment.');">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<input type="hidden" name="return_to" value="{{ current_return }}">
+<button type="submit">Activate Career Assist / Start 1-Month Term</button>
+</form>
+    {% elif lead.payment_status == 'PAID' and not lead.service_started_at and not lead.entitlement_consumed_at %}
+<div class="completed-service" style="background:#fffaeb;color:#b54708">Career Assist payment verified — awaiting admin activation</div>
+    {% endif %}
+{% endif %}
+
 <details class="manage">
 <summary>Manage lead</summary>
 <form class="manage-grid" method="POST" action="{{ url_for('admin_lead_operations', lead_id=lead.id) }}">
@@ -8876,6 +9201,8 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 @app.route("/admin/leads", methods=["GET"])
 @admin_required
 def admin_leads():
+    # Keep monthly entitlements current even if the scheduled task has not run yet.
+    expire_career_assist_entitlements()
     rows = get_all_leads()
     all_leads = []
     for row in rows:
@@ -8898,6 +9225,8 @@ def admin_leads():
             "updated_at": row[15],
             "entitlement_consumed_at": row[16],
             "entitlement_consumed_reason": row[17] or "",
+            "service_started_at": row[18],
+            "service_expires_at": row[19],
         })
 
     paused_customers = get_paused_customers()
@@ -8970,6 +9299,46 @@ def admin_leads():
                 f"paid={lead.get('paid_total')} payment_status={lead.get('payment_status')} "
                 f"consumed={bool(lead.get('entitlement_consumed_at'))} "
                 f"completion_eligible={lead['can_complete_single_job_application']}",
+                flush=True,
+            )
+
+        # Career Assist monthly lifecycle is also computed server-side from the
+        # verified ledger total. Payment alone makes it eligible; only an admin
+        # activation starts the one-month term.
+        service_started_at = lead.get("service_started_at")
+        service_expires_at = lead.get("service_expires_at")
+        now_for_service = datetime.now(UTC_TIMEZONE)
+        lead["career_assist_active"] = bool(
+            canonicalize_service(lead.get("service")) == "Career Assist"
+            and lead.get("entitlement_consumed_at") is None
+            and service_started_at is not None
+            and service_expires_at is not None
+            and service_expires_at > now_for_service
+        )
+        lead["can_activate_career_assist"] = bool(
+            canonicalize_service(lead.get("service")) == "Career Assist"
+            and lead.get("entitlement_consumed_at") is None
+            and service_started_at is None
+            and str(lead.get("status") or "").strip().upper() != "CLOSED"
+            and str(lead.get("value_currency") or "MWK").strip().upper() == "MWK"
+            and Decimal(lead.get("paid_total") or 0) >= Decimal(CAREER_ASSIST_MONTHLY_PRICE_MWK)
+        )
+        lead["service_started_label"] = (
+            service_started_at.astimezone(ADMIN_TIMEZONE).strftime("%d %b %Y at %H:%M")
+            if service_started_at else ""
+        )
+        lead["service_expires_label"] = (
+            service_expires_at.astimezone(ADMIN_TIMEZONE).strftime("%d %b %Y at %H:%M")
+            if service_expires_at else ""
+        )
+        if canonicalize_service(lead.get("service")) == "Career Assist":
+            print(
+                "CAREER ASSIST ADMIN STATE: "
+                f"lead={lead['id']} status={lead.get('status')} paid={lead.get('paid_total')} "
+                f"consumed={bool(lead.get('entitlement_consumed_at'))} "
+                f"started={bool(service_started_at)} active={lead['career_assist_active']} "
+                f"activation_eligible={lead['can_activate_career_assist']} "
+                f"expires_at={service_expires_at}",
                 flush=True,
             )
 
@@ -10301,6 +10670,18 @@ def admin_single_job_application_complete(lead_id):
     return_to = _safe_admin_return_path(request.form.get("return_to"))
     try:
         complete_single_job_application_entitlement(lead_id)
+    except (ValueError, TypeError):
+        abort(400)
+    return redirect(return_to)
+
+
+@app.route("/admin/leads/<int:lead_id>/career-assist/activate", methods=["POST"])
+@admin_required
+def admin_career_assist_activate(lead_id):
+    validate_csrf()
+    return_to = _safe_admin_return_path(request.form.get("return_to"))
+    try:
+        activate_career_assist_entitlement(lead_id)
     except (ValueError, TypeError):
         abort(400)
     return redirect(return_to)
