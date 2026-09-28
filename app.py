@@ -291,6 +291,18 @@ def init_database():
                 ADD COLUMN IF NOT EXISTS merged_at TIMESTAMPTZ
             """)
 
+            # Privacy deletion must not destroy bookkeeping records. Financially
+            # relevant leads are anonymized and hidden from the operational CRM
+            # instead of being physically deleted.
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS privacy_deleted_at TIMESTAMPTZ
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_leads_privacy_deleted
+                ON leads(privacy_deleted_at)
+            """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS lead_payments (
                     id BIGSERIAL PRIMARY KEY,
@@ -608,8 +620,24 @@ def cleanup_expired_data(force=False):
                             (CONVERSATION_RETENTION_DAYS,))
                 cur.execute("DELETE FROM processed_whatsapp_messages WHERE updated_at < NOW() - (%s * INTERVAL '1 day')",
                             (WHATSAPP_RETRY_RETENTION_DAYS,))
-                cur.execute("DELETE FROM leads WHERE updated_at < NOW() - (%s * INTERVAL '1 day')",
-                            (LEAD_RETENTION_DAYS,))
+                # Expired operational leads can be removed, but never cascade-delete
+                # payments, void-audit rows, invoices or other commercial records.
+                cur.execute("""
+                    DELETE FROM leads l
+                    WHERE l.updated_at < NOW() - (%s * INTERVAL '1 day')
+                      AND l.privacy_deleted_at IS NULL
+                      AND l.estimated_value IS NULL
+                      AND COALESCE(l.quote_status, 'NOT_STARTED') = 'NOT_STARTED'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM lead_payments p WHERE p.lead_id = l.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM payment_void_audit v WHERE v.lead_id = l.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM business_documents d WHERE d.lead_id = l.id
+                      )
+                """, (LEAD_RETENTION_DAYS,))
                 cur.execute("""
                     DELETE FROM ai_takeover_state a
                     WHERE NOT EXISTS (SELECT 1 FROM leads l WHERE l.customer_number=a.customer_number)
@@ -631,17 +659,122 @@ def cleanup_expired_data(force=False):
 
 
 def delete_customer_data(customer_number):
+    """Delete customer-facing personal data without destroying finance history.
+
+    Operational records with no commercial/accounting significance are removed.
+    Leads linked to payments, void-audit entries, business documents, quoted work
+    or an estimated value are retained only as anonymized accounting records.
+    """
+    customer_number = str(customer_number or "").strip()
+    if not customer_number:
+        raise ValueError("Customer number is required.")
+
+    anonymous_customer_number = f"PRIVACY-{secrets.token_hex(8)}"
+
     with get_db() as conn:
         with conn.cursor() as cur:
+            # Lock all lead rows for this customer so the deletion/anonymization
+            # is one atomic operation.
+            cur.execute(
+                """
+                SELECT id
+                FROM leads
+                WHERE customer_number = %s
+                FOR UPDATE
+                """,
+                (customer_number,),
+            )
+            lead_ids = [row[0] for row in cur.fetchall()]
+
+            protected_ids = []
+            if lead_ids:
+                cur.execute(
+                    """
+                    SELECT l.id
+                    FROM leads l
+                    WHERE l.id = ANY(%s)
+                      AND (
+                            l.estimated_value IS NOT NULL
+                         OR COALESCE(l.quote_status, 'NOT_STARTED') <> 'NOT_STARTED'
+                         OR EXISTS (SELECT 1 FROM lead_payments p WHERE p.lead_id = l.id)
+                         OR EXISTS (SELECT 1 FROM payment_void_audit v WHERE v.lead_id = l.id)
+                         OR EXISTS (SELECT 1 FROM business_documents d WHERE d.lead_id = l.id)
+                      )
+                    """,
+                    (lead_ids,),
+                )
+                protected_ids = [row[0] for row in cur.fetchall()]
+
+                # Notes, activity logs and pending notifications are operational
+                # customer data and are not needed for the accounting audit trail.
+                cur.execute("DELETE FROM lead_notification_status WHERE lead_id = ANY(%s)", (lead_ids,))
+                cur.execute("DELETE FROM lead_notes WHERE lead_id = ANY(%s)", (lead_ids,))
+                cur.execute("DELETE FROM lead_activity WHERE lead_id = ANY(%s)", (lead_ids,))
+
+            if protected_ids:
+                # Free-text payment notes/request tokens are not required for the
+                # retained financial totals. Keep amount/method/reference/date.
+                cur.execute(
+                    """
+                    UPDATE lead_payments
+                    SET payment_note = NULL,
+                        request_token = NULL
+                    WHERE lead_id = ANY(%s)
+                    """,
+                    (protected_ids,),
+                )
+                cur.execute(
+                    """
+                    UPDATE payment_void_audit
+                    SET payment_note = NULL,
+                        request_token = NULL
+                    WHERE lead_id = ANY(%s)
+                    """,
+                    (protected_ids,),
+                )
+
+                # Keep one anonymous token across this customer's retained rows so
+                # customer counts remain internally consistent without keeping the
+                # original WhatsApp number or name.
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET customer_number = %s,
+                        customer_name = 'Deleted customer',
+                        summary = 'Customer personal data deleted; anonymized financial record retained.',
+                        handover_reason = NULL,
+                        status = 'CLOSED',
+                        priority = 'NORMAL',
+                        follow_up_at = NULL,
+                        follow_up_notified_at = NULL,
+                        follow_up_notification_claimed_at = NULL,
+                        follow_up_notification_error = NULL,
+                        privacy_deleted_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = ANY(%s)
+                    """,
+                    (anonymous_customer_number, protected_ids),
+                )
+
+            if lead_ids:
+                unprotected_ids = [lead_id for lead_id in lead_ids if lead_id not in set(protected_ids)]
+                if unprotected_ids:
+                    cur.execute("DELETE FROM leads WHERE id = ANY(%s)", (unprotected_ids,))
+
+            # Customer-facing conversational and AI memory/state is deleted fully.
             cur.execute("DELETE FROM conversations WHERE customer_number=%s", (customer_number,))
             cur.execute("DELETE FROM attachment_memories WHERE customer_number=%s", (customer_number,))
             cur.execute("DELETE FROM processed_whatsapp_messages WHERE customer_number=%s", (customer_number,))
-            cur.execute("DELETE FROM leads WHERE customer_number=%s", (customer_number,))
             cur.execute("DELETE FROM ai_takeover_state WHERE customer_number=%s", (customer_number,))
             cur.execute("DELETE FROM application_pack_state WHERE customer_number=%s", (customer_number,))
             cur.execute("DELETE FROM application_evidence_corrections WHERE customer_number=%s", (customer_number,))
+
         conn.commit()
-    print("CUSTOMER DATA DELETION COMPLETED", flush=True)
+
+    print(
+        f"CUSTOMER DATA DELETION COMPLETED: anonymized_financial_leads={len(protected_ids)}",
+        flush=True,
+    )
 
 
 
@@ -3157,6 +3290,7 @@ def get_latest_open_lead_service(customer_number):
                 WHERE customer_number = %s
                   AND status IN ('NEW', 'CONTACTED')
                   AND merged_into_lead_id IS NULL
+                  AND privacy_deleted_at IS NULL
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT 1
                 """,
@@ -3188,6 +3322,7 @@ def create_or_update_lead(
                 WHERE customer_number = %s
                   AND status IN ('NEW', 'CONTACTED')
                   AND merged_into_lead_id IS NULL
+                  AND privacy_deleted_at IS NULL
                 ORDER BY updated_at DESC, created_at DESC
                 """,
                 (customer_number,)
@@ -3412,6 +3547,7 @@ def claim_due_follow_up_reminders(limit=20):
                     follow_up_at
                 FROM leads
                 WHERE status <> 'CLOSED'
+                  AND privacy_deleted_at IS NULL
                   AND follow_up_at IS NOT NULL
                   AND follow_up_at <= NOW()
                   AND follow_up_notified_at IS NULL
@@ -5149,6 +5285,7 @@ def get_all_leads():
                     updated_at
                 FROM leads
                 WHERE merged_into_lead_id IS NULL
+                  AND privacy_deleted_at IS NULL
                 ORDER BY
                     CASE
                         WHEN status <> 'CLOSED'
@@ -5181,6 +5318,7 @@ def get_lead_counts():
                 SELECT status, COUNT(*)
                 FROM leads
                 WHERE merged_into_lead_id IS NULL
+                  AND privacy_deleted_at IS NULL
                 GROUP BY status
             """)
             for status, count in cur.fetchall():
@@ -8727,10 +8865,10 @@ CUSTOMER_PRIVACY_TEMPLATE = """
 </head><body><div class="wrap"><div class="card">
 <h1>Customer Data & Privacy</h1><p><strong>+{{ customer_number }}</strong></p>
 <p class="small">Use this only after IBROWS has reasonably verified that the customer is requesting deletion.</p>
-<div class="warning"><strong>Permanent action:</strong> deletes this customer's conversations, attachment summaries, leads, retry records, linked lead-notification records and AI takeover state. It cannot be undone from the dashboard.</div>
+<div class="warning"><strong>Permanent privacy action:</strong> deletes the customer's conversations, attachment/CV memories, retry records, internal CRM notes, reminder state and AI takeover/application state. Leads with no financial significance are deleted. Payments, void-audit records, quotations/invoices and other financially relevant records are <strong>not destroyed</strong>; their customer name/number is anonymized and the retained lead is hidden from the operational CRM so bookkeeping remains auditable. This cannot be undone from the dashboard.</div>
 <form method="POST"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <label>Type DELETE to confirm</label><input name="confirmation" autocomplete="off" required>
-<button type="submit">Permanently Delete Customer Data</button></form>
+<button type="submit">Delete Personal Data &amp; Anonymize Finance Records</button></form>
 <a class="back" href="{{ url_for('admin_leads') }}">Cancel</a>
 </div></div></body></html>
 """
