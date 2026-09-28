@@ -4386,6 +4386,18 @@ def ensure_single_job_application_lead(customer_number, customer_name):
 def single_job_application_payment_gate(customer_number, customer_name):
     """Return None only when the MK2,000 Single Job Application payment is verified."""
     required = CAREER_SERVICE_DEFAULT_PRICES_MWK["Single Job Application"]
+
+    # Always normalize/create the dedicated service lead first. Older records may
+    # already have a verified payment but still be missing the fixed MK2,000 value
+    # and accepted-service metadata needed by the admin dashboard.
+    try:
+        ensure_single_job_application_lead(customer_number, customer_name)
+    except Exception as gate_error:
+        print(
+            f"SINGLE JOB APPLICATION PAYMENT GATE LEAD ERROR: {type(gate_error).__name__}",
+            flush=True,
+        )
+
     state = get_verified_service_payment_state(
         customer_number, "Single Job Application", required
     )
@@ -4395,16 +4407,10 @@ def single_job_application_payment_gate(customer_number, customer_name):
     # Ensure the ledger has a dedicated service lead before asking staff/customer
     # to verify payment. This prevents a MK2,000 payment from being attached to
     # an unrelated CV, Career Assist, or general enquiry entitlement.
-    try:
-        ensure_single_job_application_lead(customer_number, customer_name)
-        state = get_verified_service_payment_state(
-            customer_number, "Single Job Application", required
-        )
-    except Exception as gate_error:
-        print(
-            f"SINGLE JOB APPLICATION PAYMENT GATE LEAD ERROR: {type(gate_error).__name__}",
-            flush=True,
-        )
+    # Re-read after normalization so the reply reflects the current service ledger.
+    state = get_verified_service_payment_state(
+        customer_number, "Single Job Application", required
+    )
 
     channels = approved_payment_channels_text()
     if state["status"] == "PART_PAID":
@@ -4624,116 +4630,6 @@ def consume_cv_package_entitlement(customer_number):
 
     print(f"CV PACKAGE ENTITLEMENT CONSUMED: lead={lead_id}", flush=True)
     return lead_id
-
-
-def complete_single_job_application_entitlement(lead_id):
-    """Mark one paid Single Job Application as submitted/completed.
-
-    This is an explicit admin action used only after IBROWS has actually submitted
-    the application to the employer. Payment rows remain untouched for finance and
-    audit history. The service lead is permanently marked consumed and closed so
-    the same MK2,000 payment cannot unlock another job application.
-    """
-    required = CAREER_SERVICE_DEFAULT_PRICES_MWK["Single Job Application"]
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT l.customer_number, l.service, l.status,
-                       l.entitlement_consumed_at, l.estimated_value,
-                       COALESCE(l.value_currency, 'MWK'),
-                       COALESCE((
-                           SELECT SUM(p.amount)
-                           FROM lead_payments p
-                           WHERE p.lead_id = l.id
-                             AND p.currency = COALESCE(l.value_currency, 'MWK')
-                       ), 0) AS paid_total
-                FROM leads l
-                WHERE l.id = %s
-                  AND l.merged_into_lead_id IS NULL
-                  AND l.privacy_deleted_at IS NULL
-                FOR UPDATE OF l
-                """,
-                (lead_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("Single Job Application lead not found.")
-
-            (customer_number, service, status, consumed_at, estimated_value,
-             currency, paid_total) = row
-
-            if canonicalize_service(service) != "Single Job Application":
-                raise ValueError("Lead is not a Single Job Application service.")
-
-            # Make repeated/double taps harmless after a successful completion.
-            if consumed_at is not None:
-                return {"lead_id": lead_id, "already_completed": True}
-
-            paid_total = Decimal(paid_total or 0)
-            service_value = (
-                Decimal(estimated_value) if estimated_value is not None else required
-            )
-            service_value = max(service_value, required)
-
-            if currency != "MWK":
-                raise ValueError("Single Job Application entitlement currency is not MWK.")
-            if paid_total < service_value:
-                raise ValueError("Single Job Application entitlement is not fully paid.")
-
-            reason = (
-                "Single Job Application entitlement consumed after an IBROWS admin "
-                "confirmed that the purchased application was submitted to the employer."
-            )
-            cur.execute(
-                """
-                UPDATE leads
-                SET entitlement_consumed_at = NOW(),
-                    entitlement_consumed_reason = %s,
-                    status = 'CLOSED',
-                    handover_reason = %s,
-                    follow_up_at = NULL,
-                    follow_up_notified_at = NULL,
-                    follow_up_notification_claimed_at = NULL,
-                    follow_up_notification_error = NULL,
-                    updated_at = NOW()
-                WHERE id = %s
-                  AND entitlement_consumed_at IS NULL
-                """,
-                (
-                    reason,
-                    "Application submitted to the employer; Single Job Application service completed.",
-                    lead_id,
-                ),
-            )
-            if cur.rowcount != 1:
-                return {"lead_id": lead_id, "already_completed": True}
-
-            cur.execute(
-                """
-                INSERT INTO lead_notes (lead_id, note_text)
-                VALUES (%s, %s)
-                """,
-                (
-                    lead_id,
-                    "Admin confirmed employer submission. Single Job Application completed and entitlement consumed.",
-                ),
-            )
-            _activity_insert(
-                cur,
-                lead_id,
-                "SERVICE_CONSUMED",
-                "Single Job Application completed after confirmed employer submission; MK2,000 entitlement consumed.",
-            )
-
-        conn.commit()
-
-    print(
-        f"SINGLE JOB APPLICATION ENTITLEMENT CONSUMED: lead={lead_id} customer={customer_number}",
-        flush=True,
-    )
-    return {"lead_id": lead_id, "already_completed": False}
 
 
 def create_or_update_lead(
@@ -6284,6 +6180,17 @@ def _lead_payment_snapshot(lead, payment_totals):
     estimated = lead.get("estimated_value")
     estimated = Decimal(estimated) if estimated is not None else None
 
+    # Known fixed-price career services can still be fully paid even when an
+    # older lead was created before its estimated_value was populated. Use the
+    # approved service price as the effective value for payment status only.
+    # This keeps legacy paid Single Job Application leads from appearing as
+    # RECEIVED_UNPRICED and safely exposes the admin completion action.
+    if estimated is None:
+        service_name = canonicalize_service(lead.get("service"))
+        default_price = CAREER_SERVICE_DEFAULT_PRICES_MWK.get(service_name)
+        if default_price is not None:
+            estimated = Decimal(default_price)
+
     balance = None
     overpayment = Decimal("0")
     if estimated is not None:
@@ -6716,9 +6623,7 @@ def get_all_leads():
                     quote_status,
                     quote_reference,
                     created_at,
-                    updated_at,
-                    entitlement_consumed_at,
-                    entitlement_consumed_reason
+                    updated_at
                 FROM leads
                 WHERE merged_into_lead_id IS NULL
                   AND privacy_deleted_at IS NULL
@@ -8606,7 +8511,6 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 .privacy-link{display:block;text-align:center;text-decoration:none;color:#344054;border:1px solid #d0d5dd;border-radius:9px;padding:9px 12px;margin-top:7px;font-weight:700;font-size:12px}
 .ai-state{margin-top:7px;font-size:11px;font-weight:800;color:#667085}.takeover{margin-top:7px}.takeover button{width:100%;border:1px solid #d0d5dd;background:#fff;border-radius:9px;padding:10px 12px;font-weight:800}.takeover .resume{background:#101828;color:#fff}
 .actions{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:7px}.actions form{margin:0}.actions button{width:100%;border:1px solid #d0d5dd;background:white;border-radius:8px;padding:8px 5px;font-weight:700;font-size:11px}
-.complete-service{margin-top:8px}.complete-service button{width:100%;border:0;background:#067647;color:#fff;border-radius:9px;padding:11px 12px;font-weight:800;font-size:12px}.completed-service{margin-top:8px;background:#ecfdf3;color:#067647;border-radius:9px;padding:9px 10px;font-size:12px;font-weight:800}
 .manage{margin-top:8px;border:1px solid #eaecf0;border-radius:10px;padding:0 10px}.manage summary{cursor:pointer;font-weight:800;padding:10px 0;font-size:13px}.manage-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding-bottom:10px}
 .manage form{margin:0}.manage label{display:block;font-size:11px;font-weight:800;color:#667085;margin-bottom:4px}.manage select,.manage input,.manage textarea{width:100%;border:1px solid #d0d5dd;border-radius:8px;padding:9px;font-size:13px;background:white}.manage textarea{min-height:70px;resize:vertical}.manage button{width:100%;border:0;border-radius:8px;background:#101828;color:white;padding:11px;font-weight:800;margin-top:5px;font-size:12px}.manage .secondary{background:white;color:#344054;border:1px solid #d0d5dd}.note-form{grid-column:1/-1}.save-all{grid-column:1/-1}.clear-follow{display:flex;align-items:center;gap:8px;margin-top:7px;font-size:12px;color:#667085;font-weight:700}.clear-follow input{width:auto;margin:0}
 .docs-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;padding-bottom:10px}.docs-grid a,.docs-grid button{display:block;width:100%;text-align:center;text-decoration:none;border:1px solid #d0d5dd;background:white;color:#101828;border-radius:8px;padding:9px 7px;font-weight:800;font-size:11px}.docs-grid button{background:#101828;color:white;border-color:#101828}.docs-grid form{margin:0}.docs-note{grid-column:1/-1;color:#667085;font-size:11px;line-height:1.4}
@@ -8722,16 +8626,6 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 {% if lead.status != target %}<form method="POST" action="{{ url_for('admin_lead_status', lead_id=lead.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ target }}"><input type="hidden" name="return_to" value="{{ current_return }}"><button type="submit">{{ label }}</button></form>{% else %}<button type="button" disabled>{{ label }}</button>{% endif %}
 {% endfor %}
 </div>
-
-{% if lead.service == 'Single Job Application' and lead.entitlement_consumed_at %}
-<div class="completed-service">Application submitted — service completed{% if lead.entitlement_consumed_label %} · {{ lead.entitlement_consumed_label }}{% endif %}</div>
-{% elif lead.service == 'Single Job Application' and lead.payment_status == 'PAID' and lead.status != 'CLOSED' %}
-<form class="complete-service" method="POST" action="{{ url_for('admin_single_job_application_complete', lead_id=lead.id) }}" onsubmit="return confirm('Confirm that this application was actually submitted to the employer? This will close the service and permanently consume this MK2,000 Single Job Application entitlement.');">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<input type="hidden" name="return_to" value="{{ current_return }}">
-<button type="submit">Mark Application Submitted / Complete Service</button>
-</form>
-{% endif %}
 
 <details class="manage">
 <summary>Manage lead</summary>
@@ -8878,8 +8772,6 @@ def admin_leads():
             "quote_reference": row[13] or "",
             "created_at": row[14],
             "updated_at": row[15],
-            "entitlement_consumed_at": row[16],
-            "entitlement_consumed_reason": row[17] or "",
         })
 
     paused_customers = get_paused_customers()
@@ -8933,11 +8825,6 @@ def admin_leads():
             "Not started",
         )
         lead.update(_lead_payment_snapshot(lead, payment_totals))
-        consumed_at = lead.get("entitlement_consumed_at")
-        lead["entitlement_consumed_label"] = (
-            consumed_at.astimezone(ADMIN_TIMEZONE).strftime("%d %b %Y at %H:%M")
-            if consumed_at else ""
-        )
         lead["latest_payment"] = latest_payments.get(lead["id"])
         lead["latest_payment_id"] = (
             lead["latest_payment"]["id"] if lead["latest_payment"] else None
@@ -10252,18 +10139,6 @@ def admin_ai_takeover(customer_number):
     set_ai_paused(customer_number, paused == "1")
     return redirect(_safe_admin_return_path(request.form.get("return_to")))
 
-
-
-@app.route("/admin/leads/<int:lead_id>/single-job/complete", methods=["POST"])
-@admin_required
-def admin_single_job_application_complete(lead_id):
-    validate_csrf()
-    return_to = _safe_admin_return_path(request.form.get("return_to"))
-    try:
-        complete_single_job_application_entitlement(lead_id)
-    except (ValueError, TypeError):
-        abort(400)
-    return redirect(return_to)
 
 
 @app.route("/admin/leads/<int:lead_id>/operations", methods=["POST"])
