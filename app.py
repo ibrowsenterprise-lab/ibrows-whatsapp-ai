@@ -1033,53 +1033,85 @@ def get_recent_attachment_memories(customer_number, limit=4):
 
 
 def build_attachment_memory_context(customer_number):
+    """Build same-customer source context for ordinary WhatsApp replies.
+
+    Career conversations need more than a yes/no marker that a CV exists. Preserve several
+    candidate-document memories so education, named technologies, employment dates and
+    projects do not disappear just because a newer tailored CV summary was shorter. Recent
+    non-CV sources are still included for continuity.
     """
-    Build compact same-customer source context for ordinary WhatsApp replies.
+    recent = get_recent_attachment_memories(customer_number, limit=4)
+    wider = get_application_attachment_memories(customer_number, limit=30)
 
-    Keep the newest source memories, but also pin the newest candidate CV/resume
-    memory into context when one exists. This prevents a valid CV from falling
-    out of the short recent-memory window after several vacancy/web lookups.
-    """
-    memories = get_recent_attachment_memories(customer_number, limit=4)
+    # Candidate rows are returned newest-first. Keep several distinct CV/resume memories;
+    # an older candidate document may add a non-conflicting fact omitted from a newer summary.
+    candidate_rows = []
+    candidate_seen = set()
+    for row in wider:
+        if not _looks_like_candidate_cv_memory(*row):
+            continue
+        key = tuple(str(x or "").strip() for x in row)
+        if key in candidate_seen:
+            continue
+        candidate_seen.add(key)
+        candidate_rows.append(row)
+        if len(candidate_rows) >= 5:
+            break
 
-    # The application-pack workflow already searches a wider evidence window.
-    # Ordinary chat should also remember that a CV is on file, without loading
-    # every old attachment into the prompt. Pin only the newest CV memory.
-    has_cv = any(_looks_like_candidate_cv_memory(*row) for row in memories)
-    if not has_cv:
-        for row in get_application_attachment_memories(customer_number, limit=30):
-            if _looks_like_candidate_cv_memory(*row):
-                if row not in memories:
-                    memories.insert(0, row)
-                break
+    # Keep a small amount of recent non-CV context as well. Do not let webpage/vacancy
+    # summaries crowd candidate evidence out of the prompt.
+    other_rows = []
+    other_seen = set()
+    for row in recent:
+        if _looks_like_candidate_cv_memory(*row):
+            continue
+        key = tuple(str(x or "").strip() for x in row)
+        if key in other_seen:
+            continue
+        other_seen.add(key)
+        other_rows.append(row)
+        if len(other_rows) >= 3:
+            break
 
+    memories = candidate_rows + other_rows
     if not memories:
         return []
 
     sections = []
-    cv_on_file = False
-    for source_type, source_name, memory_text in memories:
+    for index, (source_type, source_name, memory_text) in enumerate(memories, start=1):
         is_cv = _looks_like_candidate_cv_memory(source_type, source_name, memory_text)
         if is_cv:
-            cv_on_file = True
-            label = "CV / CANDIDATE DOCUMENT ON FILE"
+            label = (
+                "CV / CANDIDATE DOCUMENT ON FILE — NEWEST CANDIDATE MEMORY"
+                if index == 1 else
+                "CV / CANDIDATE DOCUMENT ON FILE — EARLIER CANDIDATE MEMORY"
+            )
+            body = str(memory_text or "").strip()[:6000]
         else:
             label = "EARLIER CUSTOMER SOURCE"
+            body = str(memory_text or "").strip()[:3000]
         sections.append(
             f"[{label}]\n"
             f"Source: {source_name or 'customer source'} ({source_type})\n"
-            f"{memory_text}"
+            f"{body}"
         )
 
-    cv_rule = (
-        " A CV / CANDIDATE DOCUMENT ON FILE section is present. Treat that CV as "
-        "already supplied by this same customer. For CV, cover-letter, job-application, "
-        "or vacancy enquiries, do NOT ask the customer to resend the whole CV merely "
-        "because it is absent from recent chat turns. Ask only for the target job advert, "
-        "job title, or a specific genuinely missing/ambiguous fact. If the customer says "
-        "their CV has changed, then ask for the updated version."
-        if cv_on_file else ""
-    )
+    cv_rule = ""
+    if candidate_rows:
+        cv_rule = (
+            " CV / CANDIDATE DOCUMENT ON FILE sections are present. Treat the CV as already "
+            "supplied by this same customer. Before saying an education, experience or skill "
+            "fact is unclear, check ALL candidate-document sections. The newest candidate "
+            "memory controls any direct conflict; earlier candidate memories may add missing, "
+            "non-conflicting facts. Never convert a vacancy requirement into a candidate fact. "
+            "For CV, cover-letter, job-application, eligibility-screening or vacancy enquiries, "
+            "do NOT ask the customer to resend the whole CV merely because it is absent from "
+            "recent chat turns. Ask only for a genuinely absent or ambiguous fact."
+        )
+        print(
+            f"CANDIDATE CV EVIDENCE CONTEXT INCLUDED: memories={len(candidate_rows)}",
+            flush=True,
+        )
 
     return [{
         "role": "user",
@@ -1093,6 +1125,65 @@ def build_attachment_memory_context(customer_number):
             + "\n\n---\n\n".join(sections)
         )
     }]
+
+
+def build_candidate_cv_evidence_context(customer_number, limit=6):
+    """Return candidate-only evidence for qualification/eligibility screening.
+
+    This deliberately excludes vacancy/public-source memories so employer requirements can never
+    be mistaken for the customer's own qualifications. Multiple CV memories are used because a
+    later tailored-CV summary can be narrower than the customer's original/master CV.
+    """
+    rows = []
+    seen = set()
+    for row in get_application_attachment_memories(customer_number, limit=30):
+        if not _looks_like_candidate_cv_memory(*row):
+            continue
+        key = tuple(str(x or "").strip() for x in row)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+        if len(rows) >= max(1, int(limit)):
+            break
+    if not rows:
+        return []
+
+    sections = []
+    for idx, (source_type, source_name, memory_text) in enumerate(rows, start=1):
+        freshness = "NEWEST" if idx == 1 else f"EARLIER {idx-1}"
+        sections.append(
+            f"[CANDIDATE CV EVIDENCE — {freshness}]\n"
+            f"Source: {source_name or 'candidate document'} ({source_type})\n"
+            f"{str(memory_text or '').strip()[:6000]}"
+        )
+    print(f"ELIGIBILITY CV EVIDENCE LOADED: memories={len(rows)}", flush=True)
+    return [{
+        "role": "user",
+        "content": (
+            "INTERNAL CANDIDATE-ONLY EVIDENCE FOR ELIGIBILITY SCREENING. These factual "
+            "summaries come from CV/resume documents previously supplied by this same customer. "
+            "Review every section before calling a candidate fact unclear. Newest evidence wins "
+            "only when there is a direct conflict; otherwise older sections may supply omitted, "
+            "non-conflicting facts. Do not infer a technology from a related technology (for "
+            "example C# does not by itself prove .NET, and generic web technologies do not prove "
+            "React/Next.js). Do not invent years of software-development experience from general "
+            "IT tenure.\n\n" + "\n\n---\n\n".join(sections)
+        )
+    }]
+
+
+def detect_candidate_eligibility_request(customer_message):
+    text = " ".join(str(customer_message or "").lower().split())
+    if not text:
+        return False
+    markers = (
+        "do i qualify", "am i qualified", "qualify for", "eligible for", "eligibility",
+        "assess whether i", "assess if i", "assess my cv", "compare my cv", "match my cv",
+        "requirements i meet", "requirements do i meet", "which requirements", "meet the requirements",
+        "do not meet", "gaps in my cv", "qualification decision",
+    )
+    return any(marker in text for marker in markers)
 
 
 # Application-pack retrieval deliberately uses a wider evidence window than the
@@ -1115,20 +1206,49 @@ def get_application_attachment_memories(customer_number, limit=30):
 
 
 def _looks_like_candidate_cv_memory(source_type, source_name, memory_text):
-    haystack = " ".join((
-        str(source_type or ""), str(source_name or ""), str(memory_text or "")
-    )).lower()
-    strong_terms = (
-        " curriculum vitae", "curriculum vitae ", " resume", "resume ",
-        " cv ", "candidate cv", "professional experience", "employment history",
-        "work experience", "education", "qualification", "skills"
-    )
+    """Classify candidate CV/resume memories without mistaking vacancy requirements for CV facts."""
+    source_type_l = str(source_type or "").lower()
     filename = str(source_name or "").lower()
-    return (
-        any(term in f" {haystack} " for term in strong_terms)
-        or filename.endswith(("cv.pdf", "cv.doc", "cv.docx"))
+    content = str(memory_text or "").lower()
+    haystack = f" {filename} {content} "
+
+    # A fetched vacancy webpage can contain education, skills and experience requirements;
+    # those must never become candidate evidence merely because they resemble CV headings.
+    if "webpage" in source_type_l:
+        return False
+
+    explicit_filename = (
+        filename.endswith(("cv.pdf", "cv.doc", "cv.docx", "resume.pdf", "resume.doc", "resume.docx"))
         or "_cv" in filename or "cv_" in filename
+        or "resume" in filename or "curriculum_vitae" in filename
+        or "curriculum vitae" in filename
     )
+    if explicit_filename:
+        return True
+
+    explicit_content = (
+        "curriculum vitae", "candidate cv", "candidate resume", "professional profile",
+        "preferred phone:", "preferred email:",
+    )
+    if any(term in haystack for term in explicit_content):
+        return True
+
+    vacancy_signals = (
+        "closing date", "application deadline", "how to apply", "application link",
+        "job advert", "job advertisement", "vacancy", "position requirements",
+        "essential requirements", "desirable requirements",
+    )
+    if sum(1 for term in vacancy_signals if term in content) >= 2:
+        return False
+
+    # Generic filenames can still be CVs. Require a profile-like combination rather than
+    # a single word such as "skills" or "qualification", which also appears in job adverts.
+    profile_signals = (
+        "professional experience", "employment history", "work experience",
+        "education", "certifications", "professional development", "languages",
+        "core expertise", "technical skills",
+    )
+    return sum(1 for term in profile_signals if term in content) >= 3
 
 
 _APPLICATION_EMAIL_RE = re.compile(
@@ -12125,6 +12245,15 @@ def generate_ai_reply(
         memory_context = build_attachment_memory_context(customer_number)
         if memory_context and "CV / CANDIDATE DOCUMENT ON FILE" in str(memory_context[0].get("content", "")):
             print("CUSTOMER CV MEMORY INCLUDED IN BUSINESS ASSISTANT CONTEXT", flush=True)
+
+        # Qualification screening is evidence-sensitive: load several candidate-only CV
+        # memories rather than relying on whichever short CV summary happened to be newest.
+        if detect_candidate_eligibility_request(customer_message):
+            eligibility_context = build_candidate_cv_evidence_context(customer_number)
+            if eligibility_context:
+                memory_context = eligibility_context + memory_context
+                print("CANDIDATE ELIGIBILITY SCREENING CONTEXT ENRICHED", flush=True)
+
         payment_context = build_verified_payment_context(customer_number)
         prior_conversation = get_recent_conversation(customer_number, limit=11)
         active_career_search = False
@@ -12477,6 +12606,12 @@ CAREER APPLICATION INTEGRITY AND CONSENT
 
 - Never fabricate or alter work experience, qualifications, certifications, degree classification,
   age/date of birth, licences, achievements, references, eligibility or other factual records.
+- For vacancy eligibility screening, inspect ALL supplied candidate-CV evidence before calling a
+  requirement unclear. Distinguish CONFIRMED MEET, CONFIRMED NOT MET, and UNCLEAR/NOT EVIDENCED.
+  Absence from a CV is not proof the candidate lacks a skill. For compound requirements, separate
+  the supported and unsupported parts (for example, C# can be confirmed while .NET remains unclear).
+  Do not infer years of software-development experience from general IT, banking, BI or digital-work
+  tenure unless the CV explicitly supports software-development duration.
 - A customer may request a genuine correction, but do not change a verified fact merely to make
   them appear eligible.
 - Do not guess criminal-record declarations, work authorization, medical information, licence status,
@@ -12819,6 +12954,11 @@ is never shown directly to the customer. It should preserve only information use
 continuing the customer's request:
 - For a CV/resume supplied by this customer: identify the person, education, employment
   history, skills, certifications, relevant achievements and other application-relevant facts.
+  Preserve exact degree/diploma titles, employers, role dates, explicitly stated years of
+  experience, named programming languages/frameworks/databases/platforms, and named projects.
+  Do not collapse explicit technologies into a vague phrase when the individual names are useful
+  for later eligibility screening. Structure the memory clearly enough that a later comparison can
+  distinguish CONFIRMED facts from facts that were never stated.
   Also retain the candidate's own application contact phone number and email address when
   they are clearly visible in that CV/resume. Label them clearly as `Preferred phone:` and
   `Preferred email:` so they can be reused for this same customer's future application work.
