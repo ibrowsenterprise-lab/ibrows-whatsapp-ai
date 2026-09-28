@@ -11848,14 +11848,212 @@ def _direct_page_text_for_vacancy(url):
     return "\n".join(chunks), str(resource.get("url") or url)
 
 
-def _final_live_page_vacancy_gate(vacancies, today_date):
-    """Cross-check model-discovered vacancies against their actual live pages when fetchable.
+def _page_has_active_application_signal(page_text):
+    """Return True only for affirmative live-application signals on a fetched vacancy page."""
+    lower = str(page_text or "").lower()
+    active_markers = (
+        "apply now", "easy apply", "apply for this job", "submit application",
+        "submit your application", "applications are open", "applications open",
+        "currently accepting applications", "accepting applications",
+        "application portal open", "open until filled", "rolling applications",
+        "be among the first applicants", "be an early applicant", "actively hiring",
+    )
+    closed_markers = (
+        "no longer accepting applications", "applications are closed",
+        "applications closed", "vacancy closed", "job closed",
+        "this job has expired", "job has expired", "position has been filled",
+    )
+    return any(marker in lower for marker in active_markers) and not any(
+        marker in lower for marker in closed_markers
+    )
 
-    A direct page's explicit deadline overrides any date supplied by the search model. If
-    the page says the role is closed or carries a past explicit deadline, the vacancy is
-    rejected even when an Apply/Apply Now UI element remains visible.
+
+def _secondary_verify_vacancy_candidates(candidates, today_date):
+    """Batch-verify candidates whose direct vacancy pages could not prove current status.
+
+    This is a fail-closed second opinion. It searches the exact candidate title/employer/URL
+    and asks for current status from the employer's current careers page or the exact live
+    application platform. A model-supplied deadline from discovery is never trusted here
+    unless this verification pass independently confirms it.
+    """
+    candidates = [dict(x) for x in list(candidates or [])[:5]]
+    stats = {
+        "requested": len(candidates),
+        "verified": 0,
+        "expired": 0,
+        "closed": 0,
+        "unverified": 0,
+        "malformed": 0,
+        "failed": 0,
+    }
+    if not candidates:
+        return [], [], stats
+
+    today_label = today_date.strftime("%d %B %Y")
+    candidate_lines = []
+    for idx, item in enumerate(candidates, start=1):
+        candidate_lines.append(
+            f"{idx}. Title: {item.get('title')} | Employer: {item.get('employer')} | "
+            f"URL: {item.get('application_url')}"
+        )
+    prompt = (
+        f"Today is {today_label}. Verify CURRENT OPEN STATUS for ONLY these candidate vacancies.\n"
+        + "\n".join(candidate_lines)
+        + "\n\nFor each candidate, inspect the exact vacancy/application URL first. If that page is dynamic, "
+          "unavailable, archived, or ambiguous, verify against the employer's official CURRENT careers/openings page "
+          "or the exact official application platform. Do not use an old cached advert as proof that a job is open. "
+          "If an official/current page gives a deadline, return that exact date. If the deadline is before today, "
+          "set current_open=false. If there is no deadline, set current_open=true only when current live evidence "
+          "affirmatively shows applications can still be submitted (Apply/Easy Apply/current application form/open until filled). "
+          "If the evidence is ambiguous, set current_open=false. Do not invent or estimate dates.\n\n"
+          "Return JSON ONLY with exactly this structure:\n"
+          '{"verifications":[{"title":"...","employer":"...","application_url":"https://...",'
+          '"current_open":true,"deadline_iso":"YYYY-MM-DD or empty string",'
+          '"open_evidence":"specific current-status evidence","evidence_url":"https://..."}]} '
+    )
+
+    urls = []
+    try:
+        verify_client = client.with_options(timeout=CAREER_SEARCH_TIMEOUT_SECONDS, max_retries=0)
+        completion = verify_client.chat.completions.create(
+            model=CAREER_SEARCH_CHAT_MODEL,
+            web_search_options={"search_context_size": "medium"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        message = completion.choices[0].message
+        raw = str(getattr(message, "content", "") or "").strip()
+        urls = _extract_chat_search_source_urls(completion)
+        try:
+            payload = json.loads(_clean_search_json_text(raw))
+        except Exception:
+            stats["malformed"] += 1
+            return [], urls, stats
+        rows = payload.get("verifications") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            stats["malformed"] += 1
+            return [], urls, stats
+    except Exception as error:
+        stats["failed"] += 1
+        print(
+            f"CAREER ASSIST SECONDARY VACANCY VERIFICATION FAILED: {type(error).__name__}",
+            flush=True,
+        )
+        return [], urls, stats
+
+    # Match verification rows back to candidates by normalized URL first, then title/employer.
+    by_url = {}
+    by_name = {}
+    for item in candidates:
+        try:
+            normalized = _normalize_candidate_url(item.get("application_url"))
+        except Exception:
+            normalized = str(item.get("application_url") or "").strip()
+        by_url[normalized.lower()] = item
+        by_name[(str(item.get("title") or "").strip().lower(), str(item.get("employer") or "").strip().lower())] = item
+
+    verified = []
+    used = set()
+    active_markers = (
+        "apply now", "easy apply", "apply for this job", "submit application",
+        "applications are open", "applications open", "currently accepting",
+        "accepting applications", "application form", "application portal",
+        "open until filled", "rolling applications", "active vacancy", "active listing",
+        "be among the first", "be an early applicant", "actively hiring",
+    )
+    for row in rows[:10]:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_url = _normalize_candidate_url(row.get("application_url"))
+        except Exception:
+            row_url = str(row.get("application_url") or "").strip()
+        key_name = (
+            str(row.get("title") or "").strip().lower(),
+            str(row.get("employer") or "").strip().lower(),
+        )
+        item = by_url.get(row_url.lower()) or by_name.get(key_name)
+        if item is None:
+            continue
+        identity = (str(item.get("title") or "").lower(), str(item.get("employer") or "").lower())
+        if identity in used:
+            continue
+        used.add(identity)
+
+        current_open = row.get("current_open") is True
+        deadline_iso = str(row.get("deadline_iso") or "").strip()
+        evidence = str(row.get("open_evidence") or "").strip()
+        evidence_url = str(row.get("evidence_url") or "").strip()
+        if evidence_url:
+            try:
+                evidence_url = _normalize_candidate_url(evidence_url)
+            except Exception:
+                evidence_url = ""
+            if evidence_url and evidence_url not in urls:
+                urls.append(evidence_url)
+
+        if deadline_iso:
+            try:
+                deadline_date = datetime.strptime(deadline_iso, "%Y-%m-%d").date()
+            except ValueError:
+                stats["unverified"] += 1
+                continue
+            if deadline_date < today_date:
+                stats["expired"] += 1
+                print(
+                    f"CAREER ASSIST SECONDARY VERIFY REJECTED EXPIRED: deadline={deadline_iso} "
+                    f"title={item.get('title')}",
+                    flush=True,
+                )
+                continue
+            if not current_open:
+                stats["closed"] += 1
+                continue
+            item["deadline_iso"] = deadline_iso
+            item["deadline_display"] = deadline_date.strftime("%d %B %Y")
+            item["open_evidence"] = evidence[:500] or f"Independent verification confirms deadline {item['deadline_display']}."
+            verified.append(item)
+            stats["verified"] += 1
+            continue
+
+        if not current_open:
+            stats["closed"] += 1
+            continue
+        evidence_lower = evidence.lower()
+        if not any(marker in evidence_lower for marker in active_markers):
+            stats["unverified"] += 1
+            continue
+
+        # No independently verified deadline: remove any discovery-model date.
+        item["deadline_iso"] = ""
+        if "open until filled" in evidence_lower:
+            item["deadline_display"] = "Open until filled (no closing date stated)"
+        elif "rolling applications" in evidence_lower:
+            item["deadline_display"] = "Rolling applications (no closing date stated)"
+        else:
+            item["deadline_display"] = "No closing date verified; current application evidence found"
+        item["open_evidence"] = evidence[:500]
+        verified.append(item)
+        stats["verified"] += 1
+
+    stats["unverified"] += max(0, len(candidates) - len(used))
+    print(
+        "CAREER ASSIST SECONDARY VACANCY VERIFICATION: "
+        f"requested={stats['requested']} verified={stats['verified']} expired={stats['expired']} "
+        f"closed={stats['closed']} unverified={stats['unverified']} malformed={stats['malformed']} failed={stats['failed']}",
+        flush=True,
+    )
+    return verified, urls, stats
+
+
+def _final_live_page_vacancy_gate(vacancies, today_date):
+    """Cross-check model-discovered vacancies against actual live pages where possible.
+
+    Direct-page evidence wins over discovery-model claims. Candidates that cannot be
+    proven current from the fetched page are returned separately for a stricter hosted
+    verification pass rather than being silently trusted.
     """
     kept = []
+    needs_secondary = []
     stats = {
         "checked": 0,
         "fetch_failed": 0,
@@ -11863,6 +12061,7 @@ def _final_live_page_vacancy_gate(vacancies, today_date):
         "expired": 0,
         "closed": 0,
         "deadline_conflict": 0,
+        "needs_secondary": 0,
     }
     closed_markers = (
         "no longer accepting applications",
@@ -11882,13 +12081,29 @@ def _final_live_page_vacancy_gate(vacancies, today_date):
         try:
             page_text, final_url = _direct_page_text_for_vacancy(url)
             stats["checked"] += 1
+        except requests.HTTPError as error:
+            stats["fetch_failed"] += 1
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            if status in {404, 410}:
+                stats["closed"] += 1
+                print(
+                    f"CAREER ASSIST DIRECT PAGE REJECTED HTTP_{status}: {item.get('title')} | {item.get('employer')}",
+                    flush=True,
+                )
+                continue
+            needs_secondary.append(item)
+            stats["needs_secondary"] += 1
+            print(
+                f"CAREER ASSIST DIRECT VACANCY PAGE CHECK NEEDS SECONDARY: HTTPError host={urlsplit(url).hostname}",
+                flush=True,
+            )
+            continue
         except (ValueError, requests.RequestException, socket.error) as error:
             stats["fetch_failed"] += 1
-            # Do not invent a failure state when a dynamic site blocks direct fetching.
-            # The already-validated live-search evidence remains usable in that case.
-            kept.append(item)
+            needs_secondary.append(item)
+            stats["needs_secondary"] += 1
             print(
-                f"CAREER ASSIST DIRECT VACANCY PAGE CHECK FAILED: {type(error).__name__} host={urlsplit(url).hostname}",
+                f"CAREER ASSIST DIRECT VACANCY PAGE CHECK NEEDS SECONDARY: {type(error).__name__} host={urlsplit(url).hostname}",
                 flush=True,
             )
             continue
@@ -11928,10 +12143,26 @@ def _final_live_page_vacancy_gate(vacancies, today_date):
                 f"Direct vacancy page explicitly states deadline {item['deadline_display']}. "
                 + str(item.get("open_evidence") or "")
             )[:500]
-        item["application_url"] = final_url
-        kept.append(item)
-    return kept, stats
+            item["application_url"] = final_url
+            kept.append(item)
+            continue
 
+        # If the fetched page itself clearly exposes an active application action, keep
+        # the vacancy but discard any unverified discovery-model deadline.
+        if _page_has_active_application_signal(page_text):
+            item["deadline_iso"] = ""
+            item["deadline_display"] = "No closing date verified; live page shows applications open"
+            item["open_evidence"] = "Direct vacancy page shows an active application action; no closing date was verified."
+            item["application_url"] = final_url
+            kept.append(item)
+            continue
+
+        # A 200 page with no deadline and no active application signal is not enough.
+        item["application_url"] = final_url
+        needs_secondary.append(item)
+        stats["needs_secondary"] += 1
+
+    return kept, needs_secondary, stats
 
 def fetch_career_assist_vacancy_search_context(customer_request, candidate_context=""):
     """Search live vacancy sources and pass only server-validated current roles downstream."""
@@ -12168,12 +12399,22 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                     flush=True,
                 )
 
-    # Final source-of-truth check: for URLs we can fetch directly, trust the actual
-    # vacancy page over the search model for explicit deadlines/closed status.
-    all_vacancies, direct_page_stats = _final_live_page_vacancy_gate(all_vacancies, today)
+    # Final source-of-truth check: direct pages first. Any candidate whose direct
+    # page cannot prove current status is NOT trusted automatically; it goes through
+    # one stricter hosted verification pass against the exact vacancy/employer source.
+    direct_kept, secondary_candidates, direct_page_stats = _final_live_page_vacancy_gate(all_vacancies, today)
+    secondary_kept, secondary_urls, secondary_stats = _secondary_verify_vacancy_candidates(
+        secondary_candidates, today
+    )
+    for url in secondary_urls:
+        if url and url not in source_urls:
+            source_urls.append(url)
+    all_vacancies = _merge_validated_vacancies(direct_kept, secondary_kept)
     print(
         "CAREER ASSIST DIRECT PAGE FILTER: "
-        f"checked={direct_page_stats['checked']} kept={len(all_vacancies)} "
+        f"checked={direct_page_stats['checked']} kept_direct={len(direct_kept)} "
+        f"needs_secondary={direct_page_stats['needs_secondary']} "
+        f"kept_secondary={len(secondary_kept)} final_kept={len(all_vacancies)} "
         f"explicit_deadline={direct_page_stats['explicit_deadline']} "
         f"expired={direct_page_stats['expired']} closed={direct_page_stats['closed']} "
         f"deadline_conflict={direct_page_stats['deadline_conflict']} "
