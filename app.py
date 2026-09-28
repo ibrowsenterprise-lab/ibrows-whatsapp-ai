@@ -963,6 +963,20 @@ def save_attachment_memory(customer_number, source_type, source_name, memory_tex
             )
         conn.commit()
 
+    # New CV/resume memories are allowed to retain only the candidate's own application
+    # phone/email. Seed those values immediately into the same-customer application profile
+    # so the CV + cover-letter workflow does not ask for them again later.
+    try:
+        if _looks_like_candidate_cv_memory(source_type, source_name, memory_text):
+            seeded = seed_application_contacts_from_cv_memory(customer_number)
+            if seeded.get("preferred_phone") or seeded.get("preferred_email"):
+                print("APPLICATION CONTACT DEFAULTS SEEDED FROM CV MEMORY", flush=True)
+    except Exception as seed_error:
+        print(
+            f"APPLICATION CONTACT SEED ERROR: {type(seed_error).__name__}",
+            flush=True,
+        )
+
 
 def get_recent_attachment_memories(customer_number, limit=4):
     with get_db() as conn:
@@ -1099,6 +1113,58 @@ def _extract_candidate_contact_defaults(text):
         "preferred_email": email_match.group(1).strip() if email_match else "",
         "preferred_phone": phone_match.group(0).strip() if phone_match else "",
     }
+
+
+def capture_application_contact_confirmation(customer_number, customer_message):
+    """Persist contact details only when the customer clearly supplies them for an application.
+
+    This accepts explicit `my/preferred phone/email` wording, or a short answer supplied
+    immediately after the application workflow asked for preferred phone/email. It avoids
+    treating employer/recruiter contacts from a pasted vacancy as the candidate's contacts.
+    """
+    text = str(customer_message or "").strip()
+    if not text:
+        return {}
+
+    found = _extract_candidate_contact_defaults(text)
+    if not found.get("preferred_phone") and not found.get("preferred_email"):
+        return {}
+
+    recent = get_recent_conversation(customer_number, limit=6)
+    previous_assistant = ""
+    for item in reversed(recent):
+        if str(item.get("role") or "").lower() == "assistant":
+            previous_assistant = str(item.get("content") or "").lower()
+            break
+
+    lower = " ".join(text.lower().split())
+    asked_phone = any(phrase in previous_assistant for phrase in (
+        "preferred phone", "phone number", "contact number"
+    ))
+    asked_email = any(phrase in previous_assistant for phrase in (
+        "preferred email", "email address"
+    ))
+    explicit_phone = any(phrase in lower for phrase in (
+        "my phone", "my number", "preferred phone", "contact number"
+    ))
+    explicit_email = any(phrase in lower for phrase in (
+        "my email", "preferred email", "email address"
+    ))
+
+    updates = {}
+    if found.get("preferred_phone") and (asked_phone or explicit_phone):
+        updates["preferred_phone"] = found["preferred_phone"]
+    if found.get("preferred_email") and (asked_email or explicit_email):
+        updates["preferred_email"] = found["preferred_email"]
+
+    if updates:
+        update_application_pack_defaults(customer_number, **updates)
+        print(
+            "APPLICATION CONTACT CONFIRMATION STORED: "
+            + ",".join(sorted(updates.keys())),
+            flush=True,
+        )
+    return updates
 
 
 def seed_application_contacts_from_cv_memory(customer_number):
@@ -3409,6 +3475,10 @@ def send_whatsapp_document(recipient, file_bytes, filename, mime_type, caption=N
 
 
 def process_application_pack(customer_number, customer_name, customer_message):
+    # Capture a direct response to our own preferred-contact questions before
+    # generating the pack. This makes a one-time confirmation reusable even for
+    # legacy CV memories that were created before contact defaults were retained.
+    capture_application_contact_confirmation(customer_number, customer_message)
     save_message(customer_number, "user", customer_message)
     set_application_pack_active(customer_number, True)
     try:
@@ -11631,13 +11701,18 @@ For EVERY new image or document attachment, fill `attachment_memory` with a conc
 factual summary for future turns (maximum 6000 characters). This field is internal and
 is never shown directly to the customer. It should preserve only information useful for
 continuing the customer's request:
-- For a CV: identify the person, education, employment history, skills, certifications,
-  relevant achievements and other application-relevant facts.
+- For a CV/resume supplied by this customer: identify the person, education, employment
+  history, skills, certifications, relevant achievements and other application-relevant facts.
+  Also retain the candidate's own application contact phone number and email address when
+  they are clearly visible in that CV/resume. Label them clearly as `Preferred phone:` and
+  `Preferred email:` so they can be reused for this same customer's future application work.
 - For a job advert: identify the organisation, role/title, duties, essential/desirable
-  requirements, location/deadline/application details that are actually visible.
+  requirements, location/deadline/application details that are actually visible. Do NOT treat
+  an employer/recruiter phone number or email as the customer's preferred contact details.
 - For other business files/images: preserve the main factual details needed for follow-up.
-- Exclude phone numbers, email addresses, home addresses, national/passport/ID numbers,
-  dates of birth, banking/payment details, passwords, PINs, OTPs and unrelated personal data.
+- Except for the candidate's own phone/email on their CV/resume as allowed above, exclude
+  phone numbers, email addresses, home addresses, national/passport/ID numbers, dates of
+  birth, banking/payment details, passwords, PINs, OTPs and unrelated personal data.
 - Do not invent anything that is not visible or extractable from the attachment.
 
 ============================================================
