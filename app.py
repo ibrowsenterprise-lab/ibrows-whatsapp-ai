@@ -11510,9 +11510,15 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     summaries = []
     source_urls = []
     completed_passes = 0
+
+    # Hosted web search can legitimately take longer than an ordinary chat call.
+    # Give each vacancy-search pass a bounded 45-second window while keeping the
+    # overall request comfortably below Gunicorn's 120-second worker timeout.
+    search_client = client.with_options(timeout=45.0, max_retries=0)
+
     for pass_no, prompt in enumerate(search_prompts, start=1):
         try:
-            response = client.responses.create(
+            response = search_client.responses.create(
                 model=OPENAI_WEB_SEARCH_MODEL,
                 store=False,
                 tools=[{
@@ -11532,6 +11538,11 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                     source_urls.append(url)
                 if len(source_urls) >= 20:
                     break
+
+            # If the primary-source pass already produced a useful evidence set,
+            # avoid spending another search call and return promptly.
+            if pass_no == 1 and summary and len(source_urls) >= 4:
+                break
         except Exception as error:
             print(
                 f"CAREER ASSIST LIVE VACANCY SEARCH PASS {pass_no} FAILED: {type(error).__name__}",
@@ -11539,7 +11550,20 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
             )
 
     if not summaries:
-        return [], []
+        print(
+            "CAREER ASSIST LIVE VACANCY SEARCH UNAVAILABLE: no fresh search evidence",
+            flush=True,
+        )
+        failure_context = (
+            "INTERNAL ACTIVE CAREER ASSIST LIVE VACANCY SEARCH STATUS: LIVE_SEARCH_UNAVAILABLE. "
+            "The fresh web search did not return usable evidence in this request, for example "
+            "because of a temporary search/API timeout. Do NOT use older vacancy memories, old "
+            "ERA results, previous adverts, or prior closing dates as evidence of what is open "
+            "today. Do NOT ask for an additional MK2,000 payment. Tell the customer the live "
+            "vacancy search could not be completed right now and invite them to retry shortly. "
+            "Do not ask them to supply links merely because the live search service failed."
+        )
+        return [{"type": "input_text", "text": failure_context}], []
 
     combined_summary = "\n\n".join(summaries)[:MAX_HOSTED_WEB_SEARCH_CHARS]
     sources_text = "\n".join(f"- {url}" for url in source_urls[:20])
@@ -12063,6 +12087,7 @@ def generate_ai_reply(
             print("CUSTOMER CV MEMORY INCLUDED IN BUSINESS ASSISTANT CONTEXT", flush=True)
         payment_context = build_verified_payment_context(customer_number)
         prior_conversation = get_recent_conversation(customer_number, limit=11)
+        active_career_search = False
 
         direct_urls = extract_public_urls_from_text(customer_message)
         if direct_urls:
@@ -12102,6 +12127,7 @@ def generate_ai_reply(
                     flush=True,
                 )
             if career_search_state.get("state") == "ACTIVE":
+                active_career_search = True
                 candidate_search_context = _candidate_cv_context_for_live_search(customer_number)
                 live_parts, live_urls = fetch_career_assist_vacancy_search_context(
                     customer_message,
@@ -12114,6 +12140,25 @@ def generate_ai_reply(
                     label = _web_source_label(url)
                     if label not in web_sources:
                         web_sources.append(label)
+
+                # A fresh Career Assist vacancy search must not be contaminated by
+                # older vacancy/webpage memories or old chat claims about what was
+                # open. The current live-search context and candidate CV are the
+                # authoritative inputs for CURRENT vacancy status.
+                memory_context = []
+                prior_conversation = []
+                if candidate_search_context:
+                    memory_context = [{
+                        "role": "user",
+                        "content": (
+                            "INTERNAL CANDIDATE CV CONTEXT FOR MATCHING ONLY. This is candidate "
+                            "evidence, not vacancy-status evidence.\n\n" + candidate_search_context
+                        ),
+                    }]
+                print(
+                    "ACTIVE CAREER ASSIST SEARCH CONTEXT RESET — STALE VACANCY MEMORY EXCLUDED",
+                    flush=True,
+                )
 
         save_message(customer_number, "user", customer_message)
         current_content = [{"type": "input_text", "text": customer_message}]
@@ -12369,6 +12414,11 @@ PAID CAREER-SERVICE RULES:
 - When INTERNAL ACTIVE CAREER ASSIST LIVE VACANCY SEARCH context is supplied, use it
   to answer the vacancy-search request. Prefer verified current vacancies and direct
   employer/application links. Never invent availability or present expired jobs as open.
+- If the context says LIVE_SEARCH_UNAVAILABLE, do not fall back to an old ERA result,
+  a previous vacancy advert, or an earlier closing date. State that the fresh live search
+  could not be completed right now because the search service did not return usable current
+  evidence, and invite the customer to retry shortly. Do not ask for MK2,000 and do not make
+  the customer provide links merely because the live search temporarily failed.
 
 APPROVED PAYMENT CHANNELS:
 FCB — Account 0041502003599 — IBROWS Enterprise
