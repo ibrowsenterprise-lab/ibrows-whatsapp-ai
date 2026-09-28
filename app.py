@@ -12399,6 +12399,72 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                     flush=True,
                 )
 
+    # Official ATS recall pass. Broad job-board searches often surface stale aggregator
+    # pages while missing genuinely live roles hosted on applicant-tracking systems.
+    # Run one independent ATS-focused search for every broad CV-matching request, even
+    # when earlier discovery produced candidates, because those candidates may later be
+    # rejected by the direct-page freshness gate. The SAME deterministic validator and
+    # direct-page verification still apply, so this improves recall without weakening
+    # stale-job protection.
+    if broad_match_request:
+        try:
+            ats_prompt = (
+                f"Today is {today_label}. OFFICIAL ATS RECALL SEARCH for an active Career Assist customer.\n"
+                f"Customer request: {request_text}\n"
+                + candidate_block
+                + "\n\nSearch specifically for CURRENT vacancies on official employer application pages and "
+                "major applicant-tracking platforms, including jobs.ashbyhq.com, boards.greenhouse.io, "
+                "job-boards.greenhouse.io, jobs.lever.co, myworkdayjobs.com, careers.smartrecruiters.com, "
+                "jobs.workable.com, and official employer career pages. Search Malawi/Lilongwe first, then "
+                "remote/global roles only when applicants in Malawi are eligible. Focus on the customer's "
+                "requested families: Business Intelligence, data analysis/data operations, reporting/MIS, "
+                "business analysis/project delivery, IT/business systems support, digital solutions, "
+                "IT-supported administration and media/digital support. Prefer exact live job/application "
+                "pages over aggregators. Do not use expired archive pages as current evidence. If a deadline "
+                f"is stated, compare it with today ({today_label}) and omit the role when it has passed. "
+                "If there is no deadline, current_open=true only when the official ATS/application page or "
+                "current employer careers page clearly shows the role is accepting applications. Do not "
+                "invent deadlines, requirements, locations or eligibility. Match only against the supplied "
+                "candidate evidence and do not strengthen missing skills.\n\n"
+                "Return JSON ONLY with exactly this structure:\n"
+                '{"vacancies":[{"title":"...","employer":"...","location":"...",'
+                '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
+                '"current_open":true,"open_evidence":"specific live evidence that it is open/current",'
+                '"application_url":"https://...","match_reason":"brief CV-based reason"}],'
+                '"search_note":"brief note"}\n'
+                "Do not include expired, closed, removed or unverifiable vacancies."
+            )
+            ats_client = client.with_options(timeout=CAREER_SEARCH_TIMEOUT_SECONDS, max_retries=0)
+            ats_completion = ats_client.chat.completions.create(
+                model=CAREER_SEARCH_CHAT_MODEL,
+                web_search_options={"search_context_size": "medium"},
+                messages=[{"role": "user", "content": ats_prompt}],
+            )
+            ats_message = ats_completion.choices[0].message
+            ats_raw = str(getattr(ats_message, "content", "") or "").strip()
+            ats_urls = _extract_chat_search_source_urls(ats_completion)
+            ats_vacancies, stats = _validate_career_search_payload(ats_raw, today)
+            add_stats(stats)
+            for url in ats_urls:
+                if url not in source_urls:
+                    source_urls.append(url)
+            for item in ats_vacancies:
+                url = item.get("application_url")
+                if url and url not in source_urls:
+                    source_urls.insert(0, url)
+            all_vacancies = _merge_validated_vacancies(all_vacancies, ats_vacancies)
+            print(
+                f"CAREER ASSIST OFFICIAL ATS RECALL: model={CAREER_SEARCH_CHAT_MODEL} "
+                f"sources={len(ats_urls)} validated={len(ats_vacancies)} cumulative={len(all_vacancies)}",
+                flush=True,
+            )
+            search_paths.append(f"official-ats:{CAREER_SEARCH_CHAT_MODEL}")
+        except Exception as error:
+            print(
+                f"CAREER ASSIST OFFICIAL ATS RECALL FAILED: {type(error).__name__}",
+                flush=True,
+            )
+
     # Final source-of-truth check: direct pages first. Any candidate whose direct
     # page cannot prove current status is NOT trusted automatically; it goes through
     # one stricter hosted verification pass against the exact vacancy/employer source.
