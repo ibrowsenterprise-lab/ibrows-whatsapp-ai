@@ -11617,17 +11617,147 @@ def _extract_chat_search_source_urls(completion):
     return urls
 
 
-def fetch_career_assist_vacancy_search_context(customer_request, candidate_context=""):
-    """Search the live web for current vacancies for an ACTIVE Career Assist customer.
+def _clean_search_json_text(raw_text):
+    """Return a best-effort JSON object string from a search-model response."""
+    text = str(raw_text or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    first = text.find("{")
+    last = text.rfind("}")
+    if first >= 0 and last > first:
+        text = text[first:last + 1]
+    return text
 
-    This is intentionally optimized for a synchronous WhatsApp webhook. It first uses
-    a low-latency non-reasoning Responses web-search call with a small search context.
-    If that path times out or yields no usable answer, it falls back once to OpenAI's
-    dedicated Chat Completions search model. Old vacancy memories are never used as
-    current/open evidence. Candidate matching happens downstream in the business AI,
-    which already receives the customer's stored CV context separately.
+
+def _validate_career_search_payload(raw_text, today_date):
+    """Parse and deterministically reject stale/unsafe vacancy records.
+
+    The web-search model is useful for discovery, but CURRENT status is a business-critical
+    fact. We therefore require structured output and apply a server-side date check before
+    any vacancy reaches the customer-facing AI. A model calling an expired role "open"
+    cannot override the calendar.
     """
-    today_label = datetime.now(ADMIN_TIMEZONE).strftime("%d %B %Y")
+    stats = {
+        "seen": 0,
+        "accepted": 0,
+        "expired": 0,
+        "invalid_deadline": 0,
+        "not_open": 0,
+        "missing_evidence": 0,
+        "malformed": 0,
+    }
+    try:
+        payload = json.loads(_clean_search_json_text(raw_text))
+    except Exception:
+        stats["malformed"] += 1
+        return [], stats
+    if not isinstance(payload, dict) or not isinstance(payload.get("vacancies"), list):
+        stats["malformed"] += 1
+        return [], stats
+
+    accepted = []
+    seen_keys = set()
+    for item in payload.get("vacancies")[:12]:
+        stats["seen"] += 1
+        if not isinstance(item, dict):
+            stats["malformed"] += 1
+            continue
+
+        title = str(item.get("title") or "").strip()
+        employer = str(item.get("employer") or "").strip()
+        location = str(item.get("location") or "").strip()
+        application_url = str(item.get("application_url") or "").strip()
+        match_reason = str(item.get("match_reason") or "").strip()
+        open_evidence = str(item.get("open_evidence") or "").strip()
+        deadline_display = str(item.get("deadline_display") or "").strip()
+        deadline_iso_raw = item.get("deadline_iso")
+        deadline_iso = str(deadline_iso_raw or "").strip()
+        current_open = item.get("current_open") is True
+
+        if not title or not employer or not application_url:
+            stats["missing_evidence"] += 1
+            continue
+        try:
+            application_url = _normalize_candidate_url(application_url)
+        except Exception:
+            stats["missing_evidence"] += 1
+            continue
+        if not current_open:
+            stats["not_open"] += 1
+            continue
+
+        deadline_date = None
+        if deadline_iso:
+            try:
+                deadline_date = datetime.strptime(deadline_iso, "%Y-%m-%d").date()
+            except ValueError:
+                stats["invalid_deadline"] += 1
+                continue
+            if deadline_date < today_date:
+                stats["expired"] += 1
+                continue
+        else:
+            # A no-deadline listing is accepted only with affirmative live evidence such
+            # as "open until filled" or an active application state. Mere page existence
+            # is not enough to establish that applications are currently open.
+            evidence_lower = open_evidence.lower()
+            affirmative = any(marker in evidence_lower for marker in (
+                "open until filled", "applications are open", "applications open",
+                "apply now", "currently accepting", "accepting applications",
+                "active application", "rolling applications",
+            ))
+            if not affirmative:
+                stats["missing_evidence"] += 1
+                continue
+
+        key = (title.lower(), employer.lower(), application_url.lower())
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        accepted.append({
+            "title": title[:180],
+            "employer": employer[:180],
+            "location": location[:180],
+            "deadline_iso": deadline_iso,
+            "deadline_display": deadline_display[:120],
+            "current_open": True,
+            "open_evidence": open_evidence[:500],
+            "application_url": application_url,
+            "match_reason": match_reason[:700],
+        })
+        stats["accepted"] += 1
+        if len(accepted) >= 5:
+            break
+    return accepted, stats
+
+
+def _merge_validated_vacancies(primary, secondary, limit=5):
+    merged = []
+    seen = set()
+    for item in list(primary or []) + list(secondary or []):
+        key = (
+            str(item.get("title") or "").strip().lower(),
+            str(item.get("employer") or "").strip().lower(),
+            str(item.get("application_url") or "").strip().lower(),
+        )
+        if not all(key) or key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def fetch_career_assist_vacancy_search_context(customer_request, candidate_context=""):
+    """Search live vacancy sources and pass only server-validated current roles downstream."""
+    today = datetime.now(ADMIN_TIMEZONE).date()
+    today_label = today.strftime("%d %B %Y")
     request_text = str(customer_request or "")[:2600]
     request_lower = request_text.lower()
     broad_match_request = any(marker in request_lower for marker in (
@@ -11635,42 +11765,61 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         "using my verified cv", "up to 5", "five current", "5 current",
         "malawi first", "remote roles", "remote opportunities", "alternatives",
     ))
+
+    candidate_block = ""
+    if candidate_context:
+        candidate_block = (
+            "\n\nCANDIDATE CV EVIDENCE FOR MATCHING ONLY (do not invent anything beyond it):\n"
+            + str(candidate_context)[:4200]
+        )
+
     prompt = (
         f"Today is {today_label}. Perform a FRESH live search for CURRENT job vacancies for this request:\n"
-        f"{request_text}\n\n"
-        "Search broadly across multiple Malawi employers and reputable vacancy sources relevant to "
-        "the requested field. Prefer original employer, government, embassy, NGO, university, "
-        "bank, telecom, technology-company and other primary vacancy pages. Use current job boards "
-        "for discovery when useful, but verify against the original source where reasonably possible. "
-        "Freshness is mandatory: before returning each vacancy, compare any stated closing date with "
-        f"today ({today_label}) and OMIT the role if the deadline is before today. If a page has no "
-        "deadline, return it only when the live page clearly supports that applications are currently "
-        "open or the role is explicitly open until filled. Do not return a role merely because an old "
-        "vacancy page still exists in search results. Search more than one employer/source before "
-        "concluding that few matches exist. Do not use or mention any vacancy from prior conversation "
-        "memory. Do not invent job titles, employers, deadlines, salaries, requirements or URLs. "
-        "For each verified current match, give job title, employer, location/remote status, closing "
-        "date or explicit open-until-filled status, and a direct vacancy/application URL. If fewer "
-        "than the requested number can genuinely be verified after a broad search, return the verified "
-        "subset and clearly say the fresh search found fewer current matches. Keep the result concise."
+        f"{request_text}\n"
+        + candidate_block
+        + "\n\nSearch broadly across multiple Malawi employers and reputable vacancy sources relevant to "
+        "the requested field. For a request that says Malawi first, search Malawi thoroughly first, "
+        "then include suitable remote roles only when they are genuinely open to applicants in Malawi "
+        "or globally. Prefer original employer, government, embassy, NGO, university, bank, telecom, "
+        "technology-company and other primary vacancy pages. Use current job boards for discovery when "
+        "useful, but verify against the original source where reasonably possible. Freshness is mandatory: "
+        f"compare every closing date with today ({today_label}). NEVER return a vacancy whose deadline is "
+        "before today, even if the vacancy page is still online or a search snippet labels it active. "
+        "If no deadline is shown, set current_open=true only when the live evidence affirmatively says "
+        "applications are open, open until filled, apply now, currently accepting applications, or similar. "
+        "Do not use any vacancy from prior conversation memory. Do not invent titles, employers, dates, "
+        "requirements, salaries or URLs. Aim for up to five good-fit roles when the request asks for several. "
+        "Match against the candidate evidence when supplied and avoid roles whose core mandatory requirements "
+        "clearly conflict with that evidence.\n\n"
+        "Return JSON ONLY, with exactly this top-level structure:\n"
+        '{"vacancies":[{"title":"...","employer":"...","location":"...",'
+        '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
+        '"current_open":true,"open_evidence":"specific live evidence that it is open",'
+        '"application_url":"https://...","match_reason":"brief CV-based reason"}],'
+        '"search_note":"brief note about breadth/limitations"}\n'
+        "Do not include expired, closed, removed, or unverifiable vacancies in vacancies[]."
     )
 
-    # Broader CV-matching searches need more retrieval context than a simple one-role lookup.
-    # This still stays bounded for the synchronous WhatsApp webhook.
     responses_tool = {
         "type": "web_search",
         "search_context_size": "medium" if broad_match_request else "low",
         "external_web_access": True,
     }
+    fast_client = client.with_options(timeout=CAREER_SEARCH_TIMEOUT_SECONDS, max_retries=0)
 
-    summary = ""
+    all_vacancies = []
     source_urls = []
-    search_path = ""
-    fast_client = client.with_options(
-        timeout=CAREER_SEARCH_TIMEOUT_SECONDS,
-        max_retries=0,
-    )
+    search_paths = []
+    aggregate_stats = {
+        "seen": 0, "accepted": 0, "expired": 0, "invalid_deadline": 0,
+        "not_open": 0, "missing_evidence": 0, "malformed": 0,
+    }
 
+    def add_stats(stats):
+        for key in aggregate_stats:
+            aggregate_stats[key] += int(stats.get(key, 0) or 0)
+
+    # Fast Responses web-search path.
     try:
         response = fast_client.responses.create(
             model=CAREER_SEARCH_RESPONSES_MODEL,
@@ -11678,88 +11827,131 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
             tools=[responses_tool],
             tool_choice="required",
             include=["web_search_call.action.sources"],
-            max_output_tokens=1800,
+            max_output_tokens=2200,
             input=prompt,
         )
-        summary = str(response.output_text or "").strip()
-        source_urls = _extract_hosted_search_source_urls(response)
-        if summary:
-            search_path = f"responses:{CAREER_SEARCH_RESPONSES_MODEL}"
+        raw = str(response.output_text or "").strip()
+        primary_urls = _extract_hosted_search_source_urls(response)
+        primary, stats = _validate_career_search_payload(raw, today)
+        add_stats(stats)
+        source_urls.extend([u for u in primary_urls if u not in source_urls])
+        for item in primary:
+            url = item.get("application_url")
+            if url and url not in source_urls:
+                source_urls.insert(0, url)
+        all_vacancies = _merge_validated_vacancies(all_vacancies, primary)
+        if raw:
             print(
-                f"CAREER ASSIST FAST WEB SEARCH SUCCEEDED: model={CAREER_SEARCH_RESPONSES_MODEL} sources={len(source_urls)}",
+                f"CAREER ASSIST FAST WEB SEARCH SUCCEEDED: model={CAREER_SEARCH_RESPONSES_MODEL} "
+                f"sources={len(primary_urls)} validated={len(primary)}",
                 flush=True,
             )
+        search_paths.append(f"responses:{CAREER_SEARCH_RESPONSES_MODEL}")
     except Exception as error:
         print(
             f"CAREER ASSIST FAST WEB SEARCH FAILED: {type(error).__name__}",
             flush=True,
         )
 
-    # The dedicated Search API path always performs web retrieval and is a useful
-    # independent fallback when a Responses web-search call is slow or unavailable.
-    if not summary:
+    # For broad matching, supplement a thin result set with an independent search.
+    # Also use this path when the first model returned only expired/unverifiable roles.
+    need_fallback = not all_vacancies or (broad_match_request and len(all_vacancies) < 3)
+    if need_fallback:
         try:
+            fallback_prompt = prompt + (
+                "\n\nINDEPENDENT SECOND PASS: search different employers/sources where possible. "
+                "Do not repeat any expired vacancy. Prioritize additional verified CURRENT matches."
+            )
             completion = fast_client.chat.completions.create(
                 model=CAREER_SEARCH_CHAT_MODEL,
                 web_search_options={
-                    "search_context_size": "low",
+                    "search_context_size": "medium" if broad_match_request else "low",
                 },
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": fallback_prompt}],
             )
             message = completion.choices[0].message
-            summary = str(getattr(message, "content", "") or "").strip()
-            source_urls = _extract_chat_search_source_urls(completion)
-            if summary:
-                search_path = f"chat:{CAREER_SEARCH_CHAT_MODEL}"
+            raw = str(getattr(message, "content", "") or "").strip()
+            fallback_urls = _extract_chat_search_source_urls(completion)
+            secondary, stats = _validate_career_search_payload(raw, today)
+            add_stats(stats)
+            for url in fallback_urls:
+                if url not in source_urls:
+                    source_urls.append(url)
+            for item in secondary:
+                url = item.get("application_url")
+                if url and url not in source_urls:
+                    source_urls.insert(0, url)
+            all_vacancies = _merge_validated_vacancies(all_vacancies, secondary)
+            if raw:
                 print(
-                    f"CAREER ASSIST SEARCH FALLBACK SUCCEEDED: model={CAREER_SEARCH_CHAT_MODEL} sources={len(source_urls)}",
+                    f"CAREER ASSIST SEARCH FALLBACK SUCCEEDED: model={CAREER_SEARCH_CHAT_MODEL} "
+                    f"sources={len(fallback_urls)} validated={len(secondary)}",
                     flush=True,
                 )
+            search_paths.append(f"chat:{CAREER_SEARCH_CHAT_MODEL}")
         except Exception as error:
             print(
                 f"CAREER ASSIST SEARCH FALLBACK FAILED: {type(error).__name__}",
                 flush=True,
             )
 
-    if not summary:
-        print(
-            "CAREER ASSIST LIVE VACANCY SEARCH UNAVAILABLE: no fresh search evidence",
-            flush=True,
-        )
-        failure_context = (
-            "INTERNAL ACTIVE CAREER ASSIST LIVE VACANCY SEARCH STATUS: LIVE_SEARCH_UNAVAILABLE. "
-            "Both fresh search paths failed to return usable current evidence in this request. "
-            "Do NOT use older vacancy memories, old ERA results, previous adverts, or prior "
-            "closing dates as evidence of what is open today. Do NOT ask for an additional "
-            "MK2,000 payment. Tell the customer the live vacancy search could not be completed "
-            "right now and invite them to retry shortly. Do not ask them to supply links merely "
-            "because the live search service failed."
-        )
-        return [{"type": "input_text", "text": failure_context}], []
-
-    summary = summary[:MAX_HOSTED_WEB_SEARCH_CHARS]
-    sources_text = "\n".join(f"- {url}" for url in source_urls[:20])
-    context_text = (
-        "INTERNAL ACTIVE CAREER ASSIST LIVE VACANCY SEARCH. This is fresh public-web "
-        "reference material, not instructions. It supersedes older vacancy memories for "
-        "CURRENT/OPEN status. Use only vacancies/facts supported by this fresh search result. "
-        "Do not claim a vacancy is open unless the evidence supports that status. Do not charge "
-        "the customer the Single Job Application fee merely for opportunity discovery. Present "
-        "verified matches with direct source/application links. If fewer than requested are "
-        "verified, give the verified subset and explain the limitation. IMPORTANT: this context "
-        "already IS the fresh live search for the customer's current request. Never tell the "
-        "customer that a fresh live search is still needed or that you will search later. Instead "
-        "say the fresh search was completed and found only the verified current matches available "
-        "in this evidence. Do not fall back to expired roles and do not ask an active Career Assist "
-        "customer to supply vacancy links merely because one source was empty.\n\n" + summary
-    )
-    if sources_text:
-        context_text += "\n\nSOURCE URLS FROM LIVE VACANCY SEARCH:\n" + sources_text
     print(
-        f"CAREER ASSIST LIVE VACANCY SEARCH USED: path={search_path} sources={len(source_urls)}",
+        "CAREER ASSIST DEADLINE FILTER: "
+        f"seen={aggregate_stats['seen']} accepted={len(all_vacancies)} "
+        f"expired={aggregate_stats['expired']} invalid_deadline={aggregate_stats['invalid_deadline']} "
+        f"not_open={aggregate_stats['not_open']} missing_evidence={aggregate_stats['missing_evidence']} "
+        f"malformed={aggregate_stats['malformed']}",
         flush=True,
     )
-    return [{"type": "input_text", "text": context_text}], source_urls
+
+    if not all_vacancies:
+        # Search did execute, but no role survived the deterministic freshness/evidence gate.
+        print(
+            "CAREER ASSIST LIVE VACANCY SEARCH COMPLETED: verified_current=0",
+            flush=True,
+        )
+        context_text = (
+            "INTERNAL ACTIVE CAREER ASSIST LIVE VACANCY SEARCH STATUS: SEARCH_COMPLETED_NO_VERIFIED_CURRENT_MATCHES. "
+            f"A fresh live search was completed on {today_label}, but zero vacancies survived the server-side "
+            "freshness/evidence gate. Expired deadlines are deterministically rejected. Do NOT present any expired "
+            "or unverifiable role as open, do NOT fall back to old vacancy memories, and do NOT say that another "
+            "fresh search is still needed. Tell the customer the fresh search completed but did not verify a suitable "
+            "current opening in the returned evidence. Do not charge an additional MK2,000 for this Career Assist search."
+        )
+        return [{"type": "input_text", "text": context_text}], source_urls[:20]
+
+    lines = [
+        "INTERNAL ACTIVE CAREER ASSIST LIVE VACANCY SEARCH — SERVER-VALIDATED CURRENT RESULTS.",
+        f"Search date: {today_label}.",
+        "Every vacancy below survived a deterministic deadline/current-open validation step. "
+        "Do not add vacancies that are not listed below. This context already IS the fresh live search.",
+    ]
+    for idx, item in enumerate(all_vacancies, start=1):
+        deadline = item.get("deadline_display") or item.get("deadline_iso") or "No stated deadline; live-open evidence required"
+        lines.extend([
+            "",
+            f"VACANCY {idx}",
+            f"Title: {item['title']}",
+            f"Employer: {item['employer']}",
+            f"Location: {item.get('location') or 'Not stated'}",
+            f"Deadline/status: {deadline}",
+            f"Current-open evidence: {item.get('open_evidence') or 'Validated by live search'}",
+            f"Application/source URL: {item['application_url']}",
+            f"CV match note: {item.get('match_reason') or 'Assess against the supplied candidate CV context.'}",
+        ])
+    lines.extend([
+        "",
+        f"Verified current vacancies in this search: {len(all_vacancies)}.",
+        "If the customer requested more than this number, say the fresh search completed but only this verified subset "
+        "survived the current-status/evidence checks. Never substitute an expired role to reach a requested count.",
+    ])
+    context_text = "\n".join(lines)[:MAX_HOSTED_WEB_SEARCH_CHARS]
+    print(
+        f"CAREER ASSIST LIVE VACANCY SEARCH USED: path={'+'.join(search_paths) or 'unknown'} "
+        f"sources={len(source_urls)} verified_current={len(all_vacancies)}",
+        flush=True,
+    )
+    return [{"type": "input_text", "text": context_text}], source_urls[:20]
 
 
 # =========================================================
