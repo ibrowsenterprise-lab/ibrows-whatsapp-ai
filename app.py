@@ -165,6 +165,41 @@ APPLICATION_PACK_MAX_ITEMS = 20
 APPLICATION_PACK_QA_MAX_REPAIR_ATTEMPTS = 1
 
 # =========================================================
+# APPROVED CAREER-SERVICE PRICES / PAYMENT CHANNELS
+# =========================================================
+# These are business-approved values. Customer claims, screenshots, copied
+# transaction references, or WhatsApp messages never change ledger status.
+CAREER_SERVICE_DEFAULT_PRICES_MWK = {
+    "CV & Cover Letter": Decimal("5000"),
+    "Career Assist": Decimal("50000"),
+    "Scholarship Search": Decimal("60000"),
+}
+
+CAREER_PACKAGE_PRICES_MWK = {
+    "Opportunity Alerts": Decimal("20000"),
+    "Career Assist": Decimal("50000"),
+    "Career Assist Pro": Decimal("100000"),
+    "Scholarship Search": Decimal("60000"),
+    "One-Off CV + Cover Letter": Decimal("5000"),
+    "Single Job Application": Decimal("2000"),
+}
+
+IBROWS_PAYMENT_CHANNELS = (
+    ("FCB", "0041502003599", "IBROWS Enterprise"),
+    ("FDH Bank", "1040000630751", "IBROWS Cleaning Service"),
+    ("National Bank", "1004574105", "Jones Nalikungwi"),
+    ("Airtel Money", "0999242594", "Jones Nalikungwi"),
+    ("TNM Mpamba", "0882242594", "Jones Nalikungwi"),
+)
+
+def approved_payment_channels_text():
+    lines = []
+    for channel, number, account_name in IBROWS_PAYMENT_CHANNELS:
+        label = "Number" if channel in {"Airtel Money", "TNM Mpamba"} else "Account"
+        lines.append(f"{channel}: {label} {number} — {account_name}")
+    return "\n".join(lines)
+
+# =========================================================
 # DATABASE
 # =========================================================
 
@@ -656,107 +691,6 @@ def cleanup_expired_data(force=False):
         print("PRIVACY RETENTION CLEANUP COMPLETED", flush=True)
     except Exception as error:
         print(f"Privacy cleanup error: {type(error).__name__}", flush=True)
-
-
-def get_customer_privacy_preview(customer_number):
-    """Return a read-only preview of what the privacy action would affect.
-
-    This function performs SELECT queries only. It is safe to run against a real
-    customer because it does not update or delete any data.
-    """
-    customer_number = str(customer_number or "").strip()
-    if not customer_number:
-        raise ValueError("Customer number is required.")
-
-    preview = {
-        "conversations": 0,
-        "attachment_memories": 0,
-        "retry_records": 0,
-        "ai_takeover_state": 0,
-        "application_state": 0,
-        "evidence_corrections": 0,
-        "lead_notes": 0,
-        "lead_activity": 0,
-        "lead_notifications": 0,
-        "operational_leads_deleted": 0,
-        "financial_leads_anonymized": 0,
-        "payments_preserved": 0,
-        "void_audit_preserved": 0,
-        "documents_preserved": 0,
-    }
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            for key, table in (
-                ("conversations", "conversations"),
-                ("attachment_memories", "attachment_memories"),
-                ("retry_records", "processed_whatsapp_messages"),
-                ("ai_takeover_state", "ai_takeover_state"),
-                ("application_state", "application_pack_state"),
-                ("evidence_corrections", "application_evidence_corrections"),
-            ):
-                cur.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE customer_number = %s",
-                    (customer_number,),
-                )
-                preview[key] = int(cur.fetchone()[0] or 0)
-
-            cur.execute(
-                "SELECT id FROM leads WHERE customer_number = %s",
-                (customer_number,),
-            )
-            lead_ids = [row[0] for row in cur.fetchall()]
-
-            if not lead_ids:
-                return preview
-
-            cur.execute(
-                """
-                SELECT l.id
-                FROM leads l
-                WHERE l.id = ANY(%s)
-                  AND (
-                        l.estimated_value IS NOT NULL
-                     OR COALESCE(l.quote_status, 'NOT_STARTED') <> 'NOT_STARTED'
-                     OR EXISTS (SELECT 1 FROM lead_payments p WHERE p.lead_id = l.id)
-                     OR EXISTS (SELECT 1 FROM payment_void_audit v WHERE v.lead_id = l.id)
-                     OR EXISTS (SELECT 1 FROM business_documents d WHERE d.lead_id = l.id)
-                  )
-                """,
-                (lead_ids,),
-            )
-            protected_ids = [row[0] for row in cur.fetchall()]
-            protected_set = set(protected_ids)
-
-            preview["financial_leads_anonymized"] = len(protected_ids)
-            preview["operational_leads_deleted"] = sum(
-                1 for lead_id in lead_ids if lead_id not in protected_set
-            )
-
-            for key, table in (
-                ("lead_notes", "lead_notes"),
-                ("lead_activity", "lead_activity"),
-                ("lead_notifications", "lead_notification_status"),
-            ):
-                cur.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE lead_id = ANY(%s)",
-                    (lead_ids,),
-                )
-                preview[key] = int(cur.fetchone()[0] or 0)
-
-            if protected_ids:
-                for key, table in (
-                    ("payments_preserved", "lead_payments"),
-                    ("void_audit_preserved", "payment_void_audit"),
-                    ("documents_preserved", "business_documents"),
-                ):
-                    cur.execute(
-                        f"SELECT COUNT(*) FROM {table} WHERE lead_id = ANY(%s)",
-                        (protected_ids,),
-                    )
-                    preview[key] = int(cur.fetchone()[0] or 0)
-
-    return preview
 
 
 def delete_customer_data(customer_number):
@@ -2818,8 +2752,8 @@ def process_application_pack(customer_number, customer_name, customer_message):
     except Exception as error:
         print(f"APPLICATION PACK ERROR: {type(error).__name__}", flush=True)
         reply = (
-            "I could not prepare the application pack just now. Your existing CV and vacancy "
-            "context are still available. Please try again shortly, or ask for human assistance."
+            "I could not prepare the application pack just now. Please try again shortly, "
+            "or ask for human assistance."
         )
         save_message(customer_number, "assistant", reply)
         return {"reply": reply, "documents": [], "ready": False}
@@ -3402,6 +3336,178 @@ def get_latest_open_lead_service(customer_number):
     if row and row[0]:
         return canonicalize_service(row[0])
     return "General Enquiry"
+
+
+def get_verified_service_payment_state(customer_number, service, fallback_required_mwk=None):
+    """Return authoritative ledger status for the latest open lead of one service.
+
+    Only rows entered into lead_payments by the authenticated admin workflow count
+    as verified money received. Customer messages, screenshots and references do not.
+    """
+    wanted = canonicalize_service(service)
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    l.id, l.service, l.estimated_value, COALESCE(l.value_currency, 'MWK'),
+                    l.quote_status, l.status, l.updated_at,
+                    COALESCE(SUM(CASE WHEN p.currency = COALESCE(l.value_currency, 'MWK')
+                                      THEN p.amount ELSE 0 END), 0) AS paid_total
+                FROM leads l
+                LEFT JOIN lead_payments p ON p.lead_id = l.id
+                WHERE l.customer_number = %s
+                  AND l.status IN ('NEW', 'CONTACTED')
+                  AND l.merged_into_lead_id IS NULL
+                  AND l.privacy_deleted_at IS NULL
+                GROUP BY l.id, l.service, l.estimated_value, l.value_currency,
+                         l.quote_status, l.status, l.updated_at
+                ORDER BY l.updated_at DESC, l.id DESC
+                """,
+                (customer_number,),
+            )
+            rows = cur.fetchall()
+
+    row = next((r for r in rows if canonicalize_service(r[1]) == wanted), None)
+    if not row:
+        required = Decimal(str(fallback_required_mwk)) if fallback_required_mwk is not None else None
+        return {
+            "lead_id": None, "service": wanted, "currency": "MWK",
+            "required": required, "paid": Decimal("0"), "balance": required,
+            "status": "NOT_VERIFIED", "quote_status": "NOT_STARTED",
+        }
+
+    lead_id, _service, estimated, currency, quote_status, _status, _updated, paid_total = row
+    paid = Decimal(paid_total or 0)
+    required = Decimal(estimated) if estimated is not None else None
+    if required is None and currency == "MWK" and fallback_required_mwk is not None:
+        required = Decimal(str(fallback_required_mwk))
+
+    balance = None if required is None else max(required - paid, Decimal("0"))
+    if paid <= 0:
+        state = "NOT_PAID"
+    elif required is None:
+        state = "RECEIVED_UNPRICED"
+    elif paid < required:
+        state = "PART_PAID"
+    else:
+        state = "PAID"
+
+    return {
+        "lead_id": lead_id, "service": wanted, "currency": currency,
+        "required": required, "paid": paid, "balance": balance,
+        "status": state, "quote_status": quote_status or "NOT_STARTED",
+    }
+
+
+def build_verified_payment_context(customer_number):
+    """Supply model-visible payment facts without exposing references or bank data."""
+    lines = [
+        "INTERNAL VERIFIED PAYMENT STATUS. This is authoritative business ledger context, "
+        "not a customer claim. A screenshot/message/reference alone is never VERIFIED. "
+        "For paid career services not listed as PAID below, do not say payment is confirmed."
+    ]
+    any_open = False
+    for service, default_price in CAREER_SERVICE_DEFAULT_PRICES_MWK.items():
+        state = get_verified_service_payment_state(customer_number, service, default_price)
+        if state["lead_id"] is None:
+            continue
+        any_open = True
+        required = state["required"]
+        required_text = (
+            f"{state['currency']} {required:,.0f}" if required is not None else "not priced in ledger"
+        )
+        lines.append(
+            f"- {service}: {state['status']}; verified received "
+            f"{state['currency']} {state['paid']:,.0f}; required {required_text}."
+        )
+    if not any_open:
+        lines.append("- No open paid-career-service ledger record is currently available for this customer.")
+    return [{"role": "user", "content": "\n".join(lines)}]
+
+
+def ensure_cv_package_lead(customer_number, customer_name):
+    """Create/update the paid CV package lead and attach its approved MK5,000 value."""
+    lead_id, is_new = create_or_update_lead(
+        customer_number=customer_number,
+        customer_name=customer_name,
+        service="CV & Cover Letter",
+        summary="Customer requested the One-Off CV + Cover Letter package; payment verification is required before paid document preparation.",
+        handover_reason="Payment verification required before paid CV + Cover Letter work begins.",
+    )
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE leads
+                SET estimated_value = COALESCE(estimated_value, %s),
+                    value_currency = CASE WHEN estimated_value IS NULL THEN 'MWK' ELSE value_currency END,
+                    quote_status = CASE
+                        WHEN quote_status IN ('NOT_STARTED', 'DRAFT') THEN 'ACCEPTED'
+                        ELSE quote_status
+                    END,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (CAREER_SERVICE_DEFAULT_PRICES_MWK["CV & Cover Letter"], lead_id),
+            )
+        conn.commit()
+    if is_new:
+        try:
+            send_new_lead_email(
+                lead_id=lead_id,
+                customer_name=customer_name,
+                customer_number=customer_number,
+                service="CV & Cover Letter",
+                summary="Customer requested the One-Off CV + Cover Letter package; payment verification is required.",
+                handover_reason="Payment verification required before paid CV + Cover Letter work begins.",
+            )
+        except Exception as notify_error:
+            print(f"CV PAYMENT LEAD NOTIFICATION ERROR: {type(notify_error).__name__}", flush=True)
+    return lead_id
+
+
+def application_pack_payment_gate(customer_number, customer_name):
+    """Return None when paid; otherwise return a truthful payment-gate reply."""
+    required = CAREER_SERVICE_DEFAULT_PRICES_MWK["CV & Cover Letter"]
+    state = get_verified_service_payment_state(
+        customer_number, "CV & Cover Letter", required
+    )
+    if state["status"] == "PAID":
+        return None
+
+    # A direct request to prepare the paid pack is enough to create a real admin
+    # follow-up record; no customer-facing claim of referral is made without it.
+    try:
+        ensure_cv_package_lead(customer_number, customer_name)
+        state = get_verified_service_payment_state(
+            customer_number, "CV & Cover Letter", required
+        )
+    except Exception as gate_error:
+        print(f"CV PAYMENT GATE LEAD ERROR: {type(gate_error).__name__}", flush=True)
+
+    channels = approved_payment_channels_text()
+    if state["status"] == "PART_PAID":
+        balance = state["balance"] if state["balance"] is not None else required - state["paid"]
+        return (
+            f"Your One-Off CV + Cover Letter package is MK{required:,.0f}. "
+            f"The IBROWS ledger currently shows MK{state['paid']:,.0f} verified, "
+            f"with MK{balance:,.0f} remaining. Paid document preparation starts only "
+            "after the full package payment is verified, unless an authorized IBROWS "
+            "admin records an approved exception.\n\n"
+            "Approved payment channels:\n" + channels +
+            "\n\nAfter payment, send the transaction reference or payment confirmation. "
+            "Do not send your PIN, OTP, password, or security codes."
+        )
+
+    return (
+        f"The One-Off CV + Cover Letter package costs MK{required:,.0f}. "
+        "I can prepare the paid documents after payment has been verified in the "
+        "IBROWS ledger. A screenshot or customer message by itself does not mark a "
+        "payment as confirmed.\n\nApproved payment channels:\n" + channels +
+        "\n\nAfter payment, send the transaction reference or payment confirmation for "
+        "IBROWS verification. Do not send your PIN, OTP, password, or security codes."
+    )
 
 
 def create_or_update_lead(
@@ -5305,60 +5411,12 @@ def get_customer_crm_profile(customer_number):
             "service": lead["service"],
         })
 
-    # Active payments are rendered from the payment ledger below.  Some payment
-    # writes also create a lead_activity row so that a later void still leaves
-    # a complete audit trail.  Suppress only the matching activity copy while
-    # the payment is active; otherwise Customer CRM would show the same payment
-    # twice.  A voided payment no longer exists in lead_payments, so its original
-    # activity remains visible alongside the PAYMENT_VOIDED audit event.
-    payments = get_customer_payments(lead_ids, limit=100)
-    active_payment_events = []
-    for payment in payments:
-        method_label = PAYMENT_METHODS.get(
-            payment["payment_method"],
-            payment["payment_method"].replace("_", " ").title(),
-        )
-        payment_description = (
-            f"Payment received: {_format_crm_amount(payment['amount'], payment['currency'])} "
-            f"via {method_label}."
-        )
-        if payment["reference"]:
-            payment_description += f" Reference: {payment['reference']}."
-        active_payment_events.append({
-            "id": payment["id"],
-            "description": payment_description,
-            "created_at": payment["received_at"],
-            "service": payment["service"],
-        })
-
-    matched_active_payment_ids = set()
     for lead_id, activity_type, description, created_at, service in activity_rows:
-        service_name = canonicalize_service(service)
-        if activity_type == "PAYMENT":
-            duplicate_payment_id = None
-            for event in active_payment_events:
-                if event["id"] in matched_active_payment_ids:
-                    continue
-                if event["description"] != description or event["service"] != service_name:
-                    continue
-                if created_at is None or event["created_at"] is None:
-                    continue
-                try:
-                    seconds_apart = abs((created_at - event["created_at"]).total_seconds())
-                except (TypeError, AttributeError):
-                    continue
-                if seconds_apart <= 5:
-                    duplicate_payment_id = event["id"]
-                    break
-            if duplicate_payment_id is not None:
-                matched_active_payment_ids.add(duplicate_payment_id)
-                continue
-
         timeline.append({
             "kind": activity_type,
             "description": description,
             "created_at": created_at,
-            "service": service_name,
+            "service": canonicalize_service(service),
         })
 
     for lead_id, note_text, created_at, service in note_rows:
@@ -5369,12 +5427,23 @@ def get_customer_crm_profile(customer_number):
             "service": canonicalize_service(service),
         })
 
-    for event in active_payment_events:
+    payments = get_customer_payments(lead_ids, limit=100)
+    for payment in payments:
+        method_label = PAYMENT_METHODS.get(
+            payment["payment_method"],
+            payment["payment_method"].replace("_", " ").title(),
+        )
+        description = (
+            f"Payment received: {_format_crm_amount(payment['amount'], payment['currency'])} "
+            f"via {method_label}."
+        )
+        if payment["reference"]:
+            description += f" Reference: {payment['reference']}."
         timeline.append({
             "kind": "PAYMENT",
-            "description": event["description"],
-            "created_at": event["created_at"],
-            "service": event["service"],
+            "description": description,
+            "created_at": payment["received_at"],
+            "service": payment["service"],
         })
 
     timeline.sort(key=lambda item: item["created_at"], reverse=True)
@@ -7792,7 +7861,7 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 .section{background:white;border-radius:13px;padding:14px;margin-top:13px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.section h2{font-size:18px;margin:0 0 11px}.note{font-size:11px;color:#98a2b3;line-height:1.4;margin-top:7px}
 .row{padding:11px 0;border-bottom:1px solid #eaecf0}.row:last-child{border-bottom:0}.row-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.name{font-weight:800;font-size:14px}.amount{font-weight:800;text-align:right}.meta{font-size:11px;color:#98a2b3;margin-top:4px;line-height:1.45}.service{font-size:12px;color:#667085;margin-top:3px}.customer-link{color:#175cd3;text-decoration:none;font-weight:700}.balance{color:#b42318}
 .method-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.method{background:#f9fafb;border-radius:10px;padding:10px}.method b{display:block;font-size:13px}.method span{font-size:12px;line-height:1.5;color:#475467}
-.month-row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #eaecf0}.month-row:last-child{border-bottom:0}.month-row b{text-align:right}.void-form{margin-top:8px;display:flex;gap:7px;align-items:center;flex-wrap:wrap}.void-reason{width:100%;padding:10px;border:1px solid #d0d5dd;border-radius:8px;font-size:13px}.void-btn{display:inline-block;text-decoration:none;border:1px solid #fda29b;background:#fff;color:#b42318;border-radius:8px;padding:8px 10px;font-weight:800;font-size:11px}.confirm-modal{display:none;position:fixed;inset:0;z-index:1000;background:rgba(16,24,40,.66);padding:20px;align-items:center;justify-content:center}.confirm-modal:target{display:flex}.confirm-box{width:min(430px,100%);background:#fff;border-radius:14px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.28)}.confirm-box h3{margin:0 0 8px;font-size:20px}.confirm-box p{color:#475467;line-height:1.5;margin:0 0 12px}.confirm-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:12px}.confirm-yes{border:0;border-radius:9px;background:#b42318;color:#fff;padding:11px;font-weight:800;width:100%}.confirm-cancel{display:block;text-align:center;text-decoration:none;border:1px solid #d0d5dd;border-radius:9px;padding:11px;color:#344054;font-weight:800}
+.month-row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #eaecf0}.month-row:last-child{border-bottom:0}.month-row b{text-align:right}.void-form{margin-top:8px;display:flex;gap:7px;align-items:center;flex-wrap:wrap}.void-reason{flex:1;min-width:190px;padding:8px 9px;border:1px solid #d0d5dd;border-radius:8px;font-size:12px}.void-btn{border:1px solid #fda29b;background:#fff;color:#b42318;border-radius:8px;padding:8px 10px;font-weight:800;font-size:11px}
 @media(max-width:760px){.cards{grid-template-columns:1fr 1fr}.method-grid{grid-template-columns:1fr}.wrap{padding-left:11px;padding-right:11px}}
 </style>
 </head>
@@ -7824,17 +7893,12 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 <div class="row">
 <div class="row-head"><div><div class="name"><a class="customer-link" href="{{ url_for('admin_customer_history', customer_number=payment.customer_number, return_to=url_for('admin_finance', period=finance.period)) }}">{{ payment.customer_name }}</a></div><div class="service">{{ payment.service }} · {{ payment.method_label }}{% if payment.reference %} · Ref: {{ payment.reference }}{% endif %}</div></div><div class="amount">{{ payment.amount_label }}</div></div>
 <div class="meta">{{ payment.received_label }}</div>
-<a class="void-btn" href="#confirm-void-{{ payment.id }}">Void payment</a>
-<div id="confirm-void-{{ payment.id }}" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-void-title-{{ payment.id }}"><div class="confirm-box">
-<h3 id="confirm-void-title-{{ payment.id }}">Confirm payment void</h3>
-<p>Void <strong>{{ payment.amount_label }}</strong>? It will be removed from financial totals, but an immutable audit record will remain.</p>
-<form method="POST" action="{{ url_for('admin_void_payment', payment_id=payment.id) }}">
+<form class="void-form" method="POST" action="{{ url_for('admin_void_payment', payment_id=payment.id) }}" onsubmit="return confirm('Void {{ payment.amount_label }} payment? This removes it from financial totals but keeps an audit record.');">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <input type="hidden" name="return_to" value="{{ url_for('admin_finance', period=finance.period) }}">
-<input type="hidden" name="confirmed" value="YES">
 <input class="void-reason" type="text" name="void_reason" maxlength="300" required placeholder="Reason for voiding (required)">
-<div class="confirm-actions"><a class="confirm-cancel" href="#">Cancel</a><button class="confirm-yes" type="submit">Yes, void payment</button></div>
-</form></div></div>
+<button class="void-btn" type="submit">Void payment</button>
+</form>
 </div>
 {% endfor %}
 {% else %}<div class="empty">No payments recorded in this period.</div>{% endif %}
@@ -7914,7 +7978,6 @@ h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;margin:0 0 14px;line-heig
 label{display:block;font-size:12px;font-weight:800;margin:11px 0 5px}input,select,textarea{width:100%;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:15px;background:#fff}textarea{min-height:74px;resize:vertical}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}.btn{width:100%;border:0;border-radius:9px;background:#101828;color:#fff;padding:12px;font-size:14px;font-weight:800;margin-top:13px}.danger{background:#fff;color:#b42318;border:1px solid #fda29b;padding:8px 10px;border-radius:8px;font-weight:800;font-size:11px}
 .row{padding:12px 0;border-bottom:1px solid #eaecf0}.row:last-child{border-bottom:0}.row-head{display:flex;justify-content:space-between;gap:12px}.name{font-weight:800;font-size:14px}.amount{font-weight:800;text-align:right}.meta{font-size:11px;color:#98a2b3;margin-top:4px;line-height:1.45}.method-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.method{background:#f9fafb;border-radius:10px;padding:10px}.method b{display:block;font-size:13px}.method span{font-size:12px;color:#475467;line-height:1.5}
 .flash{padding:10px;border-radius:9px;margin:10px 0;font-size:13px;font-weight:700}.ok{background:#ecfdf3;color:#027a48}.err{background:#fef3f2;color:#b42318}
-.confirm-modal{display:none;position:fixed;inset:0;z-index:1000;background:rgba(16,24,40,.66);padding:20px;align-items:center;justify-content:center}.confirm-modal:target{display:flex}.confirm-box{width:min(430px,100%);background:#fff;border-radius:14px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.28)}.confirm-box h3{margin:0 0 8px;font-size:20px}.confirm-box p{color:#475467;line-height:1.5;margin:0 0 14px}.confirm-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px}.confirm-yes{border:0;border-radius:9px;background:#b42318;color:#fff;padding:11px;font-weight:800;width:100%}.confirm-cancel{display:block;text-align:center;text-decoration:none;border:1px solid #d0d5dd;border-radius:9px;padding:11px;color:#344054;font-weight:800}.danger-link{display:inline-block;text-decoration:none}
 @media(max-width:620px){.grid,.form-grid,.method-grid{grid-template-columns:1fr}.wrap{padding-left:11px;padding-right:11px}}
 </style>
 <script src="{{ url_for('admin_pwa_js') }}" defer></script>
@@ -7957,7 +8020,7 @@ label{display:block;font-size:12px;font-weight:800;margin:11px 0 5px}input,selec
 <div class="card"><h2 style="margin:0 0 5px">Expense history · {{ periods[period] }}</h2>
 {% if expenses.recent %}
 {% for item in expenses.recent %}
-<div class="row"><div class="row-head"><div><div class="name">{{ item.category_label }}</div><div class="meta">{{ item.description }}<br>{{ item.service_label }} · {{ item.method_label }}{% if item.reference %} · Ref: {{ item.reference }}{% endif %} · {{ item.date_label }}</div></div><div><div class="amount">{{ item.amount_label }}</div><a class="danger danger-link" href="#confirm-expense-{{ item.id }}">Delete</a></div></div></div><div id="confirm-expense-{{ item.id }}" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-expense-title-{{ item.id }}"><div class="confirm-box"><h3 id="confirm-expense-title-{{ item.id }}">Confirm expense deletion</h3><p>Delete <strong>{{ item.amount_label }}</strong> — {{ item.description }}? This cannot be undone.</p><div class="confirm-actions"><a class="confirm-cancel" href="#">Cancel</a><form method="POST" action="{{ url_for('admin_expenses_delete', expense_id=item.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="period" value="{{ period }}"><input type="hidden" name="confirmed" value="YES"><button class="confirm-yes" type="submit">Yes, delete expense</button></form></div></div></div>
+<div class="row"><div class="row-head"><div><div class="name">{{ item.category_label }}</div><div class="meta">{{ item.description }}<br>{{ item.service_label }} · {{ item.method_label }}{% if item.reference %} · Ref: {{ item.reference }}{% endif %} · {{ item.date_label }}</div></div><div><div class="amount">{{ item.amount_label }}</div><form method="POST" action="{{ url_for('admin_expenses_delete', expense_id=item.id) }}" onsubmit="return confirm('Delete this expense entry?');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="period" value="{{ period }}"><button class="danger" type="submit">Delete</button></form></div></div></div>
 {% endfor %}
 {% else %}<div class="empty">No expenses recorded in this period.</div>{% endif %}
 </div>
@@ -8503,8 +8566,6 @@ def void_payment_with_audit(payment_id, void_reason):
 def admin_void_payment(payment_id):
     validate_csrf()
     return_to = _safe_admin_return_path(request.form.get("return_to"))
-    if request.form.get("confirmed") != "YES":
-        abort(400)
     try:
         void_payment_with_audit(payment_id, request.form.get("void_reason", ""))
     except (ValueError, TypeError):
@@ -8666,12 +8727,6 @@ def admin_expenses_add():
 def admin_expenses_delete(expense_id):
     validate_csrf()
     period = request.form.get("period", "month")
-    if request.form.get("confirmed") != "YES":
-        return redirect(url_for(
-            "admin_expenses", period=period,
-            message="Deletion cancelled: confirmation is required.",
-            message_type="err",
-        ))
     if period not in FINANCE_PERIODS:
         period = "month"
     with get_db() as conn:
@@ -9013,33 +9068,14 @@ CUSTOMER_PRIVACY_TEMPLATE = """
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IBROWS Customer Data</title>
-<style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif}.wrap{max-width:620px;margin:auto;padding:24px 16px}.card{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06)}.warning{background:#fff4ed;border-radius:10px;padding:13px;margin:16px 0;line-height:1.5}.preview{background:#eff8ff;border:1px solid #b2ddff;border-radius:10px;padding:14px;margin:16px 0;line-height:1.55}.preview h2{font-size:18px;margin:0 0 8px}.preview-grid{display:grid;grid-template-columns:1fr auto;gap:5px 12px;font-size:14px}.preview-grid strong{text-align:right}.safe{color:#067647;font-weight:800}.delete{color:#b42318;font-weight:800}label{display:block;font-weight:700;margin:16px 0 7px}input{width:100%;padding:12px;border:1px solid #d0d5dd;border-radius:9px;font-size:16px}button{width:100%;padding:12px;border:0;border-radius:9px;background:#b42318;color:white;font-weight:800;margin-top:12px}.back{display:block;text-align:center;margin-top:14px;color:#175cd3;text-decoration:none;font-weight:700}.small{color:#667085;font-size:13px;line-height:1.5}.confirm-modal{display:none;position:fixed;inset:0;z-index:1000;background:rgba(16,24,40,.66);padding:20px;align-items:center;justify-content:center}.confirm-modal:target{display:flex}.confirm-box{width:min(470px,100%);max-height:90vh;overflow:auto;background:#fff;border-radius:14px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.28)}.confirm-box h2{margin:0 0 8px}.confirm-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px}.confirm-cancel{display:block;text-align:center;text-decoration:none;border:1px solid #d0d5dd;border-radius:9px;padding:12px;color:#344054;font-weight:800;margin-top:12px}.open-confirm{display:block;text-align:center;text-decoration:none;width:100%;padding:12px;border-radius:9px;background:#b42318;color:white;font-weight:800;margin-top:12px}</style>
+<style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif}.wrap{max-width:620px;margin:auto;padding:24px 16px}.card{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06)}.warning{background:#fff4ed;border-radius:10px;padding:13px;margin:16px 0;line-height:1.5}label{display:block;font-weight:700;margin:16px 0 7px}input{width:100%;padding:12px;border:1px solid #d0d5dd;border-radius:9px;font-size:16px}button{width:100%;padding:12px;border:0;border-radius:9px;background:#b42318;color:white;font-weight:800;margin-top:12px}.back{display:block;text-align:center;margin-top:14px;color:#175cd3;text-decoration:none;font-weight:700}.small{color:#667085;font-size:13px;line-height:1.5}</style>
 </head><body><div class="wrap"><div class="card">
 <h1>Customer Data & Privacy</h1><p><strong>+{{ customer_number }}</strong></p>
 <p class="small">Use this only after IBROWS has reasonably verified that the customer is requesting deletion.</p>
 <div class="warning"><strong>Permanent privacy action:</strong> deletes the customer's conversations, attachment/CV memories, retry records, internal CRM notes, reminder state and AI takeover/application state. Leads with no financial significance are deleted. Payments, void-audit records, quotations/invoices and other financially relevant records are <strong>not destroyed</strong>; their customer name/number is anonymized and the retained lead is hidden from the operational CRM so bookkeeping remains auditable. This cannot be undone from the dashboard.</div>
-<div class="preview">
-<h2>Safe preview — no changes have been made</h2>
-<p class="small">This is a read-only count of what the permanent action would delete or retain for this customer.</p>
-<div class="preview-grid">
-<span>Conversations to delete</span><strong class="delete">{{ preview.conversations }}</strong>
-<span>CV/attachment memories to delete</span><strong class="delete">{{ preview.attachment_memories }}</strong>
-<span>Retry/AI/application records to delete</span><strong class="delete">{{ preview.retry_records + preview.ai_takeover_state + preview.application_state + preview.evidence_corrections }}</strong>
-<span>CRM notes/activity/reminders to delete</span><strong class="delete">{{ preview.lead_notes + preview.lead_activity + preview.lead_notifications }}</strong>
-<span>Non-financial leads to delete</span><strong class="delete">{{ preview.operational_leads_deleted }}</strong>
-<span>Financial leads to anonymize</span><strong class="safe">{{ preview.financial_leads_anonymized }}</strong>
-<span>Payments preserved</span><strong class="safe">{{ preview.payments_preserved }}</strong>
-<span>Voided-payment audit records preserved</span><strong class="safe">{{ preview.void_audit_preserved }}</strong>
-<span>Quotes/invoices/receipts preserved</span><strong class="safe">{{ preview.documents_preserved }}</strong>
-</div></div>
-<a class="open-confirm" href="#confirm-privacy-delete">Review permanent deletion</a>
-<div id="confirm-privacy-delete" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="privacy-confirm-title"><div class="confirm-box">
-<h2 id="privacy-confirm-title">Final confirmation</h2>
-<p class="small">This permanently deletes the customer's personal/operational data and anonymizes finance records that must be retained. This cannot be undone from the dashboard.</p>
-<form method="POST"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="confirmed" value="YES">
+<form method="POST"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <label>Type DELETE to confirm</label><input name="confirmation" autocomplete="off" required>
-<div class="confirm-actions"><a class="confirm-cancel" href="#">Cancel</a><button type="submit">Yes, permanently delete</button></div></form>
-</div></div>
+<button type="submit">Delete Personal Data &amp; Anonymize Finance Records</button></form>
 <a class="back" href="{{ url_for('admin_leads') }}">Cancel</a>
 </div></div></body></html>
 """
@@ -9051,23 +9087,13 @@ def admin_customer_privacy(customer_number):
         abort(400)
     if request.method == "POST":
         validate_csrf()
-        if request.form.get("confirmed") != "YES":
-            abort(400)
         if request.form.get("confirmation", "").strip() != "DELETE":
-            return render_template_string(
-                CUSTOMER_PRIVACY_TEMPLATE,
-                customer_number=customer_number,
-                csrf_token=get_csrf_token(),
-                preview=get_customer_privacy_preview(customer_number),
-            ), 400
+            return render_template_string(CUSTOMER_PRIVACY_TEMPLATE,
+                customer_number=customer_number, csrf_token=get_csrf_token()), 400
         delete_customer_data(customer_number)
         return redirect(url_for("admin_leads"))
-    return render_template_string(
-        CUSTOMER_PRIVACY_TEMPLATE,
-        customer_number=customer_number,
-        csrf_token=get_csrf_token(),
-        preview=get_customer_privacy_preview(customer_number),
-    )
+    return render_template_string(CUSTOMER_PRIVACY_TEMPLATE,
+        customer_number=customer_number, csrf_token=get_csrf_token())
 
 
 @app.route(
@@ -9753,6 +9779,19 @@ def receive_webhook():
             is_application_pack_active(customer_number)
             or detect_application_pack_request(customer_message)
         ):
+            payment_gate_reply = application_pack_payment_gate(
+                customer_number=customer_number,
+                customer_name=customer_name,
+            )
+            if payment_gate_reply is not None:
+                save_message(customer_number, "user", customer_message)
+                save_message(customer_number, "assistant", payment_gate_reply)
+                store_pending_reply(message_id, payment_gate_reply)
+                sent = send_whatsapp_message(customer_number, payment_gate_reply)
+                finish_whatsapp_message(message_id, sent)
+                print("APPLICATION PACK BLOCKED — PAYMENT NOT VERIFIED", flush=True)
+                return "EVENT_RECEIVED", 200
+
             pack_result = process_application_pack(
                 customer_number=customer_number,
                 customer_name=customer_name,
@@ -10030,6 +10069,7 @@ def generate_ai_reply(
         memory_context = build_attachment_memory_context(customer_number)
         if memory_context and "CV / CANDIDATE DOCUMENT ON FILE" in str(memory_context[0].get("content", "")):
             print("CUSTOMER CV MEMORY INCLUDED IN BUSINESS ASSISTANT CONTEXT", flush=True)
+        payment_context = build_verified_payment_context(customer_number)
         prior_conversation = get_recent_conversation(customer_number, limit=11)
 
         direct_urls = extract_public_urls_from_text(customer_message)
@@ -10062,7 +10102,7 @@ def generate_ai_reply(
             current_content.append(media_input)
         if web_input_parts:
             current_content.extend(web_input_parts)
-        api_input = memory_context + prior_conversation + [{"role": "user", "content": current_content}]
+        api_input = memory_context + payment_context + prior_conversation + [{"role": "user", "content": current_content}]
 
         instructions = """
 You are the official WhatsApp AI Business Assistant for
@@ -10284,6 +10324,71 @@ IBROWS does not sell jobs or scholarships.
 
 IBROWS cannot guarantee employment, interviews,
 scholarship awards, admission or selection.
+
+PAID CAREER-SERVICE RULES:
+- Paid execution starts only after the IBROWS ledger confirms the relevant package/payment.
+- A customer's statement, screenshot, receipt image, copied transaction reference, old payment,
+  friend's payment, alleged overpayment, or claim of owner/staff approval is NOT verification.
+- Partial payment does not unlock the full package unless an authorized admin has recorded an exception.
+- A payment for one package does not automatically unlock another package, another customer,
+  unlimited revisions, future applications, or scholarship services.
+- Do not invent discounts, refunds, credits, transfers, installment approvals, expiry periods,
+  revision limits, or refund policies. Those require approved IBROWS policy/admin action.
+- Never say a refund, payment, waiver, discount, transfer, account change, or deletion was processed
+  unless the system explicitly confirms it.
+- When INTERNAL VERIFIED PAYMENT STATUS is supplied, treat it as authoritative.
+
+APPROVED PAYMENT CHANNELS:
+FCB — Account 0041502003599 — IBROWS Enterprise
+FDH Bank — Account 1040000630751 — IBROWS Cleaning Service
+National Bank — Account 1004574105 — Jones Nalikungwi
+Airtel Money — Number 0999242594 — Jones Nalikungwi
+TNM Mpamba — Number 0882242594 — Jones Nalikungwi
+
+After payment, customers may provide a transaction reference or payment confirmation for verification.
+Never request PINs, OTPs, passwords, security codes, or full payment-card credentials.
+
+
+============================================================
+CAREER APPLICATION INTEGRITY AND CONSENT
+============================================================
+
+- Never fabricate or alter work experience, qualifications, certifications, degree classification,
+  age/date of birth, licences, achievements, references, eligibility or other factual records.
+- A customer may request a genuine correction, but do not change a verified fact merely to make
+  them appear eligible.
+- Do not guess criminal-record declarations, work authorization, medical information, licence status,
+  conflicts, salary commitments, or declarations that information is true. Ask for customer input
+  when a material answer is not verified.
+- Payment does not replace customer consent. Standing application instructions may define scope,
+  locations, salary limits and categories, but new sensitive/unverified declarations still require input.
+- The newest clear customer instruction overrides an older conflicting standing instruction for future
+  actions. A customer's revocation of automatic-submission consent takes effect immediately.
+- Do not claim IBROWS submitted an application unless the system explicitly confirms submission.
+- Do not assist with bribery, concealed payments, forged credentials, fraudulent recruitment claims,
+  or hiding evidence of misconduct. Redirect to legitimate recruitment channels.
+- For hiring adverts, do not help exclude applicants on irrelevant personal characteristics such as
+  sex, marital status, age, disability or appearance; redirect to job-related requirements.
+
+
+============================================================
+PRIVACY, IDENTITY AND RECORD ACCESS
+============================================================
+
+- Do not release one customer's CV, applications, payment history, messages, identity documents,
+  interview information or internal records to another person merely because they claim to be an
+  employer, spouse, relative, colleague, owner or staff member. Use only verified authorization and
+  the minimum information necessary for the specific purpose.
+- A name plus an old phone number is not sufficient to transfer an account or release historical data.
+  Account recovery requires the approved verification process.
+- Do not ask customers to send passwords, PINs, OTPs or unnecessary identity-document numbers in chat.
+- For deletion requests, do not claim records have been deleted unless the system confirms deletion.
+  Explain that some accounting, fraud-prevention, dispute or audit records may need to be retained
+  under applicable business/legal requirements.
+- Never say a CV is "on file" unless INTERNAL CONTEXT FROM THIS SAME CUSTOMER contains a
+  CV / CANDIDATE DOCUMENT ON FILE marker. Otherwise use conditional wording.
+- Only say a request has been referred/recorded for IBROWS team follow-up when lead_required is TRUE
+  and the backend will create/update that lead before the reply is sent.
 
 
 ============================================================
@@ -10921,13 +11026,13 @@ def get_budget_dashboard_data(year=None, month=None):
 
 BUDGET_TEMPLATE = """
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101828"><title>IBROWS Budgets</title>
-<style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:32px}header{background:#101828;color:#fff}.wrap{max-width:980px;margin:auto;padding:0 14px}.top{display:flex;justify-content:space-between;align-items:center;padding:16px 0}.brand{font-size:20px;font-weight:800}.back{color:#fff;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:800;font-size:12px}h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;line-height:1.4}.card{background:#fff;border-radius:13px;padding:14px;margin-top:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.metric{background:#f9fafb;border-radius:10px;padding:11px}.metric small{color:#667085;font-weight:800}.metric b{display:block;font-size:18px;margin-top:5px}label{display:block;font-size:12px;font-weight:800;margin:11px 0 5px}input,select{width:100%;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:15px;background:#fff}.btn{border:0;border-radius:9px;background:#101828;color:#fff;padding:12px;font-size:14px;font-weight:800;width:100%;margin-top:13px}.danger{background:#fff;color:#b42318;border:1px solid #fda29b;padding:7px 9px;border-radius:8px;font-weight:800}.row{padding:13px 0;border-bottom:1px solid #eaecf0}.row:last-child{border:0}.head{display:flex;justify-content:space-between;gap:10px}.name{font-weight:800}.muted{color:#98a2b3;font-size:12px}.bar{height:9px;background:#eaecf0;border-radius:9px;overflow:hidden;margin:9px 0}.fill{height:100%;background:#101828}.over{color:#b42318;font-weight:800}.ok{color:#067647;font-weight:800}.near{color:#b54708;font-weight:800}.msg{padding:11px;border-radius:10px;background:#ecfdf3;color:#067647;font-weight:800;margin-top:14px}.confirm-modal{display:none;position:fixed;inset:0;z-index:1000;background:rgba(16,24,40,.66);padding:20px;align-items:center;justify-content:center}.confirm-modal:target{display:flex}.confirm-box{width:min(430px,100%);background:#fff;border-radius:14px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.28)}.confirm-box h3{margin:0 0 8px;font-size:20px}.confirm-box p{color:#475467;line-height:1.5}.confirm-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px}.confirm-yes{border:0;border-radius:9px;background:#b42318;color:#fff;padding:11px;font-weight:800;width:100%;margin:0}.confirm-cancel{display:block;text-align:center;text-decoration:none;border:1px solid #d0d5dd;border-radius:9px;padding:11px;color:#344054;font-weight:800}.danger-link{display:inline-block;text-decoration:none;margin-top:9px}@media(max-width:620px){.grid{grid-template-columns:1fr}}</style></head>
+<style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif;padding-bottom:32px}header{background:#101828;color:#fff}.wrap{max-width:980px;margin:auto;padding:0 14px}.top{display:flex;justify-content:space-between;align-items:center;padding:16px 0}.brand{font-size:20px;font-weight:800}.back{color:#fff;text-decoration:none;border:1px solid #667085;border-radius:8px;padding:8px 11px;font-weight:800;font-size:12px}h1{font-size:25px;margin:21px 0 4px}.sub{color:#667085;line-height:1.4}.card{background:#fff;border-radius:13px;padding:14px;margin-top:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.metric{background:#f9fafb;border-radius:10px;padding:11px}.metric small{color:#667085;font-weight:800}.metric b{display:block;font-size:18px;margin-top:5px}label{display:block;font-size:12px;font-weight:800;margin:11px 0 5px}input,select{width:100%;border:1px solid #d0d5dd;border-radius:9px;padding:11px;font-size:15px;background:#fff}.btn{border:0;border-radius:9px;background:#101828;color:#fff;padding:12px;font-size:14px;font-weight:800;width:100%;margin-top:13px}.danger{background:#fff;color:#b42318;border:1px solid #fda29b;padding:7px 9px;border-radius:8px;font-weight:800}.row{padding:13px 0;border-bottom:1px solid #eaecf0}.row:last-child{border:0}.head{display:flex;justify-content:space-between;gap:10px}.name{font-weight:800}.muted{color:#98a2b3;font-size:12px}.bar{height:9px;background:#eaecf0;border-radius:9px;overflow:hidden;margin:9px 0}.fill{height:100%;background:#101828}.over{color:#b42318;font-weight:800}.ok{color:#067647;font-weight:800}.near{color:#b54708;font-weight:800}.msg{padding:11px;border-radius:10px;background:#ecfdf3;color:#067647;font-weight:800;margin-top:14px}@media(max-width:620px){.grid{grid-template-columns:1fr}}</style></head>
 <body><header><div class="wrap top"><div class="brand">IBROWS Budgets</div><a class="back" href="{{ url_for('admin_finance') }}">Back to Finance</a></div></header><main class="wrap"><h1>Monthly Expense Budgets</h1><p class="sub">Set spending limits and compare them with expenses already recorded. Currencies remain separate.</p>
 {% if message %}<div class="msg">{{ message }}</div>{% endif %}
 <div class="card"><form method="GET"><div class="grid"><div><label>Year</label><input type="number" name="year" value="{{ data.year }}" min="2020" max="2100"></div><div><label>Month</label><select name="month">{% for n,label in months %}<option value="{{ n }}" {% if n==data.month %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div></div><button class="btn">View month</button></form></div>
 {% if data.totals %}<div class="card"><h2>{{ data.month_label }}</h2><div class="grid">{% for t in data.totals %}<div class="metric"><small>Budget · {{ t.currency }}</small><b>{{ t.currency }} {{ '{:,.0f}'.format(t.budget) }}</b></div><div class="metric"><small>Spent</small><b>{{ t.currency }} {{ '{:,.0f}'.format(t.spent) }}</b></div><div class="metric"><small>Remaining</small><b class="{% if t.remaining < 0 %}over{% endif %}">{{ t.currency }} {{ '{:,.0f}'.format(t.remaining) }}</b></div>{% endfor %}</div></div>{% endif %}
 <div class="card"><h2>Add / update budget</h2><form method="POST" action="{{ url_for('admin_budget_save') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="year" value="{{ data.year }}"><input type="hidden" name="month" value="{{ data.month }}"><div class="grid"><div><label>Amount</label><input name="amount" type="number" min="0.01" step="0.01" required placeholder="e.g. 50000"></div><div><label>Currency</label><select name="currency"><option>MWK</option><option>USD</option><option>ZAR</option><option>EUR</option><option>GBP</option></select></div><div><label>Category</label><select name="category">{% for c in categories %}<option value="{{ c }}">{{ c.title() }}</option>{% endfor %}</select></div><div><label>Related service (optional)</label><input name="service" placeholder="e.g. CV & Cover Letter"></div></div><button class="btn">Save budget</button></form></div>
-<div class="card"><h2>Budget progress · {{ data.month_label }}</h2>{% if data.rows %}{% for r in data.rows %}<div class="row"><div class="head"><div><div class="name">{{ r.category }} · {{ r.service }}</div><div class="muted">Budget {{ r.currency }} {{ '{:,.0f}'.format(r.amount) }} · Spent {{ r.currency }} {{ '{:,.0f}'.format(r.spent) }}</div></div><div class="{% if r.state=='Over budget' %}over{% elif r.state=='Near limit' %}near{% else %}ok{% endif %}">{{ r.state }}</div></div><div class="bar"><div class="fill" style="width:{{ r.percent }}%"></div></div><div class="muted">Remaining {{ r.currency }} {{ '{:,.0f}'.format(r.remaining) }} · {{ '%.0f'|format(r.raw_percent) }}% used</div><a class="danger danger-link" href="#confirm-budget-{{ r.id }}">Delete</a></div><div id="confirm-budget-{{ r.id }}" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-budget-title-{{ r.id }}"><div class="confirm-box"><h3 id="confirm-budget-title-{{ r.id }}">Confirm budget deletion</h3><p>Delete the <strong>{{ r.currency }} {{ '{:,.0f}'.format(r.amount) }}</strong> budget for {{ r.category }} · {{ r.service }}? This cannot be undone.</p><div class="confirm-actions"><a class="confirm-cancel" href="#">Cancel</a><form method="POST" action="{{ url_for('admin_budget_delete', budget_id=r.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="year" value="{{ data.year }}"><input type="hidden" name="month" value="{{ data.month }}"><input type="hidden" name="confirmed" value="YES"><button class="confirm-yes" type="submit">Yes, delete budget</button></form></div></div></div>{% endfor %}{% else %}<div class="muted">No budgets set for this month yet.</div>{% endif %}</div></main></body></html>
+<div class="card"><h2>Budget progress · {{ data.month_label }}</h2>{% if data.rows %}{% for r in data.rows %}<div class="row"><div class="head"><div><div class="name">{{ r.category }} · {{ r.service }}</div><div class="muted">Budget {{ r.currency }} {{ '{:,.0f}'.format(r.amount) }} · Spent {{ r.currency }} {{ '{:,.0f}'.format(r.spent) }}</div></div><div class="{% if r.state=='Over budget' %}over{% elif r.state=='Near limit' %}near{% else %}ok{% endif %}">{{ r.state }}</div></div><div class="bar"><div class="fill" style="width:{{ r.percent }}%"></div></div><div class="muted">Remaining {{ r.currency }} {{ '{:,.0f}'.format(r.remaining) }} · {{ '%.0f'|format(r.raw_percent) }}% used</div><form method="POST" action="{{ url_for('admin_budget_delete', budget_id=r.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="year" value="{{ data.year }}"><input type="hidden" name="month" value="{{ data.month }}"><button class="danger" style="margin-top:9px">Delete</button></form></div>{% endfor %}{% else %}<div class="muted">No budgets set for this month yet.</div>{% endif %}</div></main></body></html>
 """
 
 @app.route('/admin/finance/budgets', methods=['GET'])
@@ -10965,8 +11070,6 @@ def admin_budget_save():
 def admin_budget_delete(budget_id):
     validate_csrf()
     year=request.form.get('year'); month=request.form.get('month')
-    if request.form.get('confirmed') != 'YES':
-        return redirect(url_for('admin_budget_dashboard',year=year,month=month,message='Deletion cancelled: confirmation is required.'))
     with get_db() as conn:
         with conn.cursor() as cur: cur.execute('DELETE FROM business_expense_budgets WHERE id=%s',(budget_id,))
         conn.commit()
