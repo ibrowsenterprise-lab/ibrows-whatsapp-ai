@@ -3615,6 +3615,108 @@ def detect_explicit_human_handover(customer_message):
     return any(phrase in text for phrase in strong_phrases)
 
 
+def record_human_handover_on_current_lead(
+    customer_number,
+    customer_name,
+    requested_person=None,
+):
+    """
+    Attach a fresh human-handover event to the customer's current open lead.
+
+    The existing enquiry summary is preserved so Jones still sees what the
+    customer originally needed. Only the current human-follow-up reason is
+    refreshed, the lead is raised to HIGH priority, and a timestamped activity
+    row is appended. If no open lead exists, create a General Enquiry lead.
+    """
+    if requested_person == "Jones":
+        reason = "Customer requested to talk to Jones."
+        activity = "Customer selected Talk to Jones. AI paused for human takeover."
+    else:
+        reason = "Customer requested human assistance and asked to stop AI interaction."
+        activity = "Customer requested human assistance. AI paused for human takeover."
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, service, summary
+                FROM leads
+                WHERE customer_number = %s
+                  AND status IN ('NEW', 'CONTACTED')
+                  AND merged_into_lead_id IS NULL
+                  AND privacy_deleted_at IS NULL
+                  AND entitlement_consumed_at IS NULL
+                ORDER BY updated_at DESC, created_at DESC, id DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (customer_number,),
+            )
+            current = cur.fetchone()
+
+            if current:
+                lead_id, service, existing_summary = current
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET customer_name = COALESCE(NULLIF(%s, ''), customer_name),
+                        handover_reason = %s,
+                        priority = 'HIGH',
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (customer_name, reason, lead_id),
+                )
+                is_new_lead = False
+            else:
+                service = "General Enquiry"
+                existing_summary = reason
+                cur.execute(
+                    """
+                    INSERT INTO leads (
+                        customer_number, customer_name, service, summary,
+                        handover_reason, priority
+                    )
+                    VALUES (%s, %s, %s, %s, %s, 'HIGH')
+                    RETURNING id
+                    """,
+                    (
+                        customer_number,
+                        customer_name,
+                        service,
+                        reason,
+                        reason,
+                    ),
+                )
+                lead_id = cur.fetchone()[0]
+                is_new_lead = True
+
+            _activity_insert(
+                cur,
+                lead_id,
+                "HUMAN_HANDOVER_REQUESTED",
+                activity,
+            )
+
+            # Surface the latest handover directly on the lead card as a recent
+            # note as well as keeping the permanent CRM activity history.
+            cur.execute(
+                """
+                INSERT INTO lead_notes (lead_id, note_text)
+                VALUES (%s, %s)
+                """,
+                (lead_id, activity),
+            )
+
+        conn.commit()
+
+    print(
+        f"HUMAN HANDOVER RECORDED: lead={lead_id} requested_person={requested_person or 'human'}",
+        flush=True,
+    )
+    return lead_id, is_new_lead, canonicalize_service(service), existing_summary, reason
+
+
 def handle_local_human_handover(
     customer_number,
     customer_name,
@@ -3622,7 +3724,7 @@ def handle_local_human_handover(
     requested_person=None,
 ):
     """
-    Pause AI and create/update a handover lead without calling OpenAI.
+    Pause AI and record a real, auditable handover without calling OpenAI.
     Returns the fixed customer acknowledgement.
     """
     save_message(customer_number, "user", customer_message)
@@ -3640,18 +3742,20 @@ def handle_local_human_handover(
         )
 
     # Pause first so the customer's explicit preference is respected even
-    # if email notification later fails.
+    # if lead recording or notification later fails.
     set_ai_paused(customer_number, True)
 
     try:
-        handover_service = get_latest_open_lead_service(customer_number)
-
-        lead_id, is_new_lead = create_or_update_lead(
+        (
+            lead_id,
+            is_new_lead,
+            handover_service,
+            handover_summary,
+            handover_reason,
+        ) = record_human_handover_on_current_lead(
             customer_number=customer_number,
             customer_name=customer_name,
-            service=handover_service,
-            summary="Customer explicitly requested human assistance and asked to stop AI interaction.",
-            handover_reason="Explicit request to speak with a human/manager or stop AI."
+            requested_person=requested_person,
         )
 
         if is_new_lead:
@@ -3660,13 +3764,13 @@ def handle_local_human_handover(
                 customer_name=customer_name,
                 customer_number=customer_number,
                 service=handover_service,
-                summary="Customer explicitly requested human assistance and asked to stop AI interaction.",
-                handover_reason="Explicit request to speak with a human/manager or stop AI."
+                summary=handover_summary,
+                handover_reason=handover_reason,
             )
     except Exception as handover_error:
         print(
-            f"Local handover lead/notification error: {type(handover_error).__name__}",
-            flush=True
+            f"Local handover lead/notification error: {type(handover_error).__name__}: {handover_error}",
+            flush=True,
         )
 
     save_message(customer_number, "assistant", reply)
