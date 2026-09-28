@@ -338,6 +338,22 @@ def init_database():
                 ON leads(privacy_deleted_at)
             """)
 
+            # One-off paid services must not be reusable after successful delivery.
+            # Financial rows remain intact for audit/accounting; this marker only
+            # prevents the same entitlement/payment from unlocking another service.
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS entitlement_consumed_at TIMESTAMPTZ
+            """)
+            cur.execute("""
+                ALTER TABLE leads
+                ADD COLUMN IF NOT EXISTS entitlement_consumed_reason TEXT
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_leads_entitlement_consumed
+                ON leads(entitlement_consumed_at)
+            """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS lead_payments (
                     id BIGSERIAL PRIMARY KEY,
@@ -604,6 +620,14 @@ def init_database():
                 CREATE TABLE IF NOT EXISTS application_pack_state (
                     customer_number TEXT PRIMARY KEY,
                     active BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS customer_menu_state (
+                    customer_number TEXT PRIMARY KEY,
+                    menu_name TEXT NOT NULL,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
@@ -1335,6 +1359,360 @@ def set_application_pack_active(customer_number, active):
 
 
 
+# =========================================================
+# WHATSAPP NUMBERED SERVICE MENU
+# =========================================================
+
+MAIN_SERVICE_MENU = """Welcome to IBROWS Enterprise 👋
+What can we help you with?
+Reply with a number or type the service name.
+
+1. Career & Jobs
+2. Scholarships & Opportunities
+3. Business Registration & Support
+4. Website, AI & Automation
+5. Design, Branding & Social Media
+6. Photo Restoration
+7. Cleaning Services
+8. Car Wash
+9. Fumigation
+10. Landscaping
+11. Construction & Property Improvement
+12. Agricultural Services
+
+0. Talk to Jones
+
+Type MENU anytime to see this list again."""
+
+CAREER_SERVICE_MENU = """Career & Jobs
+Reply with a number or type the service name.
+
+1. CV + Cover Letter — MK5,000
+2. Single Job Application — MK2,000
+3. Career Assist — MK50,000/month
+4. Career Assist Pro — MK100,000/month
+5. Opportunity Alerts — MK20,000/month
+6. Scholarship Search — MK60,000/month
+
+9. Main Menu
+0. Talk to Jones"""
+
+
+def _normalise_menu_text(value):
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def set_customer_menu_state(customer_number, menu_name):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO customer_menu_state (customer_number, menu_name, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (customer_number)
+                DO UPDATE SET menu_name=EXCLUDED.menu_name, updated_at=NOW()
+                """,
+                (customer_number, str(menu_name or "MAIN")[:30]),
+            )
+        conn.commit()
+
+
+def get_customer_menu_state(customer_number):
+    """Return only a recent menu state so an old menu cannot hijack later numeric replies."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT menu_name
+                FROM customer_menu_state
+                WHERE customer_number=%s
+                  AND updated_at > NOW() - INTERVAL '2 hours'
+                """,
+                (customer_number,),
+            )
+            row = cur.fetchone()
+    return row[0] if row else None
+
+
+def clear_customer_menu_state(customer_number):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM customer_menu_state WHERE customer_number=%s",
+                (customer_number,),
+            )
+        conn.commit()
+
+
+def is_main_service_menu_request(customer_message):
+    text = _normalise_menu_text(customer_message)
+    exact = {
+        "menu", "main menu", "services", "service", "service menu",
+        "show services", "show me services", "list services", "service list",
+        "what do you offer", "what services do you offer", "what do you do",
+        "your services", "ibrows services",
+    }
+    return text in exact
+
+
+def _career_menu_selection(text):
+    aliases = {
+        "1": "CV",
+        "cv": "CV",
+        "cv and cover letter": "CV",
+        "cv & cover letter": "CV",
+        "cover letter": "CV",
+        "one-off cv": "CV",
+        "one off cv": "CV",
+        "2": "SINGLE_APPLICATION",
+        "single job application": "SINGLE_APPLICATION",
+        "job application": "SINGLE_APPLICATION",
+        "application assistance": "SINGLE_APPLICATION",
+        "3": "CAREER_ASSIST",
+        "career assist": "CAREER_ASSIST",
+        "4": "CAREER_ASSIST_PRO",
+        "career assist pro": "CAREER_ASSIST_PRO",
+        "5": "ALERTS",
+        "opportunity alerts": "ALERTS",
+        "job alerts": "ALERTS",
+        "alerts": "ALERTS",
+        "6": "SCHOLARSHIP",
+        "scholarship search": "SCHOLARSHIP",
+        "scholarships": "SCHOLARSHIP",
+        "9": "MAIN",
+        "main": "MAIN",
+        "main menu": "MAIN",
+        "back": "MAIN",
+        "0": "JONES",
+        "jones": "JONES",
+        "talk to jones": "JONES",
+        "speak to jones": "JONES",
+    }
+    return aliases.get(text)
+
+
+def _main_menu_selection(text):
+    aliases = {
+        "1": "CAREER",
+        "career": "CAREER",
+        "careers": "CAREER",
+        "career and jobs": "CAREER",
+        "career & jobs": "CAREER",
+        "jobs": "CAREER",
+        "2": "SCHOLARSHIP",
+        "scholarship": "SCHOLARSHIP",
+        "scholarships": "SCHOLARSHIP",
+        "scholarships and opportunities": "SCHOLARSHIP",
+        "scholarships & opportunities": "SCHOLARSHIP",
+        "3": "BUSINESS",
+        "business registration": "BUSINESS",
+        "business registration and support": "BUSINESS",
+        "business registration & support": "BUSINESS",
+        "business support": "BUSINESS",
+        "4": "DIGITAL",
+        "website": "DIGITAL",
+        "website development": "DIGITAL",
+        "ai": "DIGITAL",
+        "automation": "DIGITAL",
+        "website ai and automation": "DIGITAL",
+        "website, ai & automation": "DIGITAL",
+        "5": "MEDIA",
+        "design": "MEDIA",
+        "graphic design": "MEDIA",
+        "branding": "MEDIA",
+        "social media": "MEDIA",
+        "design branding and social media": "MEDIA",
+        "design, branding & social media": "MEDIA",
+        "6": "PHOTO",
+        "photo restoration": "PHOTO",
+        "photo enhancement": "PHOTO",
+        "7": "CLEANING",
+        "cleaning": "CLEANING",
+        "cleaning services": "CLEANING",
+        "8": "CAR_WASH",
+        "car wash": "CAR_WASH",
+        "carwash": "CAR_WASH",
+        "9": "FUMIGATION",
+        "fumigation": "FUMIGATION",
+        "10": "LANDSCAPING",
+        "landscaping": "LANDSCAPING",
+        "11": "CONSTRUCTION",
+        "construction": "CONSTRUCTION",
+        "construction and property improvement": "CONSTRUCTION",
+        "construction & property improvement": "CONSTRUCTION",
+        "property improvement": "CONSTRUCTION",
+        "12": "AGRO",
+        "agriculture": "AGRO",
+        "agricultural services": "AGRO",
+        "agro": "AGRO",
+        "agro services": "AGRO",
+        "0": "JONES",
+        "jones": "JONES",
+        "talk to jones": "JONES",
+        "speak to jones": "JONES",
+    }
+    return aliases.get(text)
+
+
+def handle_numbered_service_menu(customer_number, customer_name, customer_message):
+    """Handle menu navigation locally. Return None when normal AI should handle the message.
+
+    Returned dict actions:
+      REPLY -> send deterministic menu reply
+      JONES -> activate the real human handover workflow
+    """
+    text = _normalise_menu_text(customer_message)
+    current = get_customer_menu_state(customer_number)
+
+    # MENU/services requests always open a fresh main menu.
+    if is_main_service_menu_request(customer_message):
+        set_customer_menu_state(customer_number, "MAIN")
+        return {"action": "REPLY", "reply": MAIN_SERVICE_MENU}
+
+    # Typed service names should work even when no menu is currently open.
+    career_direct = _career_menu_selection(text)
+    if current != "CAREER" and career_direct in {
+        "CV", "SINGLE_APPLICATION", "CAREER_ASSIST", "CAREER_ASSIST_PRO", "ALERTS", "SCHOLARSHIP"
+    } and not text.isdigit():
+        current = "CAREER"
+
+    main_direct = _main_menu_selection(text)
+    if current is None and main_direct and not text.isdigit():
+        current = "MAIN"
+
+    if current == "CAREER":
+        selected = _career_menu_selection(text)
+        if not selected:
+            # A natural-language answer should continue through the AI instead of
+            # being trapped by a stale menu state.
+            clear_customer_menu_state(customer_number)
+            return None
+
+        if selected == "JONES":
+            clear_customer_menu_state(customer_number)
+            return {"action": "JONES"}
+        if selected == "MAIN":
+            set_customer_menu_state(customer_number, "MAIN")
+            return {"action": "REPLY", "reply": MAIN_SERVICE_MENU}
+
+        clear_customer_menu_state(customer_number)
+
+        if selected == "CV":
+            gate_reply = application_pack_payment_gate(customer_number, customer_name)
+            if gate_reply is not None:
+                return {"action": "REPLY", "reply": gate_reply}
+            set_application_pack_active(customer_number, True)
+            return {
+                "action": "REPLY",
+                "reply": (
+                    "Your One-Off CV + Cover Letter package is fully paid and active. "
+                    "Please send the target job advert/link, or tell me the job title and employer. "
+                    "If you already supplied your current CV to IBROWS, you do not need to resend it unless it has changed."
+                ),
+            }
+        if selected == "SINGLE_APPLICATION":
+            return {
+                "action": "REPLY",
+                "reply": (
+                    "Single Job Application assistance is MK2,000. Please send the vacancy advert or official link "
+                    "and tell me which role you want to apply for. Paid application work starts after the relevant payment is verified."
+                ),
+            }
+        if selected == "CAREER_ASSIST":
+            return {
+                "action": "REPLY",
+                "reply": (
+                    "Career Assist is MK50,000 per month. Tell me the job fields, locations/countries and type of work "
+                    "you want so we can define the search and application scope."
+                ),
+            }
+        if selected == "CAREER_ASSIST_PRO":
+            return {
+                "action": "REPLY",
+                "reply": (
+                    "Career Assist Pro is MK100,000 per month. Tell me the roles, locations/countries and level of support "
+                    "you need so IBROWS can confirm the scope before paid execution begins."
+                ),
+            }
+        if selected == "ALERTS":
+            return {
+                "action": "REPLY",
+                "reply": (
+                    "Opportunity Alerts are MK20,000 per month. Tell me the job fields or opportunity types and the "
+                    "locations/countries you want monitored."
+                ),
+            }
+        if selected == "SCHOLARSHIP":
+            return {
+                "action": "REPLY",
+                "reply": (
+                    "Scholarship Search is MK60,000 per month. Tell me the study level, field of study and preferred countries, "
+                    "or send a scholarship link you want checked."
+                ),
+            }
+
+    if current == "MAIN":
+        selected = _main_menu_selection(text)
+        if not selected:
+            if text.isdigit():
+                return {
+                    "action": "REPLY",
+                    "reply": "Please choose a number from 0 to 12, or type the service name.\n\n" + MAIN_SERVICE_MENU,
+                }
+            clear_customer_menu_state(customer_number)
+            return None
+
+        if selected == "JONES":
+            clear_customer_menu_state(customer_number)
+            return {"action": "JONES"}
+        if selected == "CAREER":
+            set_customer_menu_state(customer_number, "CAREER")
+            return {"action": "REPLY", "reply": CAREER_SERVICE_MENU}
+
+        clear_customer_menu_state(customer_number)
+        replies = {
+            "SCHOLARSHIP": (
+                "You selected Scholarships & Opportunities. Scholarship Search is MK60,000 per month. "
+                "Tell me your study level, field of study and preferred countries, or send a scholarship link you want checked."
+            ),
+            "BUSINESS": (
+                "You selected Business Registration & Support. Tell me whether you need business registration, a business plan, "
+                "accounting/tax-related support, South Africa setup assistance, or another business service."
+            ),
+            "DIGITAL": (
+                "You selected Website, AI & Automation. Tell me what you want built or improved and what the business/project needs it to do."
+            ),
+            "MEDIA": (
+                "You selected Design, Branding & Social Media. Tell me whether you need graphic design, branding, social media management, "
+                "digital marketing, printing-related work, or content creation."
+            ),
+            "PHOTO": (
+                "You selected Photo Restoration. Please send the photo you want restored or enhanced and tell me the result you want."
+            ),
+            "CLEANING": (
+                "You selected Cleaning Services. Please tell me the town/district, property type and the cleaning you need."
+            ),
+            "CAR_WASH": (
+                "You selected Car Wash. Please tell me your vehicle type, the cleaning/service you need and your location."
+            ),
+            "FUMIGATION": (
+                "You selected Fumigation. Please tell me the town/district, premises type and the pest/problem you need treated."
+            ),
+            "LANDSCAPING": (
+                "You selected Landscaping. Please tell me the project location, approximate property/yard size and the work you need."
+            ),
+            "CONSTRUCTION": (
+                "You selected Construction & Property Improvement. Please tell me the project location, current stage and the work you need done."
+            ),
+            "AGRO": (
+                "You selected Agricultural Services. Please tell me the product, equipment or service you need, your location and quantity where relevant."
+            ),
+        }
+        return {"action": "REPLY", "reply": replies[selected]}
+
+    return None
+
+
 def get_application_evidence_corrections(customer_number, limit=40):
     """Return narrow QA-approved wording corrections for this customer only."""
     with get_db() as conn:
@@ -1390,17 +1768,53 @@ def save_application_evidence_corrections(customer_number, replacements, source=
 
 
 def detect_application_pack_request(customer_message):
-    """Detect explicit requests to prepare both a CV/resume and cover/application letter."""
+    """
+    Detect a customer's explicit instruction to prepare/continue the paid CV +
+    Cover Letter application pack. Keep this deterministic so a verified paid
+    customer reaches the document pipeline instead of falling back to general AI.
+    """
     text = " ".join(str(customer_message or "").lower().split())
-    action = any(word in text for word in (
-        "prepare", "create", "generate", "draft", "write", "make", "produce"
+    if not text:
+        return False
+
+    # Respect clear cancellation/stop instructions.
+    cancellation = any(phrase in text for phrase in (
+        "do not prepare", "don't prepare", "dont prepare",
+        "do not start", "don't start", "dont start",
+        "stop preparing", "stop the cv", "stop my cv",
+        "cancel the cv", "cancel my cv", "cancel the application pack"
     ))
-    cv = any(term in text for term in (" cv", "cv ", "resume", "curriculum vitae")) or text.startswith("cv")
-    letter = any(term in text for term in ("cover letter", "application letter", "covering letter"))
+    if cancellation:
+        return False
+
+    # Match both base verbs and common continuations such as "preparing" /
+    # "generated" so messages like "please proceed with my CV and cover letter"
+    # enter the paid document workflow reliably after payment verification.
+    action = any(term in text for term in (
+        "prepare", "prepar", "create", "creat", "generate", "generat",
+        "draft", "write", "make", "produce", "proceed", "start",
+        "continue", "resume", "complete", "finish", "work on", "do my"
+    ))
+
+    cv = (
+        any(term in text for term in (" cv", "cv ", "resume", "curriculum vitae"))
+        or text.startswith("cv")
+    )
+    letter = any(term in text for term in (
+        "cover letter", "application letter", "covering letter"
+    ))
+
     broad = any(phrase in text for phrase in (
         "prepare my application", "prepare the application", "prepare both",
-        "application pack", "tailored application"
+        "application pack", "tailored application",
+        "proceed with my application", "continue my application",
+        "start my application", "finish my application",
+        "proceed with my cv and cover letter",
+        "start my cv and cover letter",
+        "continue my cv and cover letter",
+        "prepare my cv and cover letter"
     ))
+
     return (action and cv and letter) or broad
 
 
@@ -3173,6 +3587,11 @@ def detect_explicit_human_handover(customer_message):
         "real person",
         "customer service agent",
         "customer care agent",
+        "talk to jones",
+        "speak to jones",
+        "talk with jones",
+        "speak with jones",
+        "jones please",
         "stop ai",
         "stop the ai",
         "pause ai",
@@ -3200,6 +3619,7 @@ def handle_local_human_handover(
     customer_number,
     customer_name,
     customer_message,
+    requested_person=None,
 ):
     """
     Pause AI and create/update a handover lead without calling OpenAI.
@@ -3207,11 +3627,17 @@ def handle_local_human_handover(
     """
     save_message(customer_number, "user", customer_message)
 
-    reply = (
-        "Thank you for letting us know. I have paused the AI assistant "
-        "for this conversation and recorded your request for human assistance. "
-        "The IBROWS team will need to assist you from here."
-    )
+    if requested_person == "Jones":
+        reply = (
+            "Thank you. I have paused the AI assistant and recorded your request to talk to Jones. "
+            "Jones will need to assist you from here."
+        )
+    else:
+        reply = (
+            "Thank you for letting us know. I have paused the AI assistant "
+            "for this conversation and recorded your request for human assistance. "
+            "The IBROWS team will need to assist you from here."
+        )
 
     # Pause first so the customer's explicit preference is respected even
     # if email notification later fails.
@@ -3360,6 +3786,7 @@ def get_verified_service_payment_state(customer_number, service, fallback_requir
                   AND l.status IN ('NEW', 'CONTACTED')
                   AND l.merged_into_lead_id IS NULL
                   AND l.privacy_deleted_at IS NULL
+                  AND l.entitlement_consumed_at IS NULL
                 GROUP BY l.id, l.service, l.estimated_value, l.value_currency,
                          l.quote_status, l.status, l.updated_at
                 ORDER BY l.updated_at DESC, l.id DESC
@@ -3510,6 +3937,97 @@ def application_pack_payment_gate(customer_number, customer_name):
     )
 
 
+def consume_cv_package_entitlement(customer_number):
+    """Consume exactly one fully-paid One-Off CV + Cover Letter entitlement.
+
+    This runs only after the generated documents have been delivered successfully.
+    The payment rows stay untouched for finance/audit history, while the service lead
+    is closed and permanently marked consumed so reopening the lead cannot reuse the
+    same MK5,000 payment for another application pack.
+    """
+    required = CAREER_SERVICE_DEFAULT_PRICES_MWK["CV & Cover Letter"]
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT l.id, l.service, l.estimated_value,
+                       COALESCE(l.value_currency, 'MWK'),
+                       COALESCE((
+                           SELECT SUM(p.amount)
+                           FROM lead_payments p
+                           WHERE p.lead_id = l.id
+                             AND p.currency = COALESCE(l.value_currency, 'MWK')
+                       ), 0) AS paid_total
+                FROM leads l
+                WHERE l.customer_number = %s
+                  AND l.status IN ('NEW', 'CONTACTED')
+                  AND l.merged_into_lead_id IS NULL
+                  AND l.privacy_deleted_at IS NULL
+                  AND l.entitlement_consumed_at IS NULL
+                ORDER BY l.updated_at DESC, l.id DESC
+                FOR UPDATE OF l
+                """,
+                (customer_number,),
+            )
+            rows = cur.fetchall()
+
+            selected = None
+            for row in rows:
+                if canonicalize_service(row[1]) == "CV & Cover Letter":
+                    selected = row
+                    break
+
+            if not selected:
+                raise ValueError("No active CV + Cover Letter entitlement found to consume.")
+
+            lead_id, _service, estimated_value, currency, paid_total = selected
+            paid_total = Decimal(paid_total or 0)
+            service_value = Decimal(estimated_value) if estimated_value is not None else required
+
+            if currency != "MWK":
+                raise ValueError("CV + Cover Letter entitlement currency is not MWK.")
+            if service_value < required:
+                service_value = required
+            if paid_total < service_value:
+                raise ValueError("CV + Cover Letter entitlement is not fully paid.")
+
+            reason = (
+                "One-Off CV + Cover Letter entitlement consumed after successful "
+                "WhatsApp delivery of the purchased application pack."
+            )
+            cur.execute(
+                """
+                UPDATE leads
+                SET entitlement_consumed_at = NOW(),
+                    entitlement_consumed_reason = %s,
+                    status = 'CLOSED',
+                    follow_up_at = NULL,
+                    follow_up_notified_at = NULL,
+                    follow_up_notification_claimed_at = NULL,
+                    follow_up_notification_error = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND entitlement_consumed_at IS NULL
+                """,
+                (reason, lead_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("CV + Cover Letter entitlement was already consumed.")
+
+            _activity_insert(
+                cur,
+                lead_id,
+                "SERVICE_CONSUMED",
+                "One-Off CV + Cover Letter package completed and entitlement consumed after successful document delivery.",
+            )
+
+        conn.commit()
+
+    print(f"CV PACKAGE ENTITLEMENT CONSUMED: lead={lead_id}", flush=True)
+    return lead_id
+
+
 def create_or_update_lead(
     customer_number,
     customer_name,
@@ -3530,6 +4048,7 @@ def create_or_update_lead(
                   AND status IN ('NEW', 'CONTACTED')
                   AND merged_into_lead_id IS NULL
                   AND privacy_deleted_at IS NULL
+                  AND entitlement_consumed_at IS NULL
                 ORDER BY updated_at DESC, created_at DESC
                 """,
                 (customer_number,)
@@ -6513,11 +7032,19 @@ def update_lead_status(lead_id, status):
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT status FROM leads WHERE id=%s FOR UPDATE", (lead_id,))
+            cur.execute(
+                "SELECT status, entitlement_consumed_at FROM leads WHERE id=%s FOR UPDATE",
+                (lead_id,),
+            )
             row = cur.fetchone()
             if not row:
                 raise ValueError("Lead not found.")
-            old_status = row[0]
+            old_status, entitlement_consumed_at = row
+
+            if entitlement_consumed_at is not None and status != "CLOSED":
+                raise ValueError(
+                    "A consumed one-off service cannot be reopened. Create a new service lead instead."
+                )
 
             if status == "CLOSED":
                 cur.execute(
@@ -9761,6 +10288,39 @@ def receive_webhook():
             print("AI PAUSED FOR CUSTOMER — HUMAN TAKEOVER ACTIVE", flush=True)
             return "EVENT_RECEIVED", 200
 
+        # Deterministic numbered/text service navigation. This runs before OpenAI so
+        # customers can reliably choose a service by number or name. Numeric choices
+        # are interpreted only while a recent menu is open, avoiding collisions with
+        # ordinary quantities, room counts, dates, etc.
+        if message_type == "text":
+            menu_result = handle_numbered_service_menu(
+                customer_number=customer_number,
+                customer_name=customer_name,
+                customer_message=customer_message,
+            )
+            if menu_result is not None:
+                if menu_result.get("action") == "JONES":
+                    reply = handle_local_human_handover(
+                        customer_number=customer_number,
+                        customer_name=customer_name,
+                        customer_message="Talk to Jones (menu option 0)",
+                        requested_person="Jones",
+                    )
+                    store_pending_reply(message_id, reply)
+                    sent = send_whatsapp_message(customer_number, reply)
+                    finish_whatsapp_message(message_id, sent)
+                    print("MENU OPTION 0 — TALK TO JONES ACTIVATED", flush=True)
+                    return "EVENT_RECEIVED", 200
+
+                reply = menu_result["reply"]
+                save_message(customer_number, "user", customer_message)
+                save_message(customer_number, "assistant", reply)
+                store_pending_reply(message_id, reply)
+                sent = send_whatsapp_message(customer_number, reply)
+                finish_whatsapp_message(message_id, sent)
+                print("NUMBERED SERVICE MENU HANDLED", flush=True)
+                return "EVENT_RECEIVED", 200
+
         # Critical fail-safe: a clear request for a human must not depend on OpenAI.
         # Media captions are included in customer_message, so the same rule applies.
         if detect_explicit_human_handover(customer_message):
@@ -9802,21 +10362,42 @@ def receive_webhook():
             text_sent = send_whatsapp_message(customer_number, reply)
             documents_sent = True
             if pack_result.get("ready"):
-                for index, document in enumerate(pack_result.get("documents", [])):
-                    caption = "IBROWS draft — review before submission" if index == 0 else None
-                    sent_doc = send_whatsapp_document(
-                        customer_number,
-                        document["bytes"],
-                        document["filename"],
-                        document["mime_type"],
-                        caption=caption,
-                    )
-                    documents_sent = documents_sent and sent_doc
-                if text_sent and documents_sent:
-                    set_application_pack_active(customer_number, False)
-                    print("APPLICATION PACK SENT", flush=True)
+                documents = pack_result.get("documents", [])
+                if not documents:
+                    documents_sent = False
+                    print("APPLICATION PACK READY WITHOUT DOCUMENTS — NOT CONSUMED", flush=True)
                 else:
-                    print("APPLICATION PACK DELIVERY INCOMPLETE", flush=True)
+                    for index, document in enumerate(documents):
+                        caption = "IBROWS draft — review before submission" if index == 0 else None
+                        sent_doc = send_whatsapp_document(
+                            customer_number,
+                            document["bytes"],
+                            document["filename"],
+                            document["mime_type"],
+                            caption=caption,
+                        )
+                        documents_sent = documents_sent and sent_doc
+
+                if text_sent and documents_sent:
+                    try:
+                        consumed_lead_id = consume_cv_package_entitlement(customer_number)
+                        set_application_pack_active(customer_number, False)
+                        print(
+                            f"APPLICATION PACK SENT — ONE-OFF ENTITLEMENT CONSUMED: {consumed_lead_id}",
+                            flush=True,
+                        )
+                    except Exception as consume_error:
+                        # Delivery succeeded, but never pretend the entitlement was consumed
+                        # if the authoritative ledger update failed. Keep the pack inactive
+                        # and surface an unmistakable server log for admin intervention.
+                        set_application_pack_active(customer_number, False)
+                        print(
+                            f"CRITICAL: APPLICATION PACK DELIVERED BUT ENTITLEMENT CONSUMPTION FAILED: "
+                            f"{type(consume_error).__name__}: {consume_error}",
+                            flush=True,
+                        )
+                else:
+                    print("APPLICATION PACK DELIVERY INCOMPLETE — ENTITLEMENT NOT CONSUMED", flush=True)
             finish_whatsapp_message(message_id, text_sent and documents_sent)
             return "EVENT_RECEIVED", 200
 
@@ -10603,7 +11184,9 @@ Be:
 
 WhatsApp replies should normally be short.
 
-Do not send the complete service catalogue unless asked.
+Do not send the complete service catalogue unless asked. When a customer asks
+for the service list/menu, the local WhatsApp menu handler will provide the numbered
+menu. If useful in a normal reply, you may tell the customer to type MENU to see it.
 
 If someone simply says hello, greet them naturally and ask
 how IBROWS can assist.
