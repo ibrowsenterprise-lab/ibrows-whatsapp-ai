@@ -11701,6 +11701,10 @@ def _validate_career_search_payload(raw_text, today_date):
             if deadline_date < today_date:
                 stats["expired"] += 1
                 continue
+            # Never trust free-form deadline wording from the search model when an
+            # ISO date is available. Derive the customer-facing date server-side so
+            # phrases such as "around the end of October" cannot be invented.
+            deadline_display = deadline_date.strftime("%d %B %Y")
         else:
             # A no-deadline listing is accepted only with affirmative live evidence such
             # as "open until filled" or an active application state. Mere page existence
@@ -11714,6 +11718,15 @@ def _validate_career_search_payload(raw_text, today_date):
             if not affirmative:
                 stats["missing_evidence"] += 1
                 continue
+
+            # For live listings with no verified closing date, discard the model's
+            # free-form deadline_display completely. It may contain speculative dates.
+            if "open until filled" in evidence_lower:
+                deadline_display = "Open until filled (no closing date stated)"
+            elif "rolling applications" in evidence_lower:
+                deadline_display = "Rolling applications (no closing date stated)"
+            else:
+                deadline_display = "No closing date stated; live source shows applications open"
 
         key = (title.lower(), employer.lower(), application_url.lower())
         if key in seen_keys:
@@ -11924,7 +11937,9 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         "INTERNAL ACTIVE CAREER ASSIST LIVE VACANCY SEARCH — SERVER-VALIDATED CURRENT RESULTS.",
         f"Search date: {today_label}.",
         "Every vacancy below survived a deterministic deadline/current-open validation step. "
-        "Do not add vacancies that are not listed below. This context already IS the fresh live search.",
+        "Do not add vacancies that are not listed below. This context already IS the fresh live search. "
+        "Use the Deadline/status value exactly as supplied below. Never estimate, approximate, infer, or invent "
+        "a closing date when the validated result says no closing date is stated.",
     ]
     for idx, item in enumerate(all_vacancies, start=1):
         deadline = item.get("deadline_display") or item.get("deadline_iso") or "No stated deadline; live-open evidence required"
