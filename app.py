@@ -658,6 +658,107 @@ def cleanup_expired_data(force=False):
         print(f"Privacy cleanup error: {type(error).__name__}", flush=True)
 
 
+def get_customer_privacy_preview(customer_number):
+    """Return a read-only preview of what the privacy action would affect.
+
+    This function performs SELECT queries only. It is safe to run against a real
+    customer because it does not update or delete any data.
+    """
+    customer_number = str(customer_number or "").strip()
+    if not customer_number:
+        raise ValueError("Customer number is required.")
+
+    preview = {
+        "conversations": 0,
+        "attachment_memories": 0,
+        "retry_records": 0,
+        "ai_takeover_state": 0,
+        "application_state": 0,
+        "evidence_corrections": 0,
+        "lead_notes": 0,
+        "lead_activity": 0,
+        "lead_notifications": 0,
+        "operational_leads_deleted": 0,
+        "financial_leads_anonymized": 0,
+        "payments_preserved": 0,
+        "void_audit_preserved": 0,
+        "documents_preserved": 0,
+    }
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for key, table in (
+                ("conversations", "conversations"),
+                ("attachment_memories", "attachment_memories"),
+                ("retry_records", "processed_whatsapp_messages"),
+                ("ai_takeover_state", "ai_takeover_state"),
+                ("application_state", "application_pack_state"),
+                ("evidence_corrections", "application_evidence_corrections"),
+            ):
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE customer_number = %s",
+                    (customer_number,),
+                )
+                preview[key] = int(cur.fetchone()[0] or 0)
+
+            cur.execute(
+                "SELECT id FROM leads WHERE customer_number = %s",
+                (customer_number,),
+            )
+            lead_ids = [row[0] for row in cur.fetchall()]
+
+            if not lead_ids:
+                return preview
+
+            cur.execute(
+                """
+                SELECT l.id
+                FROM leads l
+                WHERE l.id = ANY(%s)
+                  AND (
+                        l.estimated_value IS NOT NULL
+                     OR COALESCE(l.quote_status, 'NOT_STARTED') <> 'NOT_STARTED'
+                     OR EXISTS (SELECT 1 FROM lead_payments p WHERE p.lead_id = l.id)
+                     OR EXISTS (SELECT 1 FROM payment_void_audit v WHERE v.lead_id = l.id)
+                     OR EXISTS (SELECT 1 FROM business_documents d WHERE d.lead_id = l.id)
+                  )
+                """,
+                (lead_ids,),
+            )
+            protected_ids = [row[0] for row in cur.fetchall()]
+            protected_set = set(protected_ids)
+
+            preview["financial_leads_anonymized"] = len(protected_ids)
+            preview["operational_leads_deleted"] = sum(
+                1 for lead_id in lead_ids if lead_id not in protected_set
+            )
+
+            for key, table in (
+                ("lead_notes", "lead_notes"),
+                ("lead_activity", "lead_activity"),
+                ("lead_notifications", "lead_notification_status"),
+            ):
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE lead_id = ANY(%s)",
+                    (lead_ids,),
+                )
+                preview[key] = int(cur.fetchone()[0] or 0)
+
+            if protected_ids:
+                for key, table in (
+                    ("payments_preserved", "lead_payments"),
+                    ("void_audit_preserved", "payment_void_audit"),
+                    ("documents_preserved", "business_documents"),
+                ):
+                    cur.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE lead_id = ANY(%s)",
+                        (protected_ids,),
+                    )
+                    preview[key] = int(cur.fetchone()[0] or 0)
+
+    return preview
+
+
 def delete_customer_data(customer_number):
     """Delete customer-facing personal data without destroying finance history.
 
@@ -8861,11 +8962,25 @@ CUSTOMER_PRIVACY_TEMPLATE = """
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IBROWS Customer Data</title>
-<style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif}.wrap{max-width:620px;margin:auto;padding:24px 16px}.card{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06)}.warning{background:#fff4ed;border-radius:10px;padding:13px;margin:16px 0;line-height:1.5}label{display:block;font-weight:700;margin:16px 0 7px}input{width:100%;padding:12px;border:1px solid #d0d5dd;border-radius:9px;font-size:16px}button{width:100%;padding:12px;border:0;border-radius:9px;background:#b42318;color:white;font-weight:800;margin-top:12px}.back{display:block;text-align:center;margin-top:14px;color:#175cd3;text-decoration:none;font-weight:700}.small{color:#667085;font-size:13px;line-height:1.5}</style>
+<style>*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#101828;font-family:Arial,sans-serif}.wrap{max-width:620px;margin:auto;padding:24px 16px}.card{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06)}.warning{background:#fff4ed;border-radius:10px;padding:13px;margin:16px 0;line-height:1.5}.preview{background:#eff8ff;border:1px solid #b2ddff;border-radius:10px;padding:14px;margin:16px 0;line-height:1.55}.preview h2{font-size:18px;margin:0 0 8px}.preview-grid{display:grid;grid-template-columns:1fr auto;gap:5px 12px;font-size:14px}.preview-grid strong{text-align:right}.safe{color:#067647;font-weight:800}.delete{color:#b42318;font-weight:800}label{display:block;font-weight:700;margin:16px 0 7px}input{width:100%;padding:12px;border:1px solid #d0d5dd;border-radius:9px;font-size:16px}button{width:100%;padding:12px;border:0;border-radius:9px;background:#b42318;color:white;font-weight:800;margin-top:12px}.back{display:block;text-align:center;margin-top:14px;color:#175cd3;text-decoration:none;font-weight:700}.small{color:#667085;font-size:13px;line-height:1.5}</style>
 </head><body><div class="wrap"><div class="card">
 <h1>Customer Data & Privacy</h1><p><strong>+{{ customer_number }}</strong></p>
 <p class="small">Use this only after IBROWS has reasonably verified that the customer is requesting deletion.</p>
 <div class="warning"><strong>Permanent privacy action:</strong> deletes the customer's conversations, attachment/CV memories, retry records, internal CRM notes, reminder state and AI takeover/application state. Leads with no financial significance are deleted. Payments, void-audit records, quotations/invoices and other financially relevant records are <strong>not destroyed</strong>; their customer name/number is anonymized and the retained lead is hidden from the operational CRM so bookkeeping remains auditable. This cannot be undone from the dashboard.</div>
+<div class="preview">
+<h2>Safe preview — no changes have been made</h2>
+<p class="small">This is a read-only count of what the permanent action would delete or retain for this customer.</p>
+<div class="preview-grid">
+<span>Conversations to delete</span><strong class="delete">{{ preview.conversations }}</strong>
+<span>CV/attachment memories to delete</span><strong class="delete">{{ preview.attachment_memories }}</strong>
+<span>Retry/AI/application records to delete</span><strong class="delete">{{ preview.retry_records + preview.ai_takeover_state + preview.application_state + preview.evidence_corrections }}</strong>
+<span>CRM notes/activity/reminders to delete</span><strong class="delete">{{ preview.lead_notes + preview.lead_activity + preview.lead_notifications }}</strong>
+<span>Non-financial leads to delete</span><strong class="delete">{{ preview.operational_leads_deleted }}</strong>
+<span>Financial leads to anonymize</span><strong class="safe">{{ preview.financial_leads_anonymized }}</strong>
+<span>Payments preserved</span><strong class="safe">{{ preview.payments_preserved }}</strong>
+<span>Voided-payment audit records preserved</span><strong class="safe">{{ preview.void_audit_preserved }}</strong>
+<span>Quotes/invoices/receipts preserved</span><strong class="safe">{{ preview.documents_preserved }}</strong>
+</div></div>
 <form method="POST"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <label>Type DELETE to confirm</label><input name="confirmation" autocomplete="off" required>
 <button type="submit">Delete Personal Data &amp; Anonymize Finance Records</button></form>
@@ -8881,12 +8996,20 @@ def admin_customer_privacy(customer_number):
     if request.method == "POST":
         validate_csrf()
         if request.form.get("confirmation", "").strip() != "DELETE":
-            return render_template_string(CUSTOMER_PRIVACY_TEMPLATE,
-                customer_number=customer_number, csrf_token=get_csrf_token()), 400
+            return render_template_string(
+                CUSTOMER_PRIVACY_TEMPLATE,
+                customer_number=customer_number,
+                csrf_token=get_csrf_token(),
+                preview=get_customer_privacy_preview(customer_number),
+            ), 400
         delete_customer_data(customer_number)
         return redirect(url_for("admin_leads"))
-    return render_template_string(CUSTOMER_PRIVACY_TEMPLATE,
-        customer_number=customer_number, csrf_token=get_csrf_token())
+    return render_template_string(
+        CUSTOMER_PRIVACY_TEMPLATE,
+        customer_number=customer_number,
+        csrf_token=get_csrf_token(),
+        preview=get_customer_privacy_preview(customer_number),
+    )
 
 
 @app.route(
