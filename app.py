@@ -4410,9 +4410,56 @@ def expire_career_assist_entitlements(customer_number=None):
     return len(expired)
 
 
+def normalize_open_career_assist_pricing(customer_number=None):
+    """Repair stale legacy Career Assist pricing to the approved MK50,000 monthly fee.
+
+    Older test/legacy leads can carry an unrelated estimated value even after the
+    correct Career Assist payment is recorded. Career Assist is a fixed-price
+    service, so open/unconsumed operational leads must display and account for the
+    approved monthly amount. Historical consumed/expired leads are left untouched.
+    """
+    required = CAREER_ASSIST_MONTHLY_PRICE_MWK
+    params = [required]
+    customer_clause = ""
+    if customer_number:
+        customer_clause = " AND customer_number = %s"
+        params.append(customer_number)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE leads
+                SET estimated_value = %s,
+                    value_currency = 'MWK'
+                WHERE LOWER(TRIM(COALESCE(service, ''))) = 'career assist'
+                  AND merged_into_lead_id IS NULL
+                  AND privacy_deleted_at IS NULL
+                  AND entitlement_consumed_at IS NULL
+                  AND status IN ('NEW', 'CONTACTED')
+                  {customer_clause}
+                  AND (
+                        estimated_value IS DISTINCT FROM %s
+                        OR UPPER(COALESCE(value_currency, 'MWK')) <> 'MWK'
+                  )
+                """,
+                tuple(params + [required]),
+            )
+            repaired = cur.rowcount
+        conn.commit()
+
+    if repaired:
+        print(
+            f"CAREER ASSIST PRICE NORMALIZED: leads={repaired} standard_mwk={required}",
+            flush=True,
+        )
+    return repaired
+
+
 def get_career_assist_lifecycle_state(customer_number):
     """Return authoritative Career Assist activation/expiry state."""
     expire_career_assist_entitlements(customer_number)
+    normalize_open_career_assist_pricing(customer_number)
     required = CAREER_ASSIST_MONTHLY_PRICE_MWK
 
     with get_db() as conn:
@@ -9203,6 +9250,9 @@ h1{margin:20px 0 4px;font-size:24px}.description{color:#667085;margin:0 0 14px}
 def admin_leads():
     # Keep monthly entitlements current even if the scheduled task has not run yet.
     expire_career_assist_entitlements()
+    # Repair stale legacy Career Assist values before the dashboard renders so the
+    # commercial badge always shows the approved MK50,000 monthly service price.
+    normalize_open_career_assist_pricing()
     rows = get_all_leads()
     all_leads = []
     for row in rows:
