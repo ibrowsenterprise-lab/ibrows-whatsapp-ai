@@ -11774,6 +11774,165 @@ def _merge_validated_vacancies(primary, secondary, limit=5):
     return merged
 
 
+_CAREER_MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+_CAREER_MONTH_RE = "(?:" + "|".join(_CAREER_MONTH_NAMES) + ")"
+_CAREER_WEEKDAY_RE = r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+
+
+def _parse_explicit_vacancy_deadline_from_text(page_text):
+    """Extract an explicit deadline only when it appears beside a deadline/closing label.
+
+    Search snippets and job boards sometimes leave an Apply button active long after a
+    vacancy has closed. This parser deliberately ignores unrelated dates such as Posted,
+    Start Publishing, and Stop Publishing and only trusts dates adjacent to deadline-like
+    labels in the fetched live page.
+    """
+    text = str(page_text or "")
+    if not text:
+        return None, ""
+    compact = re.sub(r"[ \t]+", " ", text)
+    label_re = re.compile(
+        r"(?is)(?:deadline(?:\s+of\s+this\s+job)?|application\s+deadline|closing\s+date|"
+        r"applications?\s+close(?:s|d)?(?:\s+on)?|closing\s+on)\s*[:\-]?\s*([^\n\r]{0,120})"
+    )
+    date_patterns = [
+        re.compile(rf"(?i)(?:{_CAREER_WEEKDAY_RE}\s*,?\s*)?({_CAREER_MONTH_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?\s*,?\s*(\d{{4}})"),
+        re.compile(rf"(?i)(\d{{1,2}})(?:st|nd|rd|th)?\s+({_CAREER_MONTH_RE})\s*,?\s*(\d{{4}})"),
+        re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b"),
+        re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](20\d{2})\b"),
+    ]
+    for label_match in label_re.finditer(compact):
+        segment = label_match.group(1).strip()
+        if not segment:
+            continue
+        m = date_patterns[0].search(segment)
+        if m:
+            try:
+                dt = datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%B %d %Y").date()
+                return dt, segment[:160]
+            except ValueError:
+                pass
+        m = date_patterns[1].search(segment)
+        if m:
+            try:
+                dt = datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y").date()
+                return dt, segment[:160]
+            except ValueError:
+                pass
+        m = date_patterns[2].search(segment)
+        if m:
+            try:
+                return date(int(m.group(1)), int(m.group(2)), int(m.group(3))), segment[:160]
+            except ValueError:
+                pass
+        m = date_patterns[3].search(segment)
+        if m:
+            try:
+                # Malawi vacancy pages overwhelmingly use day-month-year for numeric dates.
+                return date(int(m.group(3)), int(m.group(2)), int(m.group(1))), segment[:160]
+            except ValueError:
+                pass
+    return None, ""
+
+
+def _direct_page_text_for_vacancy(url):
+    """Fetch a candidate vacancy page and return its visible text for final verification."""
+    resource = fetch_public_web_resource(url)
+    chunks = []
+    for part in resource.get("input_parts") or []:
+        if isinstance(part, dict) and part.get("type") == "input_text":
+            chunks.append(str(part.get("text") or ""))
+    return "\n".join(chunks), str(resource.get("url") or url)
+
+
+def _final_live_page_vacancy_gate(vacancies, today_date):
+    """Cross-check model-discovered vacancies against their actual live pages when fetchable.
+
+    A direct page's explicit deadline overrides any date supplied by the search model. If
+    the page says the role is closed or carries a past explicit deadline, the vacancy is
+    rejected even when an Apply/Apply Now UI element remains visible.
+    """
+    kept = []
+    stats = {
+        "checked": 0,
+        "fetch_failed": 0,
+        "explicit_deadline": 0,
+        "expired": 0,
+        "closed": 0,
+        "deadline_conflict": 0,
+    }
+    closed_markers = (
+        "no longer accepting applications",
+        "applications are closed",
+        "applications closed",
+        "vacancy closed",
+        "job closed",
+        "this job has expired",
+        "job has expired",
+        "position has been filled",
+    )
+    for original in list(vacancies or [])[:5]:
+        item = dict(original)
+        url = str(item.get("application_url") or "").strip()
+        if not url:
+            continue
+        try:
+            page_text, final_url = _direct_page_text_for_vacancy(url)
+            stats["checked"] += 1
+        except (ValueError, requests.RequestException, socket.error) as error:
+            stats["fetch_failed"] += 1
+            # Do not invent a failure state when a dynamic site blocks direct fetching.
+            # The already-validated live-search evidence remains usable in that case.
+            kept.append(item)
+            print(
+                f"CAREER ASSIST DIRECT VACANCY PAGE CHECK FAILED: {type(error).__name__} host={urlsplit(url).hostname}",
+                flush=True,
+            )
+            continue
+
+        lower_page = page_text.lower()
+        if any(marker in lower_page for marker in closed_markers):
+            stats["closed"] += 1
+            print(
+                f"CAREER ASSIST DIRECT PAGE REJECTED CLOSED: {item.get('title')} | {item.get('employer')}",
+                flush=True,
+            )
+            continue
+
+        direct_deadline, deadline_evidence = _parse_explicit_vacancy_deadline_from_text(page_text)
+        if direct_deadline is not None:
+            stats["explicit_deadline"] += 1
+            model_deadline = str(item.get("deadline_iso") or "").strip()
+            direct_iso = direct_deadline.isoformat()
+            if model_deadline and model_deadline != direct_iso:
+                stats["deadline_conflict"] += 1
+                print(
+                    f"CAREER ASSIST DEADLINE CONFLICT: model={model_deadline} direct={direct_iso} "
+                    f"title={item.get('title')}",
+                    flush=True,
+                )
+            if direct_deadline < today_date:
+                stats["expired"] += 1
+                print(
+                    f"CAREER ASSIST DIRECT PAGE REJECTED EXPIRED: deadline={direct_iso} "
+                    f"title={item.get('title')}",
+                    flush=True,
+                )
+                continue
+            item["deadline_iso"] = direct_iso
+            item["deadline_display"] = direct_deadline.strftime("%d %B %Y")
+            item["open_evidence"] = (
+                f"Direct vacancy page explicitly states deadline {item['deadline_display']}. "
+                + str(item.get("open_evidence") or "")
+            )[:500]
+        item["application_url"] = final_url
+        kept.append(item)
+    return kept, stats
+
+
 def fetch_career_assist_vacancy_search_context(customer_request, candidate_context=""):
     """Search live vacancy sources and pass only server-validated current roles downstream."""
     today = datetime.now(ADMIN_TIMEZONE).date()
@@ -12008,6 +12167,19 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                     f"{type(error).__name__}",
                     flush=True,
                 )
+
+    # Final source-of-truth check: for URLs we can fetch directly, trust the actual
+    # vacancy page over the search model for explicit deadlines/closed status.
+    all_vacancies, direct_page_stats = _final_live_page_vacancy_gate(all_vacancies, today)
+    print(
+        "CAREER ASSIST DIRECT PAGE FILTER: "
+        f"checked={direct_page_stats['checked']} kept={len(all_vacancies)} "
+        f"explicit_deadline={direct_page_stats['explicit_deadline']} "
+        f"expired={direct_page_stats['expired']} closed={direct_page_stats['closed']} "
+        f"deadline_conflict={direct_page_stats['deadline_conflict']} "
+        f"fetch_failed={direct_page_stats['fetch_failed']}",
+        flush=True,
+    )
 
     print(
         "CAREER ASSIST DEADLINE FILTER: "
