@@ -11714,6 +11714,13 @@ def _validate_career_search_payload(raw_text, today_date):
                 "open until filled", "applications are open", "applications open",
                 "apply now", "currently accepting", "accepting applications",
                 "active application", "rolling applications",
+                # Common live-job UI/status signals. These are accepted only when
+                # the search result also set current_open=true; a stale page that
+                # merely exists is still insufficient.
+                "apply button", "easy apply", "apply for this job",
+                "be among the first", "be an early applicant",
+                "actively hiring", "application portal open",
+                "submit application", "applications being accepted",
             ))
             if not affirmative:
                 stats["missing_evidence"] += 1
@@ -11798,8 +11805,10 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         "useful, but verify against the original source where reasonably possible. Freshness is mandatory: "
         f"compare every closing date with today ({today_label}). NEVER return a vacancy whose deadline is "
         "before today, even if the vacancy page is still online or a search snippet labels it active. "
-        "If no deadline is shown, set current_open=true only when the live evidence affirmatively says "
-        "applications are open, open until filled, apply now, currently accepting applications, or similar. "
+        "If no deadline is shown, set current_open=true only when the live evidence affirmatively shows an "
+        "active application state: applications are open, open until filled, Apply/Easy Apply, currently accepting "
+        "applications, Be among the first applicants, Be an early applicant, Actively hiring, or similarly clear "
+        "current-application evidence. A page that says applications are closed/no longer accepted must be rejected. "
         "Do not use any vacancy from prior conversation memory. Do not invent titles, employers, dates, "
         "requirements, salaries or URLs. Aim for up to five good-fit roles when the request asks for several. "
         "Match against the candidate evidence when supplied and avoid roles whose core mandatory requirements "
@@ -11905,6 +11914,67 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         except Exception as error:
             print(
                 f"CAREER ASSIST SEARCH FALLBACK FAILED: {type(error).__name__}",
+                flush=True,
+            )
+
+    # Broad CV-matching searches can still suffer from low recall when a generic
+    # web query lands on stale vacancy aggregators. If fewer than two verified
+    # roles survive, make one targeted Malawi-first discovery pass against live
+    # job-result pages and employer career pages. The same deterministic validator
+    # is applied afterwards, so improving recall does not weaken freshness safety.
+    need_targeted_recall = broad_match_request and len(all_vacancies) < 2
+    if need_targeted_recall:
+        try:
+            targeted_prompt = prompt + (
+                "\n\nTARGETED RECALL PASS: the earlier broad searches found too few verified matches. "
+                "Run several focused Malawi searches based on EACH role family named in the customer request "
+                "rather than one broad query. Explicitly check current Malawi LinkedIn job-result/job-view pages "
+                "(mw.linkedin.com/jobs) and official employer career pages, plus reputable Malawi vacancy sources. "
+                "For examples of query structure, combine Malawi with the requested families such as business "
+                "intelligence, data analyst/data operations, business analyst, IT/business systems, digital solutions, "
+                "IT administration and media/digital. Do not limit yourself to those examples when the customer's "
+                "request names different fields. For LinkedIn or similar live job pages with no stated deadline, set "
+                "current_open=true ONLY when the live page/result shows an active application signal such as Apply, "
+                "Easy Apply, Be among the first applicants, Be an early applicant, Actively hiring, or another clear "
+                "current-application indicator, and the page does NOT say applications are closed/no longer accepted. "
+                "Prefer recently posted roles and direct job-view/application URLs. Return only JSON in the required "
+                "schema and do not repeat expired or already rejected roles."
+            )
+            targeted_response = fast_client.responses.create(
+                model=CAREER_SEARCH_RESPONSES_MODEL,
+                store=False,
+                tools=[{
+                    "type": "web_search",
+                    "search_context_size": "medium",
+                    "external_web_access": True,
+                }],
+                tool_choice="required",
+                include=["web_search_call.action.sources"],
+                max_output_tokens=2200,
+                input=targeted_prompt,
+            )
+            raw = str(targeted_response.output_text or "").strip()
+            targeted_urls = _extract_hosted_search_source_urls(targeted_response)
+            tertiary, stats = _validate_career_search_payload(raw, today)
+            add_stats(stats)
+            for url in targeted_urls:
+                if url not in source_urls:
+                    source_urls.append(url)
+            for item in tertiary:
+                url = item.get("application_url")
+                if url and url not in source_urls:
+                    source_urls.insert(0, url)
+            all_vacancies = _merge_validated_vacancies(all_vacancies, tertiary)
+            if raw:
+                print(
+                    f"CAREER ASSIST TARGETED RECALL SEARCH SUCCEEDED: model={CAREER_SEARCH_RESPONSES_MODEL} "
+                    f"sources={len(targeted_urls)} validated={len(tertiary)}",
+                    flush=True,
+                )
+            search_paths.append(f"targeted:{CAREER_SEARCH_RESPONSES_MODEL}")
+        except Exception as error:
+            print(
+                f"CAREER ASSIST TARGETED RECALL SEARCH FAILED: {type(error).__name__}",
                 flush=True,
             )
 
