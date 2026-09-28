@@ -11917,66 +11917,97 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 flush=True,
             )
 
-    # Broad CV-matching searches can still suffer from low recall when a generic
-    # web query lands on stale vacancy aggregators. If fewer than two verified
-    # roles survive, make one targeted Malawi-first discovery pass against live
-    # job-result pages and employer career pages. The same deterministic validator
-    # is applied afterwards, so improving recall does not weaken freshness safety.
+    # Broad CV-matching searches can still suffer from low recall when one generic
+    # search lands on stale aggregators. When fewer than two roles survive, run
+    # several narrow role-family searches instead of asking one model to cover
+    # every field at once. Every discovered role still goes through the SAME
+    # deterministic freshness/evidence validator, so recall improves without
+    # weakening the expiry safeguards.
     need_targeted_recall = broad_match_request and len(all_vacancies) < 2
     if need_targeted_recall:
-        try:
-            targeted_prompt = prompt + (
-                "\n\nTARGETED RECALL PASS: the earlier broad searches found too few verified matches. "
-                "Run several focused Malawi searches based on EACH role family named in the customer request "
-                "rather than one broad query. Explicitly check current Malawi LinkedIn job-result/job-view pages "
-                "(mw.linkedin.com/jobs) and official employer career pages, plus reputable Malawi vacancy sources. "
-                "For examples of query structure, combine Malawi with the requested families such as business "
-                "intelligence, data analyst/data operations, business analyst, IT/business systems, digital solutions, "
-                "IT administration and media/digital. Do not limit yourself to those examples when the customer's "
-                "request names different fields. For LinkedIn or similar live job pages with no stated deadline, set "
-                "current_open=true ONLY when the live page/result shows an active application signal such as Apply, "
-                "Easy Apply, Be among the first applicants, Be an early applicant, Actively hiring, or another clear "
-                "current-application indicator, and the page does NOT say applications are closed/no longer accepted. "
-                "Prefer recently posted roles and direct job-view/application URLs. Return only JSON in the required "
-                "schema and do not repeat expired or already rejected roles."
-            )
-            targeted_response = fast_client.responses.create(
-                model=CAREER_SEARCH_RESPONSES_MODEL,
-                store=False,
-                tools=[{
-                    "type": "web_search",
-                    "search_context_size": "medium",
-                    "external_web_access": True,
-                }],
-                tool_choice="required",
-                include=["web_search_call.action.sources"],
-                max_output_tokens=2200,
-                input=targeted_prompt,
-            )
-            raw = str(targeted_response.output_text or "").strip()
-            targeted_urls = _extract_hosted_search_source_urls(targeted_response)
-            tertiary, stats = _validate_career_search_payload(raw, today)
-            add_stats(stats)
-            for url in targeted_urls:
-                if url not in source_urls:
-                    source_urls.append(url)
-            for item in tertiary:
-                url = item.get("application_url")
-                if url and url not in source_urls:
-                    source_urls.insert(0, url)
-            all_vacancies = _merge_validated_vacancies(all_vacancies, tertiary)
-            if raw:
+        focused_queries = [
+            (
+                "BI_DATA",
+                "Malawi current Business Intelligence Analyst, Data Analyst, Data Operations, "
+                "Reporting Analyst, MIS, information management and dashboard/reporting vacancies",
+            ),
+            (
+                "BUSINESS_SYSTEMS",
+                "Malawi current Business Analyst, Project Delivery, IT/business systems, Systems Support, "
+                "Digital Solutions, technology project coordination and banking/fintech operations vacancies",
+            ),
+            (
+                "ADMIN_DIGITAL_REMOTE",
+                "Malawi current IT-supported administration, digital/media support and information-management "
+                "vacancies, then remote data/BI/business-analysis roles explicitly open worldwide or to Malawi",
+            ),
+        ]
+
+        for recall_index, (recall_label, focused_query) in enumerate(focused_queries, start=1):
+            if len(all_vacancies) >= 3:
+                break
+            try:
+                focused_prompt = (
+                    f"Today is {today_label}. TARGETED CAREER ASSIST RECALL SEARCH.\n"
+                    f"Search specifically for: {focused_query}.\n"
+                    f"Customer request: {request_text}\n"
+                    + candidate_block
+                    + "\n\nUse several focused web queries rather than a single broad query. Explicitly check "
+                    "mw.linkedin.com/jobs result pages and direct /jobs/view/ pages, official employer career pages, "
+                    "and reputable Malawi vacancy sources. Prefer recently posted vacancies. For LinkedIn or another "
+                    "live job board with no stated closing date, set current_open=true only when the live evidence "
+                    "shows a current application/listing signal such as Apply, Easy Apply, Be an early applicant, "
+                    "Be among the first applicants, Actively hiring, currently accepting applications, or an equivalent "
+                    "active-job indicator, and the page does not say closed or no longer accepting applications. "
+                    "If a deadline is stated, compare it with today and omit the role when it has passed. Do not "
+                    "invent deadlines or requirements. Match against the supplied candidate evidence and avoid roles "
+                    "whose core mandatory requirements clearly conflict with it.\n\n"
+                    "Return JSON ONLY with exactly this structure:\n"
+                    '{"vacancies":[{"title":"...","employer":"...","location":"...",'
+                    '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
+                    '"current_open":true,"open_evidence":"specific live evidence that it is open/current",'
+                    '"application_url":"https://...","match_reason":"brief CV-based reason"}],'
+                    '"search_note":"brief note"}\n'
+                    "Do not include expired, closed, removed or unverifiable vacancies."
+                )
+                targeted_response = fast_client.responses.create(
+                    model=CAREER_SEARCH_RESPONSES_MODEL,
+                    store=False,
+                    tools=[{
+                        "type": "web_search",
+                        "search_context_size": "low",
+                        "external_web_access": True,
+                    }],
+                    tool_choice="required",
+                    include=["web_search_call.action.sources"],
+                    max_output_tokens=1500,
+                    input=focused_prompt,
+                )
+                raw = str(targeted_response.output_text or "").strip()
+                targeted_urls = _extract_hosted_search_source_urls(targeted_response)
+                tertiary, stats = _validate_career_search_payload(raw, today)
+                add_stats(stats)
+                for url in targeted_urls:
+                    if url not in source_urls:
+                        source_urls.append(url)
+                for item in tertiary:
+                    url = item.get("application_url")
+                    if url and url not in source_urls:
+                        source_urls.insert(0, url)
+                all_vacancies = _merge_validated_vacancies(all_vacancies, tertiary)
                 print(
-                    f"CAREER ASSIST TARGETED RECALL SEARCH SUCCEEDED: model={CAREER_SEARCH_RESPONSES_MODEL} "
-                    f"sources={len(targeted_urls)} validated={len(tertiary)}",
+                    f"CAREER ASSIST TARGETED RECALL PASS {recall_index} {recall_label}: "
+                    f"model={CAREER_SEARCH_RESPONSES_MODEL} sources={len(targeted_urls)} "
+                    f"validated={len(tertiary)} cumulative={len(all_vacancies)}",
                     flush=True,
                 )
-            search_paths.append(f"targeted:{CAREER_SEARCH_RESPONSES_MODEL}")
-        except Exception as error:
-            print(
-                f"CAREER ASSIST TARGETED RECALL SEARCH FAILED: {type(error).__name__}",
-                flush=True,
-            )
+                search_paths.append(f"targeted-{recall_label.lower()}:{CAREER_SEARCH_RESPONSES_MODEL}")
+            except Exception as error:
+                print(
+                    f"CAREER ASSIST TARGETED RECALL PASS {recall_index} {recall_label} FAILED: "
+                    f"{type(error).__name__}",
+                    flush=True,
+                )
 
     print(
         "CAREER ASSIST DEADLINE FILTER: "
