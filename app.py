@@ -5305,12 +5305,60 @@ def get_customer_crm_profile(customer_number):
             "service": lead["service"],
         })
 
+    # Active payments are rendered from the payment ledger below.  Some payment
+    # writes also create a lead_activity row so that a later void still leaves
+    # a complete audit trail.  Suppress only the matching activity copy while
+    # the payment is active; otherwise Customer CRM would show the same payment
+    # twice.  A voided payment no longer exists in lead_payments, so its original
+    # activity remains visible alongside the PAYMENT_VOIDED audit event.
+    payments = get_customer_payments(lead_ids, limit=100)
+    active_payment_events = []
+    for payment in payments:
+        method_label = PAYMENT_METHODS.get(
+            payment["payment_method"],
+            payment["payment_method"].replace("_", " ").title(),
+        )
+        payment_description = (
+            f"Payment received: {_format_crm_amount(payment['amount'], payment['currency'])} "
+            f"via {method_label}."
+        )
+        if payment["reference"]:
+            payment_description += f" Reference: {payment['reference']}."
+        active_payment_events.append({
+            "id": payment["id"],
+            "description": payment_description,
+            "created_at": payment["received_at"],
+            "service": payment["service"],
+        })
+
+    matched_active_payment_ids = set()
     for lead_id, activity_type, description, created_at, service in activity_rows:
+        service_name = canonicalize_service(service)
+        if activity_type == "PAYMENT":
+            duplicate_payment_id = None
+            for event in active_payment_events:
+                if event["id"] in matched_active_payment_ids:
+                    continue
+                if event["description"] != description or event["service"] != service_name:
+                    continue
+                if created_at is None or event["created_at"] is None:
+                    continue
+                try:
+                    seconds_apart = abs((created_at - event["created_at"]).total_seconds())
+                except (TypeError, AttributeError):
+                    continue
+                if seconds_apart <= 5:
+                    duplicate_payment_id = event["id"]
+                    break
+            if duplicate_payment_id is not None:
+                matched_active_payment_ids.add(duplicate_payment_id)
+                continue
+
         timeline.append({
             "kind": activity_type,
             "description": description,
             "created_at": created_at,
-            "service": canonicalize_service(service),
+            "service": service_name,
         })
 
     for lead_id, note_text, created_at, service in note_rows:
@@ -5321,23 +5369,12 @@ def get_customer_crm_profile(customer_number):
             "service": canonicalize_service(service),
         })
 
-    payments = get_customer_payments(lead_ids, limit=100)
-    for payment in payments:
-        method_label = PAYMENT_METHODS.get(
-            payment["payment_method"],
-            payment["payment_method"].replace("_", " ").title(),
-        )
-        description = (
-            f"Payment received: {_format_crm_amount(payment['amount'], payment['currency'])} "
-            f"via {method_label}."
-        )
-        if payment["reference"]:
-            description += f" Reference: {payment['reference']}."
+    for event in active_payment_events:
         timeline.append({
             "kind": "PAYMENT",
-            "description": description,
-            "created_at": payment["received_at"],
-            "service": payment["service"],
+            "description": event["description"],
+            "created_at": event["created_at"],
+            "service": event["service"],
         })
 
     timeline.sort(key=lambda item: item["created_at"], reverse=True)
@@ -7914,7 +7951,7 @@ label{display:block;font-size:12px;font-weight:800;margin:11px 0 5px}input,selec
 <div class="card"><h2 style="margin:0 0 5px">Expense history · {{ periods[period] }}</h2>
 {% if expenses.recent %}
 {% for item in expenses.recent %}
-<div class="row"><div class="row-head"><div><div class="name">{{ item.category_label }}</div><div class="meta">{{ item.description }}<br>{{ item.service_label }} · {{ item.method_label }}{% if item.reference %} · Ref: {{ item.reference }}{% endif %} · {{ item.date_label }}</div></div><div><div class="amount">{{ item.amount_label }}</div><form method="POST" action="{{ url_for('admin_expenses_delete', expense_id=item.id) }}" onsubmit="return confirm('Delete this expense entry?');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="period" value="{{ period }}"><button class="danger" type="submit">Delete</button></form></div></div></div>
+<div class="row"><div class="row-head"><div><div class="name">{{ item.category_label }}</div><div class="meta">{{ item.description }}<br>{{ item.service_label }} · {{ item.method_label }}{% if item.reference %} · Ref: {{ item.reference }}{% endif %} · {{ item.date_label }}</div></div><div><div class="amount">{{ item.amount_label }}</div><form method="POST" action="{{ url_for('admin_expenses_delete', expense_id=item.id) }}" onsubmit="return confirm('Delete this expense entry? This cannot be undone.');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="period" value="{{ period }}"><button class="danger" type="submit">Delete</button></form></div></div></div>
 {% endfor %}
 {% else %}<div class="empty">No expenses recorded in this period.</div>{% endif %}
 </div>
@@ -8981,7 +9018,7 @@ CUSTOMER_PRIVACY_TEMPLATE = """
 <span>Voided-payment audit records preserved</span><strong class="safe">{{ preview.void_audit_preserved }}</strong>
 <span>Quotes/invoices/receipts preserved</span><strong class="safe">{{ preview.documents_preserved }}</strong>
 </div></div>
-<form method="POST"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<form method="POST" onsubmit="return confirm('Permanently delete this customer personal data and anonymize retained finance records? This cannot be undone.');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <label>Type DELETE to confirm</label><input name="confirmation" autocomplete="off" required>
 <button type="submit">Delete Personal Data &amp; Anonymize Finance Records</button></form>
 <a class="back" href="{{ url_for('admin_leads') }}">Cancel</a>
@@ -10869,7 +10906,7 @@ BUDGET_TEMPLATE = """
 <div class="card"><form method="GET"><div class="grid"><div><label>Year</label><input type="number" name="year" value="{{ data.year }}" min="2020" max="2100"></div><div><label>Month</label><select name="month">{% for n,label in months %}<option value="{{ n }}" {% if n==data.month %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div></div><button class="btn">View month</button></form></div>
 {% if data.totals %}<div class="card"><h2>{{ data.month_label }}</h2><div class="grid">{% for t in data.totals %}<div class="metric"><small>Budget · {{ t.currency }}</small><b>{{ t.currency }} {{ '{:,.0f}'.format(t.budget) }}</b></div><div class="metric"><small>Spent</small><b>{{ t.currency }} {{ '{:,.0f}'.format(t.spent) }}</b></div><div class="metric"><small>Remaining</small><b class="{% if t.remaining < 0 %}over{% endif %}">{{ t.currency }} {{ '{:,.0f}'.format(t.remaining) }}</b></div>{% endfor %}</div></div>{% endif %}
 <div class="card"><h2>Add / update budget</h2><form method="POST" action="{{ url_for('admin_budget_save') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="year" value="{{ data.year }}"><input type="hidden" name="month" value="{{ data.month }}"><div class="grid"><div><label>Amount</label><input name="amount" type="number" min="0.01" step="0.01" required placeholder="e.g. 50000"></div><div><label>Currency</label><select name="currency"><option>MWK</option><option>USD</option><option>ZAR</option><option>EUR</option><option>GBP</option></select></div><div><label>Category</label><select name="category">{% for c in categories %}<option value="{{ c }}">{{ c.title() }}</option>{% endfor %}</select></div><div><label>Related service (optional)</label><input name="service" placeholder="e.g. CV & Cover Letter"></div></div><button class="btn">Save budget</button></form></div>
-<div class="card"><h2>Budget progress · {{ data.month_label }}</h2>{% if data.rows %}{% for r in data.rows %}<div class="row"><div class="head"><div><div class="name">{{ r.category }} · {{ r.service }}</div><div class="muted">Budget {{ r.currency }} {{ '{:,.0f}'.format(r.amount) }} · Spent {{ r.currency }} {{ '{:,.0f}'.format(r.spent) }}</div></div><div class="{% if r.state=='Over budget' %}over{% elif r.state=='Near limit' %}near{% else %}ok{% endif %}">{{ r.state }}</div></div><div class="bar"><div class="fill" style="width:{{ r.percent }}%"></div></div><div class="muted">Remaining {{ r.currency }} {{ '{:,.0f}'.format(r.remaining) }} · {{ '%.0f'|format(r.raw_percent) }}% used</div><form method="POST" action="{{ url_for('admin_budget_delete', budget_id=r.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="year" value="{{ data.year }}"><input type="hidden" name="month" value="{{ data.month }}"><button class="danger" style="margin-top:9px">Delete</button></form></div>{% endfor %}{% else %}<div class="muted">No budgets set for this month yet.</div>{% endif %}</div></main></body></html>
+<div class="card"><h2>Budget progress · {{ data.month_label }}</h2>{% if data.rows %}{% for r in data.rows %}<div class="row"><div class="head"><div><div class="name">{{ r.category }} · {{ r.service }}</div><div class="muted">Budget {{ r.currency }} {{ '{:,.0f}'.format(r.amount) }} · Spent {{ r.currency }} {{ '{:,.0f}'.format(r.spent) }}</div></div><div class="{% if r.state=='Over budget' %}over{% elif r.state=='Near limit' %}near{% else %}ok{% endif %}">{{ r.state }}</div></div><div class="bar"><div class="fill" style="width:{{ r.percent }}%"></div></div><div class="muted">Remaining {{ r.currency }} {{ '{:,.0f}'.format(r.remaining) }} · {{ '%.0f'|format(r.raw_percent) }}% used</div><form method="POST" action="{{ url_for('admin_budget_delete', budget_id=r.id) }}" onsubmit="return confirm('Delete this budget entry? This cannot be undone.');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="year" value="{{ data.year }}"><input type="hidden" name="month" value="{{ data.month }}"><button class="danger" style="margin-top:9px">Delete</button></form></div>{% endfor %}{% else %}<div class="muted">No budgets set for this month yet.</div>{% endif %}</div></main></body></html>
 """
 
 @app.route('/admin/finance/budgets', methods=['GET'])
