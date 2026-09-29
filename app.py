@@ -1432,11 +1432,20 @@ def _application_confirmation_prompt_is_reusable(prompt_text):
 
 
 def _application_confirmation_response_looks_like_new_command(response_text):
+    """Keep application-control instructions out of reusable factual-answer evidence."""
     lower = " ".join(str(response_text or "").lower().split())
     return any(marker in lower for marker in (
         "find me a job", "find me jobs", "search for jobs", "search vacancies",
-        "apply for the next", "apply for this job", "apply for this vacancy",
-        "revoke my", "stop applying", "i authorize ibrows", "i authorise ibrows",
+        "find the next", "apply for the next", "apply for this job", "apply for this vacancy",
+        "apply for this role", "proceed with the verified", "proceed with this application",
+        "proceed with my application", "continue this application", "start this application",
+        "submit this application", "under my active career assist", "active career assist",
+        "using my standing application authorization", "using my standing application authorisation",
+        "use my standing application authorization", "use my standing application authorisation",
+        "re-check that the vacancy", "recheck that the vacancy", "use my stored cv",
+        "use my verified information", "do not ask me again", "do not invent",
+        "do not claim submission", "revoke my", "stop applying",
+        "i authorize ibrows", "i authorise ibrows",
         "standing authorization", "standing authorisation", "standing consent",
     ))
 
@@ -1488,7 +1497,7 @@ def capture_application_confirmation_evidence(customer_number, customer_message)
     return True
 
 
-def _historical_application_confirmation_pairs(customer_number, limit=120):
+def _historical_application_confirmation_pairs(customer_number, limit=500):
     """Recover older precheck answers from conversation history for backward compatibility."""
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -1553,6 +1562,12 @@ def build_application_confirmation_evidence_context(customer_number, limit=12):
     deduped = []
     seen = set()
     for prompt, response in pairs:
+        # Older builds could accidentally store a later workflow command (for example
+        # "proceed with the verified vacancy") as though it answered the prior precheck.
+        # Preserve the database row for audit history, but never surface it as factual
+        # application evidence once the improved command detector identifies it.
+        if _application_confirmation_response_looks_like_new_command(response):
+            continue
         key = (" ".join(prompt.split()).lower(), " ".join(response.split()).lower())
         if not key[0] or not key[1] or key in seen:
             continue
@@ -1566,7 +1581,7 @@ def build_application_confirmation_evidence_context(customer_number, limit=12):
         "CUSTOMER-CONFIRMED APPLICATION EVIDENCE FOR THIS SAME CUSTOMER.",
         "These are exact prior non-sensitive precheck question/answer pairs supplied by the customer.",
         "Reuse an answer only when it directly answers the current vacancy requirement and remains unambiguous.",
-        "Do not infer anything beyond the customer's words. Do not re-ask an already answered requirement unless the current vacancy conflicts with it, the answer is ambiguous, or the customer says it changed.",
+        "Do not infer anything beyond the customer's words. If a prior answer directly resolves a current requirement, you MUST reuse it and MUST NOT ask that same requirement again unless the current vacancy conflicts with it, the answer is ambiguous, or the customer says it changed.",
         "Sensitive/changeable declarations (for example criminal/medical status, work authorization, identity/security data or salary expectations) are deliberately excluded and must still be confirmed when actually required.",
         "",
     ]
@@ -1578,7 +1593,7 @@ def build_application_confirmation_evidence_context(customer_number, limit=12):
             response[:1400],
             "",
         ])
-    text = "\n".join(lines)[:12000]
+    text = "\n".join(lines)[:16000]
     print(f"APPLICATION CONFIRMATION EVIDENCE CONTEXT INCLUDED: pairs={len(deduped)}", flush=True)
     return [{"role": "user", "content": text}]
 
@@ -15549,6 +15564,24 @@ def generate_ai_reply(
                 customer_number, customer_message
             )
             web_input_parts.extend(application_parts)
+            # Repeat reusable customer-confirmed answers beside the freshly revalidated
+            # vacancy requirements. This keeps them salient even when the official job
+            # description is long and prevents the model from re-asking facts already
+            # answered by this same customer.
+            confirmation_near_vacancy = build_application_confirmation_evidence_context(customer_number)
+            if confirmation_near_vacancy:
+                confirmation_text = str(confirmation_near_vacancy[0].get("content") or "").strip()
+                if confirmation_text:
+                    web_input_parts.append({
+                        "type": "input_text",
+                        "text": (
+                            "INTERNAL REUSABLE CUSTOMER ANSWERS — APPLY TO THIS PRE-SUBMISSION CHECK. "
+                            "If an exact prior customer answer below directly resolves a current vacancy requirement, "
+                            "do not ask it again. Do not strengthen, reinterpret, or invent beyond the exact answer.\n\n"
+                            + confirmation_text
+                        )[:16000],
+                    })
+                    print("APPLICATION CONFIRMATION EVIDENCE ATTACHED TO ACTIVE VACANCY", flush=True)
             if application_urls:
                 career_verified_urls = list(application_urls)
                 web_source_urls = list(application_urls)
