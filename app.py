@@ -678,6 +678,14 @@ def init_database():
                 ALTER TABLE application_pack_state
                 ADD COLUMN IF NOT EXISTS target_organisation TEXT
             """)
+            cur.execute("""
+                ALTER TABLE application_pack_state
+                ADD COLUMN IF NOT EXISTS source_service TEXT NOT NULL DEFAULT 'CV & Cover Letter'
+            """)
+            cur.execute("""
+                ALTER TABLE application_pack_state
+                ADD COLUMN IF NOT EXISTS target_url TEXT
+            """)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS customer_menu_state (
@@ -782,6 +790,30 @@ def init_database():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_career_verified_vacancies_customer
                 ON career_verified_vacancies(customer_number, last_verified_at DESC)
+            """)
+
+            # Per-vacancy Career Assist application workflow state. This is separate
+            # from the monthly Career Assist entitlement and never creates a second fee.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS career_assist_applications (
+                    id BIGSERIAL PRIMARY KEY,
+                    customer_number TEXT NOT NULL,
+                    career_assist_lead_id BIGINT REFERENCES leads(id) ON DELETE SET NULL,
+                    vacancy_title TEXT NOT NULL,
+                    employer TEXT NOT NULL,
+                    application_url TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PREPARING'
+                        CHECK (status IN ('PREPARING','NEEDS_INFO','DRAFT_READY','SUBMITTED','CANCELLED')),
+                    authorization_note TEXT,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    submitted_at TIMESTAMPTZ,
+                    UNIQUE(customer_number, application_url)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_career_assist_applications_customer
+                ON career_assist_applications(customer_number, updated_at DESC, id DESC)
             """)
 
         conn.commit()
@@ -2156,18 +2188,49 @@ def is_application_pack_active(customer_number):
     return bool(row and row[0])
 
 
-def set_application_pack_active(customer_number, active):
+def get_application_pack_source_service(customer_number):
+    """Return the entitlement/workflow that owns the active application pack."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO application_pack_state (customer_number, active, updated_at)
-                VALUES (%s, %s, NOW())
-                ON CONFLICT (customer_number)
-                DO UPDATE SET active=EXCLUDED.active, updated_at=NOW()
+                SELECT COALESCE(source_service, 'CV & Cover Letter')
+                FROM application_pack_state
+                WHERE customer_number = %s
                 """,
-                (customer_number, bool(active))
+                (customer_number,),
             )
+            row = cur.fetchone()
+    return str(row[0] or "CV & Cover Letter").strip() if row else "CV & Cover Letter"
+
+
+def set_application_pack_active(customer_number, active, source_service=None):
+    source_service = str(source_service or "").strip()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if source_service:
+                cur.execute(
+                    """
+                    INSERT INTO application_pack_state
+                        (customer_number, active, source_service, updated_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (customer_number)
+                    DO UPDATE SET active=EXCLUDED.active,
+                                  source_service=EXCLUDED.source_service,
+                                  updated_at=NOW()
+                    """,
+                    (customer_number, bool(active), source_service[:80]),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO application_pack_state (customer_number, active, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (customer_number)
+                    DO UPDATE SET active=EXCLUDED.active, updated_at=NOW()
+                    """,
+                    (customer_number, bool(active))
+                )
         conn.commit()
 
 
@@ -2177,7 +2240,7 @@ def get_application_pack_defaults(customer_number):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT preferred_phone, preferred_email, target_role, target_organisation
+                SELECT preferred_phone, preferred_email, target_role, target_organisation, target_url
                 FROM application_pack_state
                 WHERE customer_number = %s
                 """,
@@ -2190,18 +2253,20 @@ def get_application_pack_defaults(customer_number):
             "preferred_email": "",
             "target_role": "",
             "target_organisation": "",
+            "target_url": "",
         }
     return {
         "preferred_phone": str(row[0] or "").strip(),
         "preferred_email": str(row[1] or "").strip(),
         "target_role": str(row[2] or "").strip(),
         "target_organisation": str(row[3] or "").strip(),
+        "target_url": str(row[4] or "").strip(),
     }
 
 
 def update_application_pack_defaults(customer_number, **fields):
     allowed = {
-        "preferred_phone", "preferred_email", "target_role", "target_organisation"
+        "preferred_phone", "preferred_email", "target_role", "target_organisation", "target_url"
     }
     updates = []
     values = []
@@ -2235,19 +2300,95 @@ def update_application_pack_defaults(customer_number, **fields):
 
 
 def clear_application_pack_target(customer_number):
-    """Clear vacancy-specific defaults after a one-off package is consumed."""
+    """Clear vacancy-specific defaults after a completed/abandoned application pack."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE application_pack_state
-                SET target_role = NULL, target_organisation = NULL, updated_at = NOW()
+                SET target_role = NULL, target_organisation = NULL, target_url = NULL, updated_at = NOW()
                 WHERE customer_number = %s
                 """,
                 (customer_number,),
             )
         conn.commit()
 
+
+def get_verified_vacancy_identity(customer_number, application_url):
+    """Return the cached identity for an already verified vacancy URL."""
+    url = str(application_url or "").strip()
+    if not url:
+        return None
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT title, employer, location, application_url
+                FROM career_verified_vacancies
+                WHERE customer_number=%s AND LOWER(application_url)=LOWER(%s)
+                ORDER BY last_verified_at DESC, id DESC
+                LIMIT 1
+                """,
+                (customer_number, url),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "title": str(row[0] or "").strip(),
+        "employer": str(row[1] or "").strip(),
+        "location": str(row[2] or "").strip(),
+        "application_url": str(row[3] or url).strip(),
+    }
+
+
+def upsert_career_assist_application_record(
+    customer_number, vacancy, status="PREPARING", authorization_note=""
+):
+    """Create/update a real per-vacancy Career Assist application record."""
+    allowed_statuses = {"PREPARING", "NEEDS_INFO", "DRAFT_READY", "SUBMITTED", "CANCELLED"}
+    status = str(status or "PREPARING").upper().strip()
+    if status not in allowed_statuses:
+        raise ValueError("Unsupported Career Assist application status")
+    vacancy = vacancy or {}
+    title = str(vacancy.get("title") or "").strip()
+    employer = str(vacancy.get("employer") or "").strip()
+    application_url = str(vacancy.get("application_url") or "").strip()
+    if not title or not employer or not application_url:
+        raise ValueError("Career Assist application requires an exact verified vacancy identity")
+    state = get_career_assist_lifecycle_state(customer_number)
+    lead_id = state.get("lead_id") if state.get("state") == "ACTIVE" else None
+    submitted_sql = "NOW()" if status == "SUBMITTED" else "submitted_at"
+    insert_submitted_sql = "NOW()" if status == "SUBMITTED" else "NULL"
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO career_assist_applications
+                    (customer_number, career_assist_lead_id, vacancy_title, employer,
+                     application_url, status, authorization_note, updated_at, submitted_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), {insert_submitted_sql})
+                ON CONFLICT (customer_number, application_url)
+                DO UPDATE SET career_assist_lead_id=EXCLUDED.career_assist_lead_id,
+                              vacancy_title=EXCLUDED.vacancy_title,
+                              employer=EXCLUDED.employer,
+                              status=EXCLUDED.status,
+                              authorization_note=CASE
+                                  WHEN EXCLUDED.authorization_note <> '' THEN EXCLUDED.authorization_note
+                                  ELSE career_assist_applications.authorization_note
+                              END,
+                              updated_at=NOW(),
+                              submitted_at={submitted_sql}
+                RETURNING id
+                """,
+                (
+                    customer_number, lead_id, title[:180], employer[:180],
+                    application_url[:2000], status, str(authorization_note or "")[:1200],
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return row[0] if row else None
 
 
 # =========================================================
@@ -2713,6 +2854,27 @@ def detect_application_pack_request(customer_message):
     return (action and cv and letter) or broad
 
 
+def detect_career_assist_preparation_request(customer_message):
+    """Detect an explicit request to start/continue vacancy-specific application drafting."""
+    text = " ".join(str(customer_message or "").lower().split())
+    if not text:
+        return False
+    if any(phrase in text for phrase in (
+        "do not prepare", "don't prepare", "dont prepare",
+        "stop preparing", "cancel preparation", "cancel the application",
+    )):
+        return False
+    prep_action = any(term in text for term in (
+        "prepare", "prepar", "draft", "create", "creat", "generate", "generat",
+        "application materials", "application pack", "cv and cover letter",
+        "cv & cover letter", "cover-letter", "application record", "being prepared",
+    ))
+    target_hint = any(term in text for term in (
+        "vacancy", "job", "role", "position", "application", "cv", "cover letter",
+    ))
+    return prep_action and target_hint
+
+
 def _clean_pack_string(value, max_len=4000):
     value = str(value or "").strip()
     return value[:max_len]
@@ -2820,12 +2982,18 @@ def validate_application_pack_output(result):
     return base
 
 
-def generate_application_pack(customer_number, _retry_with_resolved_defaults=False):
+def generate_application_pack(customer_number, _retry_with_resolved_defaults=False, extra_context_parts=None):
     """Build a truthful tailored CV/cover-letter draft from this customer's stored context."""
     stored_defaults_context, stored_defaults = _resolved_application_defaults_context(customer_number)
     memory_context, has_candidate_cv_memory = build_application_evidence_context(customer_number)
     conversation = get_application_customer_context(customer_number, limit=80)
     input_payload = stored_defaults_context + memory_context + conversation
+    extra_context_parts = [
+        part for part in (extra_context_parts or [])
+        if isinstance(part, dict) and part.get("type") == "input_text" and str(part.get("text") or "").strip()
+    ]
+    if extra_context_parts:
+        input_payload.append({"role": "user", "content": extra_context_parts})
     if _retry_with_resolved_defaults:
         input_payload.append({
             "role": "user",
@@ -2922,7 +3090,7 @@ The reply for ready=true should say that draft application files have been prepa
             # The model asked for facts the system already has. Give it one bounded
             # retry with those resolved defaults emphasized instead of bothering the customer.
             print("APPLICATION PACK SMART REUSE RETRY — STORED DETAILS RESOLVED QUESTIONS", flush=True)
-            return generate_application_pack(customer_number, _retry_with_resolved_defaults=True)
+            return generate_application_pack(customer_number, _retry_with_resolved_defaults=True, extra_context_parts=extra_context_parts)
         if not pack["missing_information"]:
             pack["missing_information"] = [
                 "Any specific application detail that is genuinely missing from the stored CV and vacancy evidence"
@@ -4098,15 +4266,16 @@ def send_whatsapp_document(recipient, file_bytes, filename, mime_type, caption=N
         return False
 
 
-def process_application_pack(customer_number, customer_name, customer_message):
+def process_application_pack(customer_number, customer_name, customer_message, source_service="CV & Cover Letter", extra_generation_context=None):
     # Capture a direct response to our own preferred-contact questions before
     # generating the pack. This makes a one-time confirmation reusable even for
     # legacy CV memories that were created before contact defaults were retained.
     capture_application_contact_confirmation(customer_number, customer_message)
     save_message(customer_number, "user", customer_message)
-    set_application_pack_active(customer_number, True)
+    source_service = canonicalize_service(source_service or "CV & Cover Letter")
+    set_application_pack_active(customer_number, True, source_service=source_service)
     try:
-        pack = generate_application_pack(customer_number)
+        pack = generate_application_pack(customer_number, extra_context_parts=extra_generation_context)
     except Exception as error:
         print(f"APPLICATION PACK ERROR: {type(error).__name__}", flush=True)
         reply = (
@@ -4444,19 +4613,24 @@ def process_application_pack(customer_number, customer_name, customer_message):
         elif not can_auto_repair:
             print(f"APPLICATION PACK QUALITY BLOCKED: {len(quality_issues)} issue(s)", flush=True)
 
+        entitlement_sentence = (
+            "your active Career Assist application remains in preparation while the issue is resolved"
+            if source_service == "Career Assist"
+            else "your paid one-off package remains active while the issue is resolved"
+        )
         reply = (
             "Your draft CV and cover letter have been prepared, but the final IBROWS quality "
             "check found a detail that must be verified before the files can be released. "
-            "Nothing has been submitted to the employer, and your paid one-off package remains "
-            "active while the issue is resolved. If information is needed from you, IBROWS will "
-            "ask only for the specific missing or conflicting detail; you do not need to pay again."
+            f"Nothing has been submitted to the employer, and {entitlement_sentence}. "
+            "If information is needed from you, IBROWS will ask only for the specific missing or "
+            "conflicting detail; you do not need to pay again."
         )
         save_message(customer_number, "assistant", reply)
         try:
             lead_id, _ = create_or_update_lead(
                 customer_number=customer_number,
                 customer_name=customer_name,
-                service="CV & Cover Letter",
+                service=source_service,
                 summary=f"Application pack quality check blocked delivery for {pack['candidate_name']} — {pack['target_role']}.",
                 handover_reason="Final application quality review required: " + "; ".join(quality_issues[:4]),
             )
@@ -4502,7 +4676,7 @@ def process_application_pack(customer_number, customer_name, customer_message):
         lead_id, is_new_lead = create_or_update_lead(
             customer_number=customer_number,
             customer_name=customer_name,
-            service="CV & Cover Letter",
+            service=source_service,
             summary=f"Tailored application pack prepared for {pack['candidate_name']} — {pack['target_role']} at {pack['target_organisation'] or 'target organisation'}.",
             handover_reason=(
                 ("Eligibility review: " + warning)
@@ -4515,7 +4689,7 @@ def process_application_pack(customer_number, customer_name, customer_message):
                 lead_id=lead_id,
                 customer_name=customer_name,
                 customer_number=customer_number,
-                service="CV & Cover Letter",
+                service=source_service,
                 summary=f"Tailored application pack prepared for {pack['candidate_name']} — {pack['target_role']}.",
                 handover_reason="Final review required before submission."
             )
@@ -13809,6 +13983,7 @@ def fetch_career_assist_application_context(customer_number, customer_request):
             customer_number,
             target_role=str(selected.get("title") or "")[:180],
             target_organisation=str(selected.get("employer") or "")[:180],
+            target_url=str(live_url or selected.get("application_url") or "")[:2000],
         )
     except Exception as error:
         print(f"CAREER ASSIST APPLICATION TARGET DEFAULT UPDATE FAILED: {type(error).__name__}", flush=True)
@@ -15294,13 +15469,190 @@ def receive_webhook():
                 flush=True,
             )
 
+        # Vacancy-specific application drafting under ACTIVE Career Assist must execute
+        # inside the monthly entitlement. It must never fall through to the generic lead
+        # handoff or the standalone MK5,000 CV-package payment gate.
+        pack_active = is_application_pack_active(customer_number)
+        pack_source = get_application_pack_source_service(customer_number) if pack_active else ""
+        career_pack_continuation = pack_active and pack_source == "Career Assist"
+        career_prep_requested = detect_career_assist_preparation_request(customer_message)
+        career_pack_start = active_career_assist_application and career_prep_requested
+        if career_prep_requested and not career_pack_start:
+            prep_text = " ".join(str(customer_message or "").lower().split())
+            specific_prep_target = any(term in prep_text for term in (
+                "vacancy", "job", "role", "position", "this application", "exact application"
+            ))
+            if specific_prep_target:
+                try:
+                    prep_state = get_career_assist_lifecycle_state(customer_number)
+                    career_pack_start = prep_state.get("state") == "ACTIVE"
+                except Exception as prep_state_error:
+                    print(
+                        f"CAREER ASSIST PREPARATION STATE CHECK FAILED: {type(prep_state_error).__name__}",
+                        flush=True,
+                    )
+
+        if message_type == "text" and (career_pack_start or career_pack_continuation):
+            try:
+                ca_state = get_career_assist_lifecycle_state(customer_number)
+            except Exception as lifecycle_error:
+                ca_state = {"state": "UNKNOWN"}
+                print(f"CAREER ASSIST PACK STATE CHECK FAILED: {type(lifecycle_error).__name__}", flush=True)
+
+            if ca_state.get("state") != "ACTIVE":
+                set_application_pack_active(customer_number, False, source_service="Career Assist")
+                reply = (
+                    "I cannot continue this application under Career Assist because the Career Assist term is not currently active. "
+                    "No application has been submitted. Please ask IBROWS to review the Career Assist status before preparation continues."
+                )
+                save_message(customer_number, "user", customer_message)
+                save_message(customer_number, "assistant", reply)
+                store_pending_reply(message_id, reply)
+                sent = send_whatsapp_message(customer_number, reply)
+                finish_whatsapp_message(message_id, sent)
+                return "EVENT_RECEIVED", 200
+
+            defaults = get_application_pack_defaults(customer_number)
+            target_url = str(defaults.get("target_url") or "").strip()
+            resolution_request = customer_message
+            if career_pack_continuation and target_url and target_url not in resolution_request:
+                resolution_request = f"{customer_message}\nExact active application URL: {target_url}"
+
+            application_parts, application_urls, application_resolved = fetch_career_assist_application_context(
+                customer_number, resolution_request
+            )
+            if not application_resolved or len(application_urls) != 1:
+                application_status_text = " ".join(
+                    str(part.get("text") or "")
+                    for part in (application_parts or [])
+                    if isinstance(part, dict)
+                )
+                if "SELECTED_VACANCY_NO_LONGER_CURRENT" in application_status_text:
+                    reply = (
+                        "I rechecked the selected vacancy and could not confirm it as currently open, so I have not started or submitted an application for it. "
+                        "Your Career Assist remains active and no separate fee applies. I can search for another verified vacancy instead."
+                    )
+                    log_message = "CAREER ASSIST PACK BLOCKED — VACANCY NO LONGER CURRENT"
+                elif "VACANCY_REVALIDATION_UNAVAILABLE" in application_status_text:
+                    reply = (
+                        "I could not safely revalidate the selected vacancy's current status and requirements just now, so I have not generated or submitted anything. "
+                        "Your Career Assist remains active and no separate fee applies. Please retry shortly."
+                    )
+                    log_message = "CAREER ASSIST PACK BLOCKED — REVALIDATION UNAVAILABLE"
+                else:
+                    reply = (
+                        "I cannot safely start the application documents until the exact verified vacancy is uniquely resolved. "
+                        "Your active Career Assist still covers the work and no separate MK2,000 or MK5,000 fee applies. "
+                        "Please send the exact vacancy URL or the exact employer and job title. Nothing has been submitted."
+                    )
+                    log_message = "CAREER ASSIST PACK BLOCKED — EXACT VACANCY NOT RESOLVED"
+                save_message(customer_number, "user", customer_message)
+                save_message(customer_number, "assistant", reply)
+                store_pending_reply(message_id, reply)
+                sent = send_whatsapp_message(customer_number, reply)
+                finish_whatsapp_message(message_id, sent)
+                print(log_message, flush=True)
+                return "EVENT_RECEIVED", 200
+
+            verified_url = application_urls[0]
+            vacancy = get_verified_vacancy_identity(customer_number, verified_url)
+            if vacancy is None:
+                refreshed_defaults = get_application_pack_defaults(customer_number)
+                vacancy = {
+                    "title": str(refreshed_defaults.get("target_role") or "").strip(),
+                    "employer": str(refreshed_defaults.get("target_organisation") or "").strip(),
+                    "application_url": verified_url,
+                    "location": "",
+                }
+            if not vacancy.get("title") or not vacancy.get("employer"):
+                reply = (
+                    "The vacancy page is verified, but its stored title/employer identity is incomplete. "
+                    "Please send the exact employer and job title so I can bind the preparation record safely. "
+                    "No application has been submitted and Career Assist remains the covering service."
+                )
+                save_message(customer_number, "user", customer_message)
+                save_message(customer_number, "assistant", reply)
+                store_pending_reply(message_id, reply)
+                sent = send_whatsapp_message(customer_number, reply)
+                finish_whatsapp_message(message_id, sent)
+                return "EVENT_RECEIVED", 200
+
+            vacancy["application_url"] = verified_url
+            update_application_pack_defaults(
+                customer_number,
+                target_role=vacancy["title"],
+                target_organisation=vacancy["employer"],
+                target_url=verified_url,
+            )
+            try:
+                app_record_id = upsert_career_assist_application_record(
+                    customer_number, vacancy, status="PREPARING",
+                    authorization_note=(
+                        "Vacancy-specific Career Assist preparation authorized in the customer conversation; "
+                        "standing Career Assist scope is unchanged."
+                    ),
+                )
+                print(f"CAREER ASSIST APPLICATION PREPARING: record={app_record_id}", flush=True)
+            except Exception as record_error:
+                print(f"CAREER ASSIST APPLICATION RECORD ERROR: {type(record_error).__name__}", flush=True)
+                reply = (
+                    "I could not create the internal application-preparation record safely, so I have not generated or submitted anything. "
+                    "Your Career Assist entitlement is unchanged. Please try again shortly or ask to talk to Jones."
+                )
+                save_message(customer_number, "user", customer_message)
+                save_message(customer_number, "assistant", reply)
+                store_pending_reply(message_id, reply)
+                sent = send_whatsapp_message(customer_number, reply)
+                finish_whatsapp_message(message_id, sent)
+                return "EVENT_RECEIVED", 200
+
+            pack_result = process_application_pack(
+                customer_number=customer_number, customer_name=customer_name,
+                customer_message=customer_message, source_service="Career Assist",
+                extra_generation_context=application_parts,
+            )
+            reply = pack_result["reply"]
+            store_pending_reply(message_id, reply)
+            text_sent = send_whatsapp_message(customer_number, reply)
+            documents_sent = True
+            if pack_result.get("ready"):
+                documents = pack_result.get("documents", [])
+                if not documents:
+                    documents_sent = False
+                    print("CAREER ASSIST PACK READY WITHOUT DOCUMENTS", flush=True)
+                else:
+                    for index, document in enumerate(documents):
+                        caption = "IBROWS Career Assist draft — review before submission" if index == 0 else None
+                        sent_doc = send_whatsapp_document(
+                            customer_number, document["bytes"], document["filename"],
+                            document["mime_type"], caption=caption,
+                        )
+                        documents_sent = documents_sent and sent_doc
+                if text_sent and documents_sent:
+                    set_application_pack_active(customer_number, False, source_service="Career Assist")
+                    try:
+                        upsert_career_assist_application_record(customer_number, vacancy, status="DRAFT_READY")
+                    except Exception as record_error:
+                        print(f"CAREER ASSIST DRAFT-READY RECORD ERROR: {type(record_error).__name__}", flush=True)
+                    print("CAREER ASSIST APPLICATION DRAFTS DELIVERED — NO ONE-OFF ENTITLEMENT CONSUMED", flush=True)
+                else:
+                    print("CAREER ASSIST APPLICATION DRAFT DELIVERY INCOMPLETE", flush=True)
+            else:
+                try:
+                    upsert_career_assist_application_record(customer_number, vacancy, status="NEEDS_INFO")
+                except Exception as record_error:
+                    print(f"CAREER ASSIST NEEDS-INFO RECORD ERROR: {type(record_error).__name__}", flush=True)
+            finish_whatsapp_message(message_id, text_sent and documents_sent)
+            return "EVENT_RECEIVED", 200
+
+        # Standalone One-Off CV + Cover Letter package. Career Assist-owned pack
+        # continuations are handled above and therefore never reach this payment gate.
         if message_type == "text" and (
-            is_application_pack_active(customer_number)
+            (pack_active and pack_source != "Career Assist")
             or detect_application_pack_request(customer_message)
         ):
             payment_gate_reply = application_pack_payment_gate(
-                customer_number=customer_number,
-                customer_name=customer_name,
+                customer_number=customer_number, customer_name=customer_name,
             )
             if payment_gate_reply is not None:
                 save_message(customer_number, "user", customer_message)
@@ -15312,9 +15664,8 @@ def receive_webhook():
                 return "EVENT_RECEIVED", 200
 
             pack_result = process_application_pack(
-                customer_number=customer_number,
-                customer_name=customer_name,
-                customer_message=customer_message,
+                customer_number=customer_number, customer_name=customer_name,
+                customer_message=customer_message, source_service="CV & Cover Letter",
             )
             reply = pack_result["reply"]
             store_pending_reply(message_id, reply)
@@ -15329,32 +15680,21 @@ def receive_webhook():
                     for index, document in enumerate(documents):
                         caption = "IBROWS draft — review before submission" if index == 0 else None
                         sent_doc = send_whatsapp_document(
-                            customer_number,
-                            document["bytes"],
-                            document["filename"],
-                            document["mime_type"],
-                            caption=caption,
+                            customer_number, document["bytes"], document["filename"],
+                            document["mime_type"], caption=caption,
                         )
                         documents_sent = documents_sent and sent_doc
-
                 if text_sent and documents_sent:
                     try:
                         consumed_lead_id = consume_cv_package_entitlement(customer_number)
-                        set_application_pack_active(customer_number, False)
+                        set_application_pack_active(customer_number, False, source_service="CV & Cover Letter")
                         clear_application_pack_target(customer_number)
-                        print(
-                            f"APPLICATION PACK SENT — ONE-OFF ENTITLEMENT CONSUMED: {consumed_lead_id}",
-                            flush=True,
-                        )
+                        print(f"APPLICATION PACK SENT — ONE-OFF ENTITLEMENT CONSUMED: {consumed_lead_id}", flush=True)
                     except Exception as consume_error:
-                        # Delivery succeeded, but never pretend the entitlement was consumed
-                        # if the authoritative ledger update failed. Keep the pack inactive
-                        # and surface an unmistakable server log for admin intervention.
-                        set_application_pack_active(customer_number, False)
+                        set_application_pack_active(customer_number, False, source_service="CV & Cover Letter")
                         print(
                             f"CRITICAL: APPLICATION PACK DELIVERED BUT ENTITLEMENT CONSUMPTION FAILED: "
-                            f"{type(consume_error).__name__}: {consume_error}",
-                            flush=True,
+                            f"{type(consume_error).__name__}: {consume_error}", flush=True,
                         )
                 else:
                     print("APPLICATION PACK DELIVERY INCOMPLETE — ENTITLEMENT NOT CONSUMED", flush=True)
