@@ -4828,7 +4828,10 @@ def build_verified_payment_context(customer_number):
         expires = career_assist["expires_at"].astimezone(ADMIN_TIMEZONE).strftime("%d %b %Y %H:%M")
         lines.append(
             f"- Career Assist activation: ACTIVE; started {started} Malawi time; "
-            f"expires {expires} Malawi time. Do not request another payment before expiry unless the customer is purchasing a separate service."
+            f"expires {expires} Malawi time. This active term includes vacancy discovery plus job-application support/execution "
+            "within the customer's agreed scope. Do NOT require a separate MK2,000 Single Job Application payment for an "
+            "application handled under this active Career Assist term. Customer consent and any genuinely missing sensitive "
+            "or mandatory declarations are still required before submission."
         )
     elif ca_state == "PAID_AWAITING_ACTIVATION":
         lines.append(
@@ -4989,7 +4992,7 @@ def detect_career_assist_vacancy_search_request(customer_message):
 
 
 def detect_single_job_application_request(customer_message):
-    """Detect an explicit one-job application request without confusing it with the CV pack."""
+    """Detect execution of one identified application without confusing it with discovery/CV work."""
     text = " ".join(str(customer_message or "").lower().split())
     if not text:
         return False
@@ -4998,15 +5001,47 @@ def detect_single_job_application_request(customer_message):
     exact_or_named = any(phrase in text for phrase in (
         "single job application", "one job application", "job application assistance",
         "apply for one job", "apply for this job", "apply to this job",
+        "apply for vacancy", "apply to vacancy", "apply for role", "apply to role",
+        "apply for the first one", "apply for the second one", "apply for the third one",
+        "apply for vacancy 1", "apply for vacancy 2", "apply for vacancy 3",
         "proceed with my job application", "continue my job application",
-        "start my job application", "submit my job application",
+        "start my job application", "submit my job application", "submit this application",
     ))
-    action_job = (
-        any(word in text for word in ("apply", "application", "proceed", "continue", "start", "submit"))
-        and "job" in text
-        and any(word in text for word in ("apply", "application"))
-    )
+    action_word = any(word in text for word in (
+        "apply", "application", "proceed", "continue", "start", "submit"
+    ))
+    target_word = any(word in text for word in (
+        "job", "vacancy", "role", "position"
+    ))
+    action_job = action_word and target_word and any(word in text for word in ("apply", "application", "submit"))
     return exact_or_named or action_job
+
+
+def detect_career_assist_application_request(customer_message):
+    """Detect an identified-vacancy application request that may be covered by active Career Assist.
+
+    This is intentionally separate from vacancy discovery. An active Career Assist term covers
+    application support/execution within the customer's agreed scope; it must not be redirected
+    into the standalone MK2,000 Single Job Application payment gate.
+    """
+    text = " ".join(str(customer_message or "").lower().split())
+    if not text:
+        return False
+    if detect_career_assist_vacancy_search_request(customer_message):
+        return False
+    application_intent = any(phrase in text for phrase in (
+        "i want to apply", "want to apply", "apply for vacancy", "apply to vacancy",
+        "apply for this job", "apply to this job", "apply for this role", "apply to this role",
+        "apply for the first one", "apply for the second one", "apply for the third one",
+        "proceed with this application", "proceed with my application",
+        "continue this application", "start this application", "submit this application",
+        "before anything is submitted", "before submission",
+    ))
+    target_hint = any(term in text for term in (
+        "vacancy", "job", "role", "position", "first one", "second one", "third one",
+        "vacancy 1", "vacancy 2", "vacancy 3", "role 1", "role 2", "role 3",
+    ))
+    return application_intent and target_hint
 
 
 def ensure_cv_package_lead(customer_number, customer_name):
@@ -12839,6 +12874,258 @@ def _trusted_ats_exact_job_url(url):
     return False
 
 
+
+def _career_application_requested_ordinal(customer_message):
+    text = " ".join(str(customer_message or "").lower().split())
+    match = re.search(r"\b(?:vacancy|role|job|option)\s*(?:number\s*)?([1-5])\b", text)
+    if match:
+        return int(match.group(1))
+    word_map = {
+        "first one": 1, "first vacancy": 1, "first role": 1,
+        "second one": 2, "second vacancy": 2, "second role": 2,
+        "third one": 3, "third vacancy": 3, "third role": 3,
+        "fourth one": 4, "fourth vacancy": 4, "fourth role": 4,
+        "fifth one": 5, "fifth vacancy": 5, "fifth role": 5,
+    }
+    for phrase, number in word_map.items():
+        if phrase in text:
+            return number
+    return None
+
+
+def _recent_verified_vacancy_url_by_ordinal(customer_number, ordinal):
+    """Resolve 'vacancy 1/first one' only from a recent assistant shortlist."""
+    if not ordinal or ordinal < 1:
+        return ""
+    try:
+        recent = get_recent_conversation(customer_number, limit=24)
+    except Exception:
+        return ""
+    for message in reversed(recent):
+        if str(message.get("role") or "").lower() != "assistant":
+            continue
+        content = str(message.get("content") or "")
+        urls = []
+        for url in extract_public_urls_from_text(content):
+            try:
+                normalized = _normalize_candidate_url(url)
+            except Exception:
+                continue
+            if not _career_is_trusted_ats_source(normalized) or not _trusted_ats_exact_job_url(normalized):
+                continue
+            if normalized.lower() not in {u.lower() for u in urls}:
+                urls.append(normalized)
+        if len(urls) >= ordinal:
+            return urls[ordinal - 1]
+    return ""
+
+
+def _career_application_candidate_score(item, customer_request):
+    """Score cached verified vacancies against the customer's selected title/employer wording."""
+    request = re.sub(r"[^a-z0-9]+", " ", str(customer_request or "").lower()).strip()
+    title = re.sub(r"[^a-z0-9]+", " ", str(item.get("title") or "").lower()).strip()
+    employer = re.sub(r"[^a-z0-9]+", " ", str(item.get("employer") or "").lower()).strip()
+    score = 0
+    if title and title in request:
+        score += 12
+    if employer and employer in request:
+        score += 6
+    title_tokens = [t for t in title.split() if len(t) >= 4]
+    score += min(6, sum(1 for t in title_tokens if t in request))
+    employer_tokens = [t for t in employer.split() if len(t) >= 3]
+    score += min(3, sum(1 for t in employer_tokens if t in request))
+    return score
+
+
+def fetch_career_assist_application_context(customer_number, customer_request):
+    """Resolve and freshly revalidate a selected vacancy for an active Career Assist application.
+
+    Cached rows are discovery/identity hints only. Current status and requirements are re-read from
+    the exact ATS/direct vacancy source before the model is allowed to discuss application readiness.
+    """
+    request_text = str(customer_request or "")[:3000]
+    candidates = []
+    seen = set()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT title, employer, location, application_url, match_reason, fit_strength, fit_gaps
+                    FROM career_verified_vacancies
+                    WHERE customer_number=%s
+                      AND last_verified_at >= NOW() - INTERVAL '30 days'
+                    ORDER BY last_verified_at DESC, id DESC
+                    LIMIT 20
+                    """,
+                    (customer_number,),
+                )
+                rows = cur.fetchall()
+        for title, employer, location, application_url, match_reason, fit_strength, fit_gaps in rows:
+            url = str(application_url or "").strip()
+            if not url or not _career_is_trusted_ats_source(url) or not _trusted_ats_exact_job_url(url):
+                continue
+            key = url.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({
+                "title": str(title or "")[:180],
+                "employer": str(employer or "")[:180],
+                "location": str(location or "")[:180],
+                "application_url": url,
+                "match_reason": str(match_reason or "")[:700],
+                "fit_strength": str(fit_strength or ""),
+                "fit_gaps": str(fit_gaps or "")[:900],
+            })
+    except Exception as error:
+        print(f"CAREER ASSIST APPLICATION CACHE LOAD FAILED: {type(error).__name__}", flush=True)
+
+    if not candidates:
+        return [{
+            "type": "input_text",
+            "text": (
+                "INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: SELECTED_VACANCY_NOT_RESOLVED. "
+                "Career Assist is active and application support is covered without a separate MK2,000 fee, but the exact "
+                "previously verified vacancy could not be resolved from the short-lived verified-vacancy cache. Ask only for "
+                "the exact vacancy/application URL or exact title+employer; do not ask for payment and do not claim submission."
+            ),
+        }], [], False
+
+    selected = None
+    direct_urls = []
+    try:
+        direct_urls = extract_public_urls_from_text(request_text)
+    except Exception:
+        direct_urls = []
+    for raw_url in direct_urls:
+        try:
+            normalized = _normalize_candidate_url(raw_url)
+        except Exception:
+            continue
+        selected = next((x for x in candidates if x["application_url"].lower() == normalized.lower()), None)
+        if selected:
+            break
+
+    if selected is None:
+        ordinal = _career_application_requested_ordinal(request_text)
+        ordinal_url = _recent_verified_vacancy_url_by_ordinal(customer_number, ordinal)
+        if ordinal_url:
+            selected = next((x for x in candidates if x["application_url"].lower() == ordinal_url.lower()), None)
+
+    if selected is None:
+        ranked = sorted(
+            (( _career_application_candidate_score(item, request_text), item) for item in candidates),
+            key=lambda pair: pair[0], reverse=True,
+        )
+        if ranked and ranked[0][0] >= 4:
+            # Avoid an ambiguous title-only guess when two recent vacancies score equally.
+            if len(ranked) == 1 or ranked[0][0] > ranked[1][0]:
+                selected = ranked[0][1]
+
+    if selected is None:
+        return [{
+            "type": "input_text",
+            "text": (
+                "INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: SELECTED_VACANCY_AMBIGUOUS. "
+                "Career Assist is active and this application does not require the standalone MK2,000 payment. "
+                "Several recent verified vacancies could match the customer's wording. Ask only which exact vacancy they mean "
+                "(title/employer or application URL). Do not request the full advert when the verified vacancy can be resolved by identity."
+            ),
+        }], [], False
+
+    url = selected["application_url"]
+    requirement_text = ""
+    live_url = url
+    apply_url = ""
+    current_evidence = ""
+    ashby = _ashby_public_posting_verification(selected, url)
+    if ashby.get("api_ok"):
+        if not ashby.get("live"):
+            print(
+                f"CAREER ASSIST APPLICATION REVALIDATION REJECTED: title={selected.get('title')} reason={ashby.get('reason')}",
+                flush=True,
+            )
+            return [{
+                "type": "input_text",
+                "text": (
+                    "INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: SELECTED_VACANCY_NO_LONGER_CURRENT. "
+                    f"The exact previously verified vacancy {selected.get('title')} at {selected.get('employer')} no longer appears "
+                    "in the official current Ashby posting feed. Do not prepare or submit it as an open vacancy. Tell the customer "
+                    "its current status could not be reconfirmed and offer to search for a replacement under active Career Assist."
+                ),
+            }], [], False
+        requirement_text = str(ashby.get("scope_text") or "")[:14000]
+        live_url = str(ashby.get("job_url") or url)
+        apply_url = str(ashby.get("apply_url") or "")
+        current_evidence = "Exact posting is currently published in Ashby's public job-board feed."
+    else:
+        try:
+            page_text, final_url = _direct_page_text_for_vacancy(url)
+            lower = str(page_text or "").lower()
+            if any(marker in lower for marker in (
+                "no longer accepting applications", "applications are closed", "applications closed",
+                "vacancy closed", "job closed", "job has expired", "position has been filled",
+            )):
+                return [{
+                    "type": "input_text",
+                    "text": (
+                        "INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: SELECTED_VACANCY_NO_LONGER_CURRENT. "
+                        "The exact vacancy page now shows a closed/expired state. Do not prepare or submit an application as current."
+                    ),
+                }], [], False
+            requirement_text = str(page_text or "")[:14000]
+            live_url = str(final_url or url)
+            current_evidence = "Exact vacancy page was freshly fetched and did not show a closed/expired state."
+        except Exception as error:
+            print(f"CAREER ASSIST APPLICATION REVALIDATION FAILED: {type(error).__name__}", flush=True)
+            return [{
+                "type": "input_text",
+                "text": (
+                    "INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: VACANCY_REVALIDATION_UNAVAILABLE. "
+                    "The selected vacancy was previously verified, but its current official page could not be revalidated right now. "
+                    "Do not ask the customer to pay or to resend their CV. Say the current vacancy requirements/status could not be "
+                    "rechecked at this moment and invite a retry; do not claim submission."
+                ),
+            }], [], False
+
+    fit_strength, fit_gaps = _normalize_career_fit_assessment(
+        selected.get("fit_strength"), selected.get("match_reason"), selected.get("fit_gaps")
+    )
+    try:
+        update_application_pack_defaults(
+            customer_number,
+            target_role=str(selected.get("title") or "")[:180],
+            target_organisation=str(selected.get("employer") or "")[:180],
+        )
+    except Exception as error:
+        print(f"CAREER ASSIST APPLICATION TARGET DEFAULT UPDATE FAILED: {type(error).__name__}", flush=True)
+    lines = [
+        "INTERNAL ACTIVE CAREER ASSIST APPLICATION — VERIFIED SELECTED VACANCY.",
+        "This customer's ACTIVE Career Assist term covers application support/execution for this selected vacancy within the agreed scope.",
+        "Do NOT request or mention a separate MK2,000 Single Job Application payment for this workflow.",
+        "The customer has asked for a pre-submission requirements check. Do NOT claim or imply that anything has been submitted.",
+        "Treat the verified vacancy text below as the source for job requirements. Do not ask the customer to resend the full advert/screenshot/PDF merely because it is not in recent chat.",
+        "Ask only for genuinely unresolved MANDATORY facts or declarations actually required by the vacancy/application process. Do not invent generic questions such as salary, work authorisation or availability unless the verified vacancy/application evidence actually requires them.",
+        f"Title: {selected.get('title')}",
+        f"Employer: {selected.get('employer')}",
+        f"Location: {str(ashby.get('location') or selected.get('location') or 'Not stated')}",
+        f"Current-status evidence: {current_evidence}",
+        f"Verified application/source URL (COPY EXACTLY): {live_url}",
+        f"Direct apply URL if supplied by ATS (COPY EXACTLY, otherwise blank): {apply_url}",
+        f"Prior verified fit classification: {fit_strength}",
+        f"Prior verified fit gaps: {fit_gaps or 'None flagged as mandatory/core gaps.'}",
+        "",
+        "VERIFIED CURRENT VACANCY REQUIREMENTS / DESCRIPTION:",
+        requirement_text or "No readable requirement text was returned by the official source.",
+    ]
+    print(
+        f"ACTIVE CAREER ASSIST APPLICATION CONTEXT RESOLVED: title={selected.get('title')} host={_career_url_host(live_url)}",
+        flush=True,
+    )
+    return [{"type": "input_text", "text": "\n".join(lines)[:MAX_HOSTED_WEB_SEARCH_CHARS]}], [live_url], True
+
+
 def _trusted_ats_page_has_live_job_signal(item, url, page_text):
     """Recognize a live exact-job page on trusted ATS hosts without trusting a deadline.
 
@@ -14191,18 +14478,29 @@ def receive_webhook():
             print("LOCAL HUMAN HANDOVER ACTIVATED", flush=True)
             return "EVENT_RECEIVED", 200
 
-        # The MK2,000 Single Job Application has its own service-specific ledger
-        # entitlement. However, an ACTIVE Career Assist customer's request to SEARCH
-        # for vacancies is part of Career Assist discovery and must not be mistaken
-        # for a request to submit one specific paid application.
+        # The MK2,000 Single Job Application remains a separate standalone service.
+        # An ACTIVE Career Assist term, however, already includes vacancy discovery AND
+        # application support/execution within the agreed customer scope. Never create or
+        # require a separate Single Job Application payment merely because an active Career
+        # Assist customer chooses one of the verified vacancies and asks to proceed.
         active_career_assist_discovery = False
-        if message_type == "text" and detect_career_assist_vacancy_search_request(customer_message):
+        active_career_assist_application = False
+        if message_type == "text" and (
+            detect_career_assist_vacancy_search_request(customer_message)
+            or detect_career_assist_application_request(customer_message)
+        ):
             try:
                 career_state = get_career_assist_lifecycle_state(customer_number)
-                active_career_assist_discovery = career_state.get("state") == "ACTIVE"
+                career_active = career_state.get("state") == "ACTIVE"
+                active_career_assist_discovery = (
+                    career_active and detect_career_assist_vacancy_search_request(customer_message)
+                )
+                active_career_assist_application = (
+                    career_active and detect_career_assist_application_request(customer_message)
+                )
             except Exception as lifecycle_error:
                 print(
-                    f"CAREER ASSIST DISCOVERY STATE CHECK FAILED: {type(lifecycle_error).__name__}",
+                    f"CAREER ASSIST ROUTING STATE CHECK FAILED: {type(lifecycle_error).__name__}",
                     flush=True,
                 )
 
@@ -14210,6 +14508,7 @@ def receive_webhook():
             message_type == "text"
             and detect_single_job_application_request(customer_message)
             and not active_career_assist_discovery
+            and not active_career_assist_application
         ):
             single_gate_reply = single_job_application_payment_gate(
                 customer_number=customer_number,
@@ -14224,6 +14523,11 @@ def receive_webhook():
                 print("SINGLE JOB APPLICATION BLOCKED — PAYMENT NOT VERIFIED", flush=True)
                 return "EVENT_RECEIVED", 200
             print("SINGLE JOB APPLICATION PAYMENT VERIFIED", flush=True)
+        elif active_career_assist_application:
+            print(
+                "ACTIVE CAREER ASSIST APPLICATION — SINGLE JOB PAYMENT GATE BYPASSED",
+                flush=True,
+            )
         elif active_career_assist_discovery:
             print(
                 "ACTIVE CAREER ASSIST VACANCY SEARCH — SINGLE JOB PAYMENT GATE BYPASSED",
@@ -14558,7 +14862,50 @@ def generate_ai_reply(
         payment_context = build_verified_payment_context(customer_number)
         prior_conversation = get_recent_conversation(customer_number, limit=11)
         active_career_search = False
+        active_career_application = False
         career_verified_urls = []
+
+        # An active Career Assist customer choosing a verified vacancy is still inside
+        # the monthly Career Assist entitlement; this is not the standalone MK2,000 service.
+        if detect_career_assist_application_request(customer_message):
+            try:
+                application_state = get_career_assist_lifecycle_state(customer_number)
+            except Exception as lifecycle_error:
+                application_state = {"state": "UNKNOWN"}
+                print(
+                    f"CAREER ASSIST APPLICATION STATE CHECK FAILED: {type(lifecycle_error).__name__}",
+                    flush=True,
+                )
+            if application_state.get("state") == "ACTIVE":
+                active_career_application = True
+                # Application readiness is evidence-sensitive. Always include the wider
+                # candidate-only CV evidence and resolved stored contact defaults.
+                application_cv_context = build_candidate_cv_evidence_context(customer_number)
+                contact_defaults = seed_application_contacts_from_cv_memory(customer_number)
+                contact_lines = []
+                if str(contact_defaults.get("preferred_phone") or "").strip():
+                    contact_lines.append(f"Preferred phone: {contact_defaults['preferred_phone']}")
+                if str(contact_defaults.get("preferred_email") or "").strip():
+                    contact_lines.append(f"Preferred email: {contact_defaults['preferred_email']}")
+                contact_context = []
+                if contact_lines:
+                    contact_context = [{
+                        "role": "user",
+                        "content": (
+                            "VERIFIED STORED APPLICATION CONTACTS FOR THIS SAME CUSTOMER. Reuse these contact details "
+                            "for the selected Career Assist application and do NOT ask the customer to reconfirm them unless "
+                            "the customer says they changed or the official application requires a different value.\n" +
+                            "\n".join(contact_lines)
+                        ),
+                    }]
+                if application_cv_context:
+                    memory_context = application_cv_context + memory_context
+                if contact_context:
+                    memory_context = contact_context + memory_context
+                print(
+                    f"ACTIVE CAREER ASSIST APPLICATION EVIDENCE CONTEXT ENRICHED: contacts={len(contact_lines)}",
+                    flush=True,
+                )
 
         direct_urls = extract_public_urls_from_text(customer_message)
         if direct_urls:
@@ -14583,6 +14930,23 @@ def generate_ai_reply(
         else:
             web_input_parts, web_sources, fetched_web_urls = [], [], []
             web_source_urls = []
+
+        if active_career_application:
+            application_parts, application_urls, application_resolved = fetch_career_assist_application_context(
+                customer_number, customer_message
+            )
+            web_input_parts.extend(application_parts)
+            if application_urls:
+                career_verified_urls = list(application_urls)
+                web_source_urls = list(application_urls)
+                for url in application_urls:
+                    label = _web_source_label(url)
+                    if label not in web_sources:
+                        web_sources.append(label)
+            print(
+                f"ACTIVE CAREER ASSIST APPLICATION PRECHECK: resolved={bool(application_resolved)} sources={len(application_urls)}",
+                flush=True,
+            )
 
         # Active Career Assist includes vacancy discovery. Customers should not need
         # to supply a URL before IBROWS can search the live public web for current
@@ -14877,15 +15241,16 @@ PAID CAREER-SERVICE RULES:
 - Never say a refund, payment, waiver, discount, transfer, account change, or deletion was processed
   unless the system explicitly confirms it.
 - When INTERNAL VERIFIED PAYMENT STATUS is supplied, treat it as authoritative.
-- For Single Job Application, use ONLY the ledger line labelled "Single Job Application".
-  If that line is PAID, do not ask the customer to pay or say payment still needs verification.
-  Ask only for genuinely missing vacancy/application details and continue the paid workflow.
-  A CV & Cover Letter, Career Assist, Scholarship Search or other payment must never unlock it.
-- IMPORTANT DISTINCTION: an ACTIVE Career Assist customer's request to FIND, SEARCH,
-  LIST, DISCOVER, or VERIFY current jobs/vacancies is Career Assist opportunity-search
-  work. It is NOT a Single Job Application purchase merely because the customer says
-  the jobs should be ones they "can apply for". Do not quote or request MK2,000 for
-  vacancy discovery during an active Career Assist term.
+- For the STANDALONE Single Job Application service, use ONLY the ledger line labelled "Single Job Application".
+  If that standalone line is PAID, do not ask the customer to pay or say payment still needs verification.
+  Ask only for genuinely missing vacancy/application details and continue that paid workflow.
+- IMPORTANT: an ACTIVE Career Assist term is a DIFFERENT entitlement whose approved scope includes vacancy discovery
+  AND job-application support/execution within the customer's agreed scope until expiry. When Career Assist is ACTIVE,
+  do NOT require, quote, or mention a separate MK2,000 Single Job Application payment merely because the customer chooses
+  one of the vacancies and asks IBROWS to prepare/proceed with that application. This does not reclassify the Career Assist
+  payment as a Single Job Application payment; it simply means the monthly Career Assist entitlement already covers that work.
+- An ACTIVE Career Assist customer's request to FIND, SEARCH, LIST, DISCOVER, or VERIFY current jobs/vacancies is Career
+  Assist opportunity-search work. Likewise, choosing a verified vacancy and asking to apply is Career Assist application work.
 - When INTERNAL ACTIVE CAREER ASSIST LIVE VACANCY SEARCH context is supplied, use it
   to answer the vacancy-search request. Prefer verified current vacancies and direct
   employer/application links. Never invent availability or present expired jobs as open.
@@ -14929,6 +15294,13 @@ CAREER APPLICATION INTEGRITY AND CONSENT
   when a material answer is not verified.
 - Payment does not replace customer consent. Standing application instructions may define scope,
   locations, salary limits and categories, but new sensitive/unverified declarations still require input.
+- Ask for a declaration only when the actual verified vacancy/application process requires it. Do not invent a generic
+  checklist of salary expectations, work authorisation, availability, criminal/medical declarations or similar fields merely
+  because such questions sometimes appear on applications. If the official form has not exposed such a question yet, do not
+  call it missing.
+- If the customer explicitly asks for a pre-submission check (for example, "before anything is submitted"), treat their stated
+  intent to apply as sufficient to perform preparation and requirements checking, but preserve final submission approval as
+  outstanding unless a valid standing-submission instruction already covers that vacancy.
 - The newest clear customer instruction overrides an older conflicting standing instruction for future
   actions. A customer's revocation of automatic-submission consent takes effect immediately.
 - Do not claim IBROWS submitted an application unless the system explicitly confirms submission.
@@ -15328,7 +15700,7 @@ Return ONLY the required JSON object.
         # deterministic verification. Do not follow model-suggested URLs afterward: a
         # mistyped ATS path must never become a fetched/allowed source merely because
         # the model emitted it in detected_urls.
-        if active_career_search:
+        if active_career_search or active_career_application:
             final_result["detected_urls"] = []
 
         # At most two tightly bounded follow-up fetch rounds. This allows a poster to
@@ -15414,7 +15786,7 @@ Return ONLY the required JSON object.
 
         reply = final_result["reply"]
 
-        if active_career_search:
+        if active_career_search or active_career_application:
             # Application URLs are immutable verified data. Correct/block any URL the
             # language model altered while composing the natural-language reply.
             reply = _sanitize_active_career_search_reply_urls(reply, career_verified_urls)
