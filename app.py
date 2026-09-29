@@ -12400,13 +12400,85 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 flush=True,
             )
 
-    # Broad CV-matching searches can still suffer from low recall when one generic
-    # search lands on stale aggregators. When fewer than two roles survive, run
-    # several narrow role-family searches instead of asking one model to cover
+    # Malawi-first direct ATS sweep. Search primary ATS/employer pages before relying
+    # on aggregator-heavy recall. This intentionally prioritizes local direct-employer
+    # vacancies and keeps them at the front of the candidate pool so stale/foreign
+    # discovery results cannot crowd them out before final page verification.
+    if broad_match_request:
+        try:
+            malawi_ats_prompt = (
+                f"Today is {today_label}. MALAWI DIRECT ATS SWEEP for an active Career Assist customer.\n"
+                f"Customer request: {request_text}\n"
+                + candidate_block
+                + "\n\nSearch Malawi/Lilongwe DIRECT employer and ATS vacancy pages first. Execute focused searches "
+                "equivalent to: site:jobs.ashbyhq.com (Malawi OR Lilongwe) (data OR analyst OR business intelligence "
+                "OR information OR systems OR digital); site:boards.greenhouse.io OR site:job-boards.greenhouse.io "
+                "(Malawi OR Lilongwe) (data OR analyst OR systems OR digital); site:jobs.lever.co (Malawi OR Lilongwe) "
+                "(data OR analyst OR systems OR digital); site:myworkdayjobs.com (Malawi OR Lilongwe) (analyst OR data "
+                "OR systems OR digital); site:careers.smartrecruiters.com (Malawi OR Lilongwe) (analyst OR data OR systems). "
+                "Also search official employer career pages in Malawi. Do NOT broaden to foreign-only jobs in this pass. "
+                "Return potentially relevant roles in Business Intelligence, data analysis/data operations, reporting/MIS, "
+                "business analysis/project delivery, IT/business systems support, digital solutions, IT-supported administration "
+                "or media/digital support. Do not reject a role merely because an optional/nice-to-have skill is not in the CV; "
+                "exclude it only when a CORE mandatory requirement clearly conflicts with the supplied candidate evidence. "
+                "Freshness is mandatory. If a deadline is stated and is before today, omit the role. If there is no deadline, "
+                "current_open=true only when the live direct page shows an active application state. Prefer exact job/application "
+                "pages over search-result pages and aggregators. Do not invent deadlines, requirements, locations or URLs.\n\n"
+                "Return JSON ONLY with exactly this structure:\n"
+                '{"vacancies":[{"title":"...","employer":"...","location":"...",'
+                '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
+                '"current_open":true,"open_evidence":"specific live evidence that it is open/current",'
+                '"application_url":"https://...","match_reason":"brief CV-based reason including any important gap"}],'
+                '"search_note":"brief note"}\n'
+                "Return up to 5 strong direct-source candidates. Do not include expired, closed, removed or unverifiable roles."
+            )
+            malawi_ats_response = fast_client.responses.create(
+                model=CAREER_SEARCH_RESPONSES_MODEL,
+                store=False,
+                tools=[{
+                    "type": "web_search",
+                    "search_context_size": "medium",
+                    "external_web_access": True,
+                }],
+                tool_choice="required",
+                include=["web_search_call.action.sources"],
+                max_output_tokens=1900,
+                input=malawi_ats_prompt,
+            )
+            malawi_ats_raw = str(malawi_ats_response.output_text or "").strip()
+            malawi_ats_urls = _extract_hosted_search_source_urls(malawi_ats_response)
+            malawi_ats_vacancies, stats = _validate_career_search_payload(malawi_ats_raw, today)
+            add_stats(stats)
+            for url in malawi_ats_urls:
+                if url not in source_urls:
+                    source_urls.append(url)
+            for item in malawi_ats_vacancies:
+                url = item.get("application_url")
+                if url and url not in source_urls:
+                    source_urls.insert(0, url)
+            # Direct Malawi ATS results receive pool priority; final freshness and
+            # eligibility checks still decide what may reach the customer.
+            all_vacancies = _merge_validated_vacancies(malawi_ats_vacancies, all_vacancies, limit=8)
+            print(
+                f"CAREER ASSIST MALAWI ATS SWEEP: model={CAREER_SEARCH_RESPONSES_MODEL} "
+                f"sources={len(malawi_ats_urls)} validated={len(malawi_ats_vacancies)} "
+                f"cumulative={len(all_vacancies)}",
+                flush=True,
+            )
+            search_paths.append(f"malawi-ats:{CAREER_SEARCH_RESPONSES_MODEL}")
+        except Exception as error:
+            print(
+                f"CAREER ASSIST MALAWI ATS SWEEP FAILED: {type(error).__name__}",
+                flush=True,
+            )
+
+    # Broad CV-matching searches can still suffer from low recall when direct ATS
+    # discovery and the generic pass return a thin pool. Run narrow role-family searches
+    # instead of asking one model to cover every field at once.
     # every field at once. Every discovered role still goes through the SAME
     # deterministic freshness/evidence validator, so recall improves without
     # weakening the expiry safeguards.
-    need_targeted_recall = broad_match_request and len(all_vacancies) < 2
+    need_targeted_recall = broad_match_request and len(all_vacancies) < 4
     if need_targeted_recall:
         focused_queries = [
             (
@@ -12427,7 +12499,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         ]
 
         for recall_index, (recall_label, focused_query) in enumerate(focused_queries, start=1):
-            if len(all_vacancies) >= 3:
+            if len(all_vacancies) >= 5:
                 break
             try:
                 focused_prompt = (
@@ -12499,7 +12571,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     # rejected by the direct-page freshness gate. The SAME deterministic validator and
     # direct-page verification still apply, so this improves recall without weakening
     # stale-job protection.
-    if broad_match_request:
+    if broad_match_request and len(all_vacancies) < 5:
         try:
             ats_prompt = (
                 f"Today is {today_label}. OFFICIAL ATS RECALL SEARCH for an active Career Assist customer.\n"
@@ -12576,6 +12648,16 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 f"CAREER ASSIST OFFICIAL ATS RECALL FAILED: {type(error).__name__}",
                 flush=True,
             )
+
+    if broad_match_request:
+        discovery_labels = [
+            f"{str(x.get('title') or '').strip()} @ {str(x.get('employer') or '').strip()}"
+            for x in list(all_vacancies or [])[:8]
+        ]
+        print(
+            "CAREER ASSIST DISCOVERY CANDIDATES: " + " | ".join(discovery_labels),
+            flush=True,
+        )
 
     # Final source-of-truth check: direct pages first. Any candidate whose direct
     # page cannot prove current status is NOT trusted automatically; it goes through
