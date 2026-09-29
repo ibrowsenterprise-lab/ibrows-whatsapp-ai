@@ -11863,6 +11863,192 @@ def _career_fit_rank(item):
     }.get(strength, 2)
 
 
+def _career_explicit_year_requirement_gaps(job_text, candidate_context):
+    """Find explicit minimum-years requirements that the verified CV does not support.
+
+    This is a narrow deterministic guard, not a general CV parser. It only fires when
+    the vacancy itself states a numeric years-of-experience requirement tied to a
+    recognizable specialist skill/domain, and the candidate evidence does not state
+    an equal-or-greater duration for that same skill/domain. This prevents a broad
+    adjacent skill (for example data analysis) from satisfying a specific requirement
+    (for example 3+ years of machine learning).
+    """
+    job = re.sub(r"\s+", " ", str(job_text or "")).strip().lower()
+    cv = re.sub(r"\s+", " ", str(candidate_context or "")).strip().lower()
+    if not job or not cv:
+        return []
+
+    specialist_terms = (
+        "machine learning", "computer vision", "data modeling", "data modelling",
+        "software development", "software engineering", "data science",
+        "cybersecurity", "network administration", "network engineering",
+        "project management", "monitoring and evaluation", "monitoring & evaluation",
+        "statistics", "statistical analysis", "python", "sql", "react", "next.js",
+        "node.js", ".net", "redis", "postgresql", "mssql",
+    )
+    gaps = []
+    pattern = re.compile(
+        r"(?:at least\s*)?\+?(\d{1,2})\+?\s*years?\s+of\s+(?:professional\s+)?experience\s+"
+        r"(?:in|with|as)\s+([^.;\n]{2,180})",
+        re.I,
+    )
+    for match in pattern.finditer(job):
+        required_years = int(match.group(1))
+        requirement_phrase = re.sub(r"\s+", " ", match.group(2)).strip(" ,:-")
+        matched_terms = [term for term in specialist_terms if term in requirement_phrase]
+        if not matched_terms:
+            # Use a short leading noun phrase only when it is specific enough.
+            lead = " ".join(requirement_phrase.split()[:5]).strip()
+            if len(lead) >= 8:
+                matched_terms = [lead]
+        supported = False
+        for term in matched_terms:
+            term_re = re.escape(term)
+            # Require explicit duration evidence near the same skill/domain. A generic
+            # '10+ years experience' elsewhere in the CV cannot satisfy it.
+            duration_patterns = (
+                rf"(\d{{1,2}})\+?\s*years?[^.\n]{{0,100}}{term_re}",
+                rf"{term_re}[^.\n]{{0,100}}(\d{{1,2}})\+?\s*years?",
+            )
+            for dp in duration_patterns:
+                for dm in re.finditer(dp, cv, flags=re.I):
+                    try:
+                        if int(dm.group(1)) >= required_years:
+                            supported = True
+                            break
+                    except Exception:
+                        pass
+                if supported:
+                    break
+            if supported:
+                break
+        if not supported:
+            label = matched_terms[0] if matched_terms else requirement_phrase[:80]
+            gaps.append(
+                f"Vacancy requires {required_years}+ years of experience in {label}; "
+                "the verified CV does not evidence that duration in the same specialist area."
+            )
+    # Keep the guard concise and deterministic.
+    deduped = []
+    for gap in gaps:
+        if gap not in deduped:
+            deduped.append(gap)
+    return deduped[:3]
+
+
+def _audit_verified_vacancy_fit(vacancies, candidate_context):
+    """Re-assess fit from verified vacancy requirements plus verified CV evidence.
+
+    Discovery-time match notes are useful for recall, but they may summarize only the
+    attractive overlap and omit mandatory requirements. This second-stage audit uses the
+    actual verified job text captured from the ATS/page. It never affects open/current
+    status; it only controls whether a verified-open role is a responsible CV match.
+    """
+    items = [dict(x) for x in list(vacancies or [])]
+    if not items:
+        return items, {"audited": 0, "failed": 0, "hard_guard": 0}
+
+    stats = {"audited": 0, "failed": 0, "hard_guard": 0}
+    cv_text = str(candidate_context or "").strip()[:5200]
+
+    # First apply a deterministic guard for explicit specialist years requirements.
+    for item in items:
+        requirement_text = str(item.get("_job_requirement_text") or "")
+        hard_gaps = _career_explicit_year_requirement_gaps(requirement_text, cv_text)
+        if hard_gaps:
+            item["fit_strength"] = _CAREER_FIT_INSUFFICIENT
+            item["fit_gaps"] = "; ".join(hard_gaps)[:900]
+            item["match_reason"] = (
+                str(item.get("match_reason") or "").strip() +
+                " Core experience threshold is not evidenced in the verified CV."
+            ).strip()[:700]
+            item["_fit_hard_guard"] = True
+            stats["hard_guard"] += 1
+
+    # Then audit remaining roles against actual requirements in one bounded model call.
+    auditable = []
+    for item in items:
+        if item.get("_fit_hard_guard"):
+            continue
+        requirement_text = str(item.get("_job_requirement_text") or "").strip()
+        if not requirement_text:
+            continue
+        auditable.append(item)
+        if len(auditable) >= 6:
+            break
+
+    if not auditable or not cv_text:
+        return items, stats
+
+    blocks = []
+    for idx, item in enumerate(auditable, start=1):
+        blocks.append(
+            f"ROLE {idx}\n"
+            f"Title: {item.get('title')}\n"
+            f"Employer: {item.get('employer')}\n"
+            f"URL: {item.get('application_url')}\n"
+            f"VERIFIED JOB TEXT:\n{str(item.get('_job_requirement_text') or '')[:3600]}"
+        )
+    prompt = (
+        "Audit CV fit for the verified-open vacancies below. CURRENT/OPEN STATUS IS ALREADY VERIFIED; "
+        "do not change it. Compare only the supplied VERIFIED CV EVIDENCE with mandatory/basic/core job "
+        "requirements in the VERIFIED JOB TEXT. Never infer a skill, duration, certification, domain experience, "
+        "or level that the CV does not explicitly support. Nice-to-have/preferred requirements alone should not "
+        "downgrade a role. Use exactly one fit label: Strong fit, Reasonable fit with gaps, or Not enough evidence "
+        "to recommend. Strong fit requires no material unsupported mandatory/core requirement. Reasonable fit with "
+        "gaps is for broadly aligned roles with limited non-fatal uncertainty. Not enough evidence to recommend is "
+        "required when an explicit minimum years threshold in a specialist field is unsupported, or multiple central "
+        "mandatory technical requirements are unsupported. Example: a vacancy requiring 3+ years of machine learning "
+        "cannot be Strong or merely assumed from general data-analysis/Python experience unless the CV explicitly "
+        "supports that ML duration.\n\n"
+        f"VERIFIED CV EVIDENCE:\n{cv_text}\n\n" + "\n\n".join(blocks) +
+        "\n\nReturn JSON ONLY: {\"assessments\":[{\"application_url\":\"https://...\","
+        "\"fit_strength\":\"Strong fit | Reasonable fit with gaps | Not enough evidence to recommend\","
+        "\"fit_gaps\":\"specific unsupported mandatory/core requirements or empty string\","
+        "\"match_reason\":\"brief evidence-based overlap\"}]}"
+    )
+    try:
+        audit_client = client.with_options(timeout=CAREER_SEARCH_TIMEOUT_SECONDS, max_retries=0)
+        response = audit_client.responses.create(
+            model=CAREER_SEARCH_RESPONSES_MODEL,
+            store=False,
+            max_output_tokens=1800,
+            input=prompt,
+        )
+        payload = json.loads(_clean_search_json_text(str(response.output_text or "")))
+        rows = payload.get("assessments") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("missing assessments")
+        by_url = {
+            str(item.get("application_url") or "").strip().lower(): item
+            for item in auditable
+        }
+        for row in rows[:8]:
+            if not isinstance(row, dict):
+                continue
+            try:
+                row_url = _normalize_candidate_url(row.get("application_url"))
+            except Exception:
+                row_url = str(row.get("application_url") or "").strip()
+            item = by_url.get(row_url.lower())
+            if item is None:
+                continue
+            strength, gaps = _normalize_career_fit_assessment(
+                row.get("fit_strength"), row.get("match_reason"), row.get("fit_gaps")
+            )
+            item["fit_strength"] = strength
+            item["fit_gaps"] = gaps
+            reason = str(row.get("match_reason") or "").strip()
+            if reason:
+                item["match_reason"] = reason[:700]
+            stats["audited"] += 1
+    except Exception as error:
+        stats["failed"] += 1
+        print(f"CAREER ASSIST VERIFIED REQUIREMENT FIT AUDIT FAILED: {type(error).__name__}", flush=True)
+
+    return items, stats
+
+
 def _validate_career_search_payload(raw_text, today_date):
     """Parse and deterministically reject stale/unsafe vacancy records.
 
@@ -12849,6 +13035,7 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
                 "no closing date was independently verified."
             )
             item["application_url"] = str(ashby_check.get("job_url") or candidate_url)
+            item["_job_requirement_text"] = ashby_scope_text[:14000]
             verified.append(item)
             stats["verified"] += 1
             stats["ashby_api_verified"] += 1
@@ -12902,6 +13089,7 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
 
         try:
             evidence_text, final_evidence_url = _direct_page_text_for_vacancy(verification_url)
+            item["_job_requirement_text"] = str(evidence_text or "")[:14000]
         except (ValueError, requests.RequestException, socket.error) as error:
             stats["evidence_fetch_failed"] += 1
             stats["unverified"] += 1
@@ -13071,6 +13259,7 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
                 "no closing date was independently verified."
             )
             item["application_url"] = str(ashby_check.get("job_url") or url)
+            item["_job_requirement_text"] = ashby_scope_text[:14000]
             kept.append(item)
             stats["ashby_api_verified"] += 1
             print(
@@ -13082,6 +13271,7 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
 
         try:
             page_text, final_url = _direct_page_text_for_vacancy(url)
+            item["_job_requirement_text"] = str(page_text or "")[:14000]
             stats["checked"] += 1
         except requests.HTTPError as error:
             stats["fetch_failed"] += 1
@@ -13728,6 +13918,9 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         if url and url not in source_urls:
             source_urls.append(url)
     all_vacancies = _merge_validated_vacancies(direct_kept, secondary_kept, limit=12)
+    all_vacancies, requirement_fit_stats = _audit_verified_vacancy_fit(
+        all_vacancies, candidate_context
+    )
     fit_ready = []
     final_fit_rejected = 0
     for item in all_vacancies:
@@ -13744,6 +13937,13 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     all_vacancies = fit_ready[:5]
     strong_fit_count = sum(1 for item in all_vacancies if item.get("fit_strength") == _CAREER_FIT_STRONG)
     partial_fit_count = sum(1 for item in all_vacancies if item.get("fit_strength") == _CAREER_FIT_PARTIAL)
+    print(
+        "CAREER ASSIST VERIFIED REQUIREMENT FIT AUDIT: "
+        f"audited={requirement_fit_stats.get('audited', 0)} "
+        f"hard_guard={requirement_fit_stats.get('hard_guard', 0)} "
+        f"failed={requirement_fit_stats.get('failed', 0)}",
+        flush=True,
+    )
     print(
         f"CAREER ASSIST FIT CLASSIFICATION: strong={strong_fit_count} "
         f"reasonable_with_gaps={partial_fit_count} "
