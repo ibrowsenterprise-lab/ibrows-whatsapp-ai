@@ -12034,6 +12034,8 @@ _CAREER_THIRD_PARTY_JOB_HOST_SUFFIXES = (
     "careeradmw.com",
     "greatmalawijobs.com",
     "mvungi.com",
+    "ajirika.com",
+    "careersmw.com",
     "linkedin.com",
     "bebee.com",
     "developerjobs.io",
