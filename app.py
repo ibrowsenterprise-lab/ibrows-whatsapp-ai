@@ -11998,6 +11998,118 @@ def _career_same_host(url_a, url_b):
     return bool(a and b and a == b)
 
 
+def _ashby_public_posting_verification(item, url):
+    """Verify an Ashby vacancy against Ashby's public currently-published postings feed.
+
+    Ashby's hosted job pages are JavaScript-heavy and their rendered Apply control is not
+    always present in plain HTTP text. Ashby exposes a public job-board posting API whose
+    response contains the organization's currently published postings. Matching the exact
+    UUID from the customer-facing Ashby URL against that feed is stronger evidence than
+    guessing from page text or a search-model current_open flag.
+
+    Returns a dict with api_ok=True when the public feed was successfully read. When the
+    exact posting is absent, live=False is definitive for this check. Network/API failures
+    return api_ok=False so callers can fall back to the normal page/secondary verifier.
+    """
+    try:
+        parsed = urlsplit(str(url or ""))
+    except Exception:
+        return {"api_ok": False, "live": False, "reason": "invalid_url"}
+    host = (parsed.hostname or "").lower().strip(".")
+    if not _career_host_matches(host, ("jobs.ashbyhq.com",)):
+        return {"api_ok": False, "live": False, "reason": "not_ashby"}
+
+    parts = [part for part in (parsed.path or "").split("/") if part]
+    if len(parts) < 2:
+        return {"api_ok": False, "live": False, "reason": "not_exact_job"}
+    board_name = parts[0]
+    posting_id = next((
+        part for part in parts[1:]
+        if re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            part,
+        )
+    ), "")
+    if not posting_id:
+        return {"api_ok": False, "live": False, "reason": "missing_posting_id"}
+
+    board_safe = requests.utils.quote(board_name, safe="")
+    api_url = f"https://api.ashbyhq.com/posting-api/job-board/{board_safe}"
+    try:
+        response = requests.get(
+            api_url,
+            headers={"User-Agent": "IBROWS-CareerAssist/1.0", "Accept": "application/json"},
+            timeout=min(15, max(5, int(CAREER_SEARCH_TIMEOUT_SECONDS))),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError, TypeError):
+        return {"api_ok": False, "live": False, "reason": "api_fetch_failed", "board": board_name}
+
+    jobs = payload.get("jobs") if isinstance(payload, dict) else None
+    if not isinstance(jobs, list):
+        return {"api_ok": False, "live": False, "reason": "invalid_api_payload", "board": board_name}
+
+    expected_title = re.sub(r"[^a-z0-9]+", " ", str(item.get("title") or "").lower()).strip()
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        job_url = str(job.get("jobUrl") or "").strip()
+        apply_url = str(job.get("applyUrl") or "").strip()
+        if posting_id.lower() not in (job_url + " " + apply_url).lower():
+            continue
+
+        api_title = re.sub(r"[^a-z0-9]+", " ", str(job.get("title") or "").lower()).strip()
+        if expected_title and api_title and expected_title != api_title:
+            # Exact UUID should normally make this impossible. Fail closed on identity
+            # mismatch instead of accepting a different posting accidentally.
+            return {
+                "api_ok": True, "live": False, "reason": "title_mismatch",
+                "board": board_name, "posting_id": posting_id,
+            }
+
+        secondary_locations = []
+        for loc in job.get("secondaryLocations") or []:
+            if isinstance(loc, dict):
+                secondary_locations.append(str(loc.get("location") or ""))
+                address = loc.get("address") if isinstance(loc.get("address"), dict) else {}
+                secondary_locations.extend([
+                    str(address.get("addressLocality") or ""),
+                    str(address.get("addressRegion") or ""),
+                    str(address.get("addressCountry") or ""),
+                ])
+        address = job.get("address") if isinstance(job.get("address"), dict) else {}
+        postal = address.get("postalAddress") if isinstance(address.get("postalAddress"), dict) else {}
+        scope_text = "\n".join(filter(None, [
+            str(job.get("title") or ""),
+            str(job.get("location") or ""),
+            *secondary_locations,
+            str(postal.get("addressLocality") or ""),
+            str(postal.get("addressRegion") or ""),
+            str(postal.get("addressCountry") or ""),
+            str(job.get("workplaceType") or ""),
+            str(job.get("descriptionPlain") or ""),
+        ]))
+        return {
+            "api_ok": True,
+            "live": True,
+            "reason": "published_in_ashby_public_feed",
+            "board": board_name,
+            "posting_id": posting_id,
+            "job_url": job_url or str(url),
+            "apply_url": apply_url,
+            "location": str(job.get("location") or ""),
+            "scope_text": scope_text,
+            "published_at": str(job.get("publishedAt") or ""),
+            "is_listed": job.get("isListed"),
+        }
+
+    return {
+        "api_ok": True, "live": False, "reason": "not_in_current_published_feed",
+        "board": board_name, "posting_id": posting_id,
+    }
+
+
 def _trusted_ats_exact_job_url(url):
     """Return True only for a job-specific URL on a trusted ATS host.
 
@@ -12083,6 +12195,7 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
         "eligibility_rejected": 0,
         "deadline_conflict": 0,
         "evidence_fetch_failed": 0,
+        "ashby_api_verified": 0,
     }
     if not candidates:
         return [], [], stats
@@ -12193,9 +12306,63 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
             continue
         used.add(identity)
 
-        if row.get("status_conflict") is True or row.get("current_open") is not True:
+        status_conflict = row.get("status_conflict") is True
+        row_current_open = row.get("current_open") is True
+        candidate_url = str(item.get("application_url") or "").strip()
+
+        # For Ashby, use the provider's public currently-published postings feed as the
+        # source of truth. This avoids falsely closing a live JavaScript-heavy vacancy
+        # merely because a search model could not see a rendered Apply control.
+        ashby_check = _ashby_public_posting_verification(item, candidate_url)
+        if ashby_check.get("api_ok"):
+            if not ashby_check.get("live"):
+                stats["closed"] += 1
+                print(
+                    f"CAREER ASSIST ASHBY PUBLIC API REJECTED NOT PUBLISHED: "
+                    f"title={item.get('title')} board={ashby_check.get('board')} reason={ashby_check.get('reason')}",
+                    flush=True,
+                )
+                continue
+            ashby_scope_text = str(ashby_check.get("scope_text") or "")
+            ashby_scope_item = dict(item)
+            ashby_scope_item["location"] = str(ashby_check.get("location") or item.get("location") or "")
+            if require_malawi_scope and not _career_scope_is_eligible(ashby_scope_item, ashby_scope_text):
+                stats["eligibility_rejected"] += 1
+                print(
+                    f"CAREER ASSIST ASHBY PUBLIC API REJECTED LOCATION/ELIGIBILITY: "
+                    f"title={item.get('title')} location={item.get('location')}",
+                    flush=True,
+                )
+                continue
+            item["deadline_iso"] = ""
+            item["deadline_display"] = "No closing date stated; currently published on official Ashby job board"
+            item["open_evidence"] = (
+                "Ashby's public job-posting feed currently lists this exact posting; "
+                "no closing date was independently verified."
+            )
+            item["application_url"] = str(ashby_check.get("job_url") or candidate_url)
+            verified.append(item)
+            stats["verified"] += 1
+            stats["ashby_api_verified"] += 1
+            print(
+                f"CAREER ASSIST ASHBY PUBLIC API VERIFIED: title={item.get('title')} "
+                f"board={ashby_check.get('board')} posting={ashby_check.get('posting_id')}",
+                flush=True,
+            )
+            continue
+
+        if status_conflict:
             stats["closed"] += 1
             continue
+        if not row_current_open and not _trusted_ats_exact_job_url(candidate_url):
+            stats["closed"] += 1
+            continue
+        if not row_current_open and _trusted_ats_exact_job_url(candidate_url):
+            print(
+                f"CAREER ASSIST SECONDARY TRUSTED ATS SEARCH STATUS AMBIGUOUS — PAGE CHECKING: "
+                f"title={item.get('title')} host={_career_url_host(candidate_url)}",
+                flush=True,
+            )
 
         evidence_url = str(row.get("evidence_url") or "").strip()
         if evidence_url:
@@ -12327,7 +12494,8 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
         f"requested={stats['requested']} verified={stats['verified']} expired={stats['expired']} "
         f"closed={stats['closed']} unverified={stats['unverified']} "
         f"eligibility_rejected={stats['eligibility_rejected']} deadline_conflict={stats['deadline_conflict']} "
-        f"evidence_fetch_failed={stats['evidence_fetch_failed']} malformed={stats['malformed']} failed={stats['failed']}",
+        f"ashby_api_verified={stats['ashby_api_verified']} evidence_fetch_failed={stats['evidence_fetch_failed']} "
+        f"malformed={stats['malformed']} failed={stats['failed']}",
         flush=True,
     )
     return verified, urls, stats
@@ -12345,6 +12513,7 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
         "deadline_conflict": 0,
         "needs_secondary": 0,
         "eligibility_rejected": 0,
+        "ashby_api_verified": 0,
     }
     closed_markers = (
         "no longer accepting applications",
@@ -12363,6 +12532,46 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
         url = str(item.get("application_url") or "").strip()
         if not url:
             continue
+
+        # Prefer Ashby's own public currently-published postings feed over rendered-page
+        # heuristics. The feed is specifically designed to list current public postings.
+        ashby_check = _ashby_public_posting_verification(item, url)
+        if ashby_check.get("api_ok"):
+            if not ashby_check.get("live"):
+                stats["closed"] += 1
+                print(
+                    f"CAREER ASSIST ASHBY PUBLIC API REJECTED NOT PUBLISHED: "
+                    f"title={item.get('title')} board={ashby_check.get('board')} reason={ashby_check.get('reason')}",
+                    flush=True,
+                )
+                continue
+            ashby_scope_text = str(ashby_check.get("scope_text") or "")
+            ashby_scope_item = dict(item)
+            ashby_scope_item["location"] = str(ashby_check.get("location") or item.get("location") or "")
+            if require_malawi_scope and not _career_scope_is_eligible(ashby_scope_item, ashby_scope_text):
+                stats["eligibility_rejected"] += 1
+                print(
+                    f"CAREER ASSIST ASHBY PUBLIC API REJECTED LOCATION/ELIGIBILITY: "
+                    f"title={item.get('title')} location={item.get('location')}",
+                    flush=True,
+                )
+                continue
+            item["deadline_iso"] = ""
+            item["deadline_display"] = "No closing date stated; currently published on official Ashby job board"
+            item["open_evidence"] = (
+                "Ashby's public job-posting feed currently lists this exact posting; "
+                "no closing date was independently verified."
+            )
+            item["application_url"] = str(ashby_check.get("job_url") or url)
+            kept.append(item)
+            stats["ashby_api_verified"] += 1
+            print(
+                f"CAREER ASSIST ASHBY PUBLIC API VERIFIED: title={item.get('title')} "
+                f"board={ashby_check.get('board')} posting={ashby_check.get('posting_id')}",
+                flush=True,
+            )
+            continue
+
         try:
             page_text, final_url = _direct_page_text_for_vacancy(url)
             stats["checked"] += 1
@@ -12997,6 +13206,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         f"expired={direct_page_stats['expired']} closed={direct_page_stats['closed']} "
         f"deadline_conflict={direct_page_stats['deadline_conflict']} "
         f"eligibility_rejected={direct_page_stats['eligibility_rejected']} "
+        f"ashby_api_verified={direct_page_stats['ashby_api_verified']} "
         f"fetch_failed={direct_page_stats['fetch_failed']}",
         flush=True,
     )
