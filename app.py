@@ -714,6 +714,30 @@ def init_database():
                 ON application_evidence_corrections(customer_number, updated_at DESC)
             """)
 
+            # Discovery cache for Career Assist. These rows are NEVER treated as
+            # current-status evidence. They only preserve direct ATS URLs that have
+            # previously survived the live verifier for this same customer, so a
+            # later web-search miss can re-check the exact vacancy deterministically.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS career_verified_vacancies (
+                    id BIGSERIAL PRIMARY KEY,
+                    customer_number TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    employer TEXT NOT NULL,
+                    location TEXT,
+                    application_url TEXT NOT NULL,
+                    match_reason TEXT,
+                    source_host TEXT,
+                    first_verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(customer_number, application_url)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_career_verified_vacancies_customer
+                ON career_verified_vacancies(customer_number, last_verified_at DESC)
+            """)
+
         conn.commit()
 
     print("DATABASE READY", flush=True)
@@ -756,6 +780,11 @@ def cleanup_expired_data(force=False):
                     DELETE FROM ai_takeover_state a
                     WHERE NOT EXISTS (SELECT 1 FROM leads l WHERE l.customer_number=a.customer_number)
                       AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.customer_number=a.customer_number)
+                """)
+                # Cached vacancy URLs are discovery hints only; keep the cache short-lived.
+                cur.execute("""
+                    DELETE FROM career_verified_vacancies
+                    WHERE last_verified_at < NOW() - INTERVAL '45 days'
                 """)
                 cur.execute("""
                     DELETE FROM application_pack_state
@@ -11818,7 +11847,7 @@ def _validate_career_search_payload(raw_text, today_date):
     return accepted, stats
 
 
-def _merge_validated_vacancies(primary, secondary, limit=8):
+def _merge_validated_vacancies(primary, secondary, limit=12):
     merged = []
     seen = set()
     for item in list(primary or []) + list(secondary or []):
@@ -12035,6 +12064,246 @@ def _career_same_host(url_a, url_b):
     return bool(a and b and a == b)
 
 
+def _career_seed_matches_request(item, request_text):
+    """Keep revalidation seeds relevant to the customer's present role families.
+
+    The seed is only a discovery hint; it must still pass the full live verifier later.
+    This filter prevents an old verified data role from surfacing when a customer later
+    asks narrowly for media-only, administration-only, etc.
+    """
+    request_lower = str(request_text or "").lower()
+    item_text = " ".join([
+        str(item.get("title") or ""),
+        str(item.get("match_reason") or ""),
+    ]).lower()
+
+    groups = {
+        "data": (
+            ("business intelligence", "data analysis", "data analyst", "analytics", "reporting", "mis"),
+            ("business intelligence", "data", "analyst", "analytics", "reporting", "mis"),
+        ),
+        "systems": (
+            ("business systems", "it systems", "systems support", "digital solutions", "information technology", "ict"),
+            ("system", "systems", "information technology", "ict", "digital solution", "technology support"),
+        ),
+        "admin": (
+            ("administration", "administrative", "project administration", "project support"),
+            ("admin", "administration", "administrative", "project support", "project coordinator"),
+        ),
+        "media": (
+            ("media", "social media", "digital marketing", "content"),
+            ("media", "social media", "marketing", "content", "communications"),
+        ),
+    }
+    requested = []
+    for name, (request_markers, _item_markers) in groups.items():
+        if any(marker in request_lower for marker in request_markers):
+            requested.append(name)
+    if not requested:
+        return True
+    return any(
+        any(marker in item_text for marker in groups[name][1])
+        for name in requested
+    )
+
+
+def _parse_trusted_ats_seed_from_reply(content, url):
+    """Recover a structured ATS discovery hint from a prior customer-facing reply.
+
+    Prior replies are not trusted for CURRENT status. This extracts only the exact URL
+    and nearby title/employer/location so the live verifier can re-check it from scratch.
+    """
+    text = str(content or "")
+    lines = text.splitlines()
+    line_index = next((i for i, line in enumerate(lines) if str(url) in line), -1)
+    if line_index < 0:
+        return None
+
+    title = employer = location = match_reason = ""
+    start = max(0, line_index - 14)
+    for i in range(line_index - 1, start - 1, -1):
+        line = lines[i].strip()
+        if not line:
+            continue
+        if not employer:
+            m = re.match(r"(?i)^employer\s*:\s*(.+)$", line)
+            if m:
+                employer = m.group(1).strip()
+                continue
+        if not location:
+            m = re.match(r"(?i)^location\s*:\s*(.+)$", line)
+            if m:
+                location = m.group(1).strip()
+                continue
+        if not match_reason:
+            m = re.match(r"(?i)^(?:why it fits|cv match(?: note)?)\s*:\s*(.+)$", line)
+            if m:
+                match_reason = m.group(1).strip()
+                continue
+        if not title:
+            m = re.match(r"(?i)^title\s*:\s*(.+)$", line)
+            if m:
+                title = m.group(1).strip()
+                continue
+            m = re.match(r"^\d+[.)]\s*(.+)$", line)
+            if m:
+                title = m.group(1).strip()
+                continue
+
+    if not title or not employer:
+        return None
+    return {
+        "title": title[:180],
+        "employer": employer[:180],
+        "location": location[:180],
+        "deadline_iso": "",
+        "deadline_display": "",
+        "current_open": True,
+        "open_evidence": "Previously verified direct ATS URL queued for fresh live revalidation; cached reply is not status evidence.",
+        "application_url": str(url),
+        "match_reason": match_reason[:700],
+        "_revalidation_seed": True,
+    }
+
+
+def _load_recent_verified_vacancy_seeds(customer_number, request_text, limit=4):
+    """Load customer-specific direct ATS URLs for mandatory fresh revalidation.
+
+    Sources are (1) the short-lived verified-vacancy cache and (2) recent assistant
+    replies as a bootstrap path for deployments created before the cache table existed.
+    Nothing returned here is considered open until _final_live_page_vacancy_gate passes.
+    """
+    customer_number = str(customer_number or "").strip()
+    if not customer_number:
+        return []
+
+    seeds = []
+    seen_urls = set()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT title, employer, location, application_url, match_reason
+                    FROM career_verified_vacancies
+                    WHERE customer_number=%s
+                      AND last_verified_at >= NOW() - INTERVAL '30 days'
+                    ORDER BY last_verified_at DESC
+                    LIMIT 12
+                    """,
+                    (customer_number,),
+                )
+                rows = cur.fetchall()
+        for title, employer, location, application_url, match_reason in rows:
+            url = str(application_url or "").strip()
+            if not url or not _career_is_trusted_ats_source(url) or not _trusted_ats_exact_job_url(url):
+                continue
+            item = {
+                "title": str(title or "")[:180],
+                "employer": str(employer or "")[:180],
+                "location": str(location or "")[:180],
+                "deadline_iso": "",
+                "deadline_display": "",
+                "current_open": True,
+                "open_evidence": "Previously verified direct ATS URL queued for fresh live revalidation; cache is not status evidence.",
+                "application_url": url,
+                "match_reason": str(match_reason or "")[:700],
+                "_revalidation_seed": True,
+            }
+            if _career_seed_matches_request(item, request_text):
+                seeds.append(item)
+                seen_urls.add(url.lower())
+                if len(seeds) >= limit:
+                    return seeds
+    except Exception as error:
+        print(f"CAREER ASSIST VERIFIED ATS CACHE LOAD FAILED: {type(error).__name__}", flush=True)
+
+    # Bootstrap from recent replies so the first deployment of this cache can recover
+    # URLs that were already successfully delivered before the table existed.
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT content
+                    FROM conversations
+                    WHERE customer_number=%s
+                      AND role='assistant'
+                      AND created_at >= NOW() - INTERVAL '30 days'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 40
+                    """,
+                    (customer_number,),
+                )
+                reply_rows = cur.fetchall()
+        url_pattern = re.compile(r"https?://[^\s<>\"']+")
+        for (content,) in reply_rows:
+            for raw_url in url_pattern.findall(str(content or "")):
+                url = raw_url.rstrip(".,;:!?)\\]}")
+                key = url.lower()
+                if key in seen_urls or not _career_is_trusted_ats_source(url) or not _trusted_ats_exact_job_url(url):
+                    continue
+                item = _parse_trusted_ats_seed_from_reply(content, url)
+                if not item or not _career_seed_matches_request(item, request_text):
+                    continue
+                seeds.append(item)
+                seen_urls.add(key)
+                if len(seeds) >= limit:
+                    return seeds
+    except Exception as error:
+        print(f"CAREER ASSIST VERIFIED ATS REPLY BOOTSTRAP FAILED: {type(error).__name__}", flush=True)
+
+    return seeds
+
+
+def _store_verified_vacancy_seeds(customer_number, vacancies):
+    """Persist only freshly verified direct ATS vacancies for future revalidation."""
+    customer_number = str(customer_number or "").strip()
+    if not customer_number:
+        return 0
+    rows = []
+    for item in list(vacancies or []):
+        url = str(item.get("application_url") or "").strip()
+        if not url or not _career_is_trusted_ats_source(url) or not _trusted_ats_exact_job_url(url):
+            continue
+        rows.append((
+            customer_number,
+            str(item.get("title") or "")[:180],
+            str(item.get("employer") or "")[:180],
+            str(item.get("location") or "")[:180],
+            url,
+            str(item.get("match_reason") or "")[:700],
+            _career_url_host(url),
+        ))
+    if not rows:
+        return 0
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                for row in rows:
+                    cur.execute(
+                        """
+                        INSERT INTO career_verified_vacancies
+                            (customer_number, title, employer, location, application_url, match_reason, source_host)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (customer_number, application_url)
+                        DO UPDATE SET
+                            title=EXCLUDED.title,
+                            employer=EXCLUDED.employer,
+                            location=EXCLUDED.location,
+                            match_reason=EXCLUDED.match_reason,
+                            source_host=EXCLUDED.source_host,
+                            last_verified_at=NOW()
+                        """,
+                        row,
+                    )
+            conn.commit()
+        return len(rows)
+    except Exception as error:
+        print(f"CAREER ASSIST VERIFIED ATS CACHE STORE FAILED: {type(error).__name__}", flush=True)
+        return 0
+
+
 def _ashby_public_posting_verification(item, url):
     """Verify an Ashby vacancy against Ashby's public currently-published postings feed.
 
@@ -12135,6 +12404,7 @@ def _ashby_public_posting_verification(item, url):
             "posting_id": posting_id,
             "job_url": job_url or str(url),
             "apply_url": apply_url,
+            "title": str(job.get("title") or ""),
             "location": str(job.get("location") or ""),
             "scope_text": scope_text,
             "published_at": str(job.get("publishedAt") or ""),
@@ -12220,7 +12490,7 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
     evidence URL is the final authority. Search-model dates are never sent to customers
     unless the fetched evidence page itself exposes the same/current deadline.
     """
-    candidates = [dict(x) for x in list(candidates or [])[:8]]
+    candidates = [dict(x) for x in list(candidates or [])[:12]]
     stats = {
         "requested": len(candidates),
         "verified": 0,
@@ -12564,7 +12834,7 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
     )
     # Keep a wider discovery pool than the requested five because stale/foreign roles
     # may be rejected here. Final customer output is capped to five after verification.
-    for original in list(vacancies or [])[:8]:
+    for original in list(vacancies or [])[:12]:
         item = dict(original)
         url = str(item.get("application_url") or "").strip()
         if not url:
@@ -12729,7 +12999,7 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
 
     return kept, needs_secondary, stats
 
-def fetch_career_assist_vacancy_search_context(customer_request, candidate_context=""):
+def fetch_career_assist_vacancy_search_context(customer_request, candidate_context="", customer_number=""):
     """Search live vacancy sources and pass only server-validated current roles downstream."""
     today = datetime.now(ADMIN_TIMEZONE).date()
     today_label = today.strftime("%d %B %Y")
@@ -12787,9 +13057,22 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     }
     fast_client = client.with_options(timeout=CAREER_SEARCH_TIMEOUT_SECONDS, max_retries=0)
 
-    all_vacancies = []
+    revalidation_seeds = []
+    if broad_match_request and customer_number:
+        revalidation_seeds = _load_recent_verified_vacancy_seeds(
+            customer_number, request_text, limit=4
+        )
+        if revalidation_seeds:
+            print(
+                f"CAREER ASSIST VERIFIED ATS REVALIDATION SEEDS: loaded={len(revalidation_seeds)}",
+                flush=True,
+            )
+
+    all_vacancies = list(revalidation_seeds)
     source_urls = []
     search_paths = []
+    if revalidation_seeds:
+        search_paths.append("verified-ats-revalidation")
     aggregate_stats = {
         "seen": 0, "accepted": 0, "expired": 0, "invalid_deadline": 0,
         "not_open": 0, "missing_evidence": 0, "malformed": 0,
@@ -12939,7 +13222,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                     source_urls.insert(0, url)
             # Direct Malawi ATS results receive pool priority; final freshness and
             # eligibility checks still decide what may reach the customer.
-            all_vacancies = _merge_validated_vacancies(malawi_ats_vacancies, all_vacancies, limit=8)
+            all_vacancies = _merge_validated_vacancies(malawi_ats_vacancies, all_vacancies, limit=12)
             print(
                 f"CAREER ASSIST MALAWI ATS SWEEP: model={CAREER_SEARCH_RESPONSES_MODEL} "
                 f"sources={len(malawi_ats_urls)} validated={len(malawi_ats_vacancies)} "
@@ -13196,7 +13479,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 url = item.get("application_url")
                 if url and url not in source_urls:
                     source_urls.insert(0, url)
-            all_vacancies = _merge_validated_vacancies(priority_vacancies, all_vacancies, limit=8)
+            all_vacancies = _merge_validated_vacancies(priority_vacancies, all_vacancies, limit=12)
             print(
                 f"CAREER ASSIST PRIORITY ATS RESCUE: model={CAREER_SEARCH_RESPONSES_MODEL} "
                 f"sources={len(priority_urls)} validated={len(priority_vacancies)} "
@@ -13214,7 +13497,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     if broad_match_request:
         discovery_labels = [
             f"{str(x.get('title') or '').strip()} @ {str(x.get('employer') or '').strip()}"
-            for x in list(all_vacancies or [])[:8]
+            for x in list(all_vacancies or [])[:12]
         ]
         print(
             "CAREER ASSIST DISCOVERY CANDIDATES: " + " | ".join(discovery_labels),
@@ -13256,6 +13539,14 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         f"malformed={aggregate_stats['malformed']}",
         flush=True,
     )
+
+    if all_vacancies and customer_number:
+        cached_count = _store_verified_vacancy_seeds(customer_number, all_vacancies)
+        if cached_count:
+            print(
+                f"CAREER ASSIST VERIFIED ATS CACHE UPDATED: stored={cached_count}",
+                flush=True,
+            )
 
     if not all_vacancies:
         # Search did execute, but no role survived the deterministic freshness/evidence gate.
@@ -13873,6 +14164,7 @@ def generate_ai_reply(
                 live_parts, live_urls = fetch_career_assist_vacancy_search_context(
                     customer_message,
                     candidate_search_context,
+                    customer_number=customer_number,
                 )
                 web_input_parts.extend(live_parts)
                 for url in live_urls:
