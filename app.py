@@ -13823,6 +13823,102 @@ def _career_application_candidate_score(item, customer_request):
     return score
 
 
+def _career_application_request_identity_hints(customer_request):
+    """Extract explicit vacancy identity labels from the customer's own message.
+
+    These are identity hints only. They never establish current-open status; the exact
+    vacancy URL is still revalidated against the official ATS/source before preparation.
+    """
+    text = str(customer_request or "")
+    title = ""
+    employer = ""
+
+    # Prefer clearly labelled fields because they are unambiguous and easy to audit.
+    patterns = (
+        ("title", r"(?im)^\s*(?:job\s+title|vacancy\s+title|role\s+title|title)\s*:\s*(.+?)\s*$"),
+        ("employer", r"(?im)^\s*(?:employer|organisation|organization|company)\s*:\s*(.+?)\s*$"),
+    )
+    for field, pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        value = re.sub(r"https?://\S+", "", match.group(1)).strip(" -–—|\t")
+        value = " ".join(value.split())
+        if not value:
+            continue
+        if field == "title":
+            title = value[:180]
+        else:
+            employer = value[:180]
+
+    return {"title": title, "employer": employer}
+
+
+def _career_persisted_application_candidates(customer_number):
+    """Load exact vacancy identities already bound to this customer's application workflow.
+
+    These rows are identity/persistence hints only. Every selected URL is freshly revalidated
+    before it can be treated as an open vacancy.
+    """
+    items = []
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT vacancy_title, employer, application_url
+                    FROM career_assist_applications
+                    WHERE customer_number=%s
+                      AND status IN ('PREPARING','NEEDS_INFO','DRAFT_READY')
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 10
+                    """,
+                    (customer_number,),
+                )
+                rows = cur.fetchall()
+        for title, employer, application_url in rows:
+            url = str(application_url or "").strip()
+            if not url or not _career_is_trusted_ats_source(url) or not _trusted_ats_exact_job_url(url):
+                continue
+            items.append({
+                "title": str(title or "")[:180],
+                "employer": str(employer or "")[:180],
+                "location": "",
+                "application_url": url,
+                "match_reason": "",
+                "fit_strength": "",
+                "fit_gaps": "",
+            })
+    except Exception as error:
+        print(f"CAREER ASSIST PERSISTED APPLICATION LOAD FAILED: {type(error).__name__}", flush=True)
+
+    try:
+        defaults = get_application_pack_defaults(customer_number)
+        target_url = str(defaults.get("target_url") or "").strip()
+        if target_url and _career_is_trusted_ats_source(target_url) and _trusted_ats_exact_job_url(target_url):
+            items.insert(0, {
+                "title": str(defaults.get("target_role") or "")[:180],
+                "employer": str(defaults.get("target_organisation") or "")[:180],
+                "location": "",
+                "application_url": target_url,
+                "match_reason": "",
+                "fit_strength": "",
+                "fit_gaps": "",
+            })
+    except Exception as error:
+        print(f"CAREER ASSIST PACK TARGET LOAD FAILED: {type(error).__name__}", flush=True)
+
+    deduped = []
+    seen = set()
+    for item in items:
+        key = str(item.get("application_url") or "").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
 def fetch_career_assist_application_context(customer_number, customer_request):
     """Resolve and freshly revalidate a selected vacancy for an active Career Assist application.
 
@@ -13867,16 +13963,14 @@ def fetch_career_assist_application_context(customer_number, customer_request):
     except Exception as error:
         print(f"CAREER ASSIST APPLICATION CACHE LOAD FAILED: {type(error).__name__}", flush=True)
 
-    if not candidates:
-        return [{
-            "type": "input_text",
-            "text": (
-                "INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: SELECTED_VACANCY_NOT_RESOLVED. "
-                "Career Assist is active and application support is covered without a separate MK2,000 fee, but the exact "
-                "previously verified vacancy could not be resolved from the short-lived verified-vacancy cache. Ask only for "
-                "the exact vacancy/application URL or exact title+employer; do not ask for payment and do not claim submission."
-            ),
-        }], [], False
+    # Add application-state persistence as an identity source. This is deliberately
+    # separate from current-status evidence: every selected URL is revalidated below.
+    for item in _career_persisted_application_candidates(customer_number):
+        key = str(item.get("application_url") or "").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        candidates.append(item)
 
     selected = None
     direct_urls = []
@@ -13884,14 +13978,39 @@ def fetch_career_assist_application_context(customer_number, customer_request):
         direct_urls = extract_public_urls_from_text(request_text)
     except Exception:
         direct_urls = []
+
+    identity_hints = _career_application_request_identity_hints(request_text)
+
+    # An exact customer-supplied ATS vacancy URL must not depend on the discovery cache.
+    # The URL identifies the posting; official revalidation below decides whether it is
+    # still current. This fixes the previous loop where the assistant asked for a URL
+    # even when the customer had just supplied that exact URL.
     for raw_url in direct_urls:
         try:
             normalized = _normalize_candidate_url(raw_url)
         except Exception:
             continue
+        if not _career_is_trusted_ats_source(normalized) or not _trusted_ats_exact_job_url(normalized):
+            continue
         selected = next((x for x in candidates if x["application_url"].lower() == normalized.lower()), None)
-        if selected:
-            break
+        if selected is None:
+            selected = {
+                "title": identity_hints.get("title", ""),
+                "employer": identity_hints.get("employer", ""),
+                "location": "",
+                "application_url": normalized,
+                "match_reason": "",
+                "fit_strength": "",
+                "fit_gaps": "",
+            }
+        else:
+            # The customer's explicit labels may repair an incomplete persisted identity,
+            # but they never override a non-empty verified value silently.
+            if not str(selected.get("title") or "").strip() and identity_hints.get("title"):
+                selected["title"] = identity_hints["title"]
+            if not str(selected.get("employer") or "").strip() and identity_hints.get("employer"):
+                selected["employer"] = identity_hints["employer"]
+        break
 
     if selected is None:
         ordinal = _career_application_requested_ordinal(request_text)
@@ -13899,9 +14018,9 @@ def fetch_career_assist_application_context(customer_number, customer_request):
         if ordinal_url:
             selected = next((x for x in candidates if x["application_url"].lower() == ordinal_url.lower()), None)
 
-    if selected is None:
+    if selected is None and candidates:
         ranked = sorted(
-            (( _career_application_candidate_score(item, request_text), item) for item in candidates),
+            ((_career_application_candidate_score(item, request_text), item) for item in candidates),
             key=lambda pair: pair[0], reverse=True,
         )
         if ranked and ranked[0][0] >= 4:
@@ -13910,13 +14029,18 @@ def fetch_career_assist_application_context(customer_number, customer_request):
                 selected = ranked[0][1]
 
     if selected is None:
+        status = "SELECTED_VACANCY_NOT_RESOLVED" if not candidates else "SELECTED_VACANCY_AMBIGUOUS"
+        detail = (
+            "No exact vacancy identity is stored and no exact trusted ATS vacancy URL was supplied in this message."
+            if not candidates else
+            "Several stored/recent vacancies could match the customer's wording and none was uniquely selected."
+        )
         return [{
             "type": "input_text",
             "text": (
-                "INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: SELECTED_VACANCY_AMBIGUOUS. "
-                "Career Assist is active and this application does not require the standalone MK2,000 payment. "
-                "Several recent verified vacancies could match the customer's wording. Ask only which exact vacancy they mean "
-                "(title/employer or application URL). Do not request the full advert when the verified vacancy can be resolved by identity."
+                f"INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: {status}. "
+                "Career Assist is active and application support is covered without a separate MK2,000 or MK5,000 fee. "
+                + detail + " Ask only for the exact vacancy/application URL or exact title+employer; do not ask for payment and do not claim submission."
             ),
         }], [], False
 
@@ -13944,6 +14068,18 @@ def fetch_career_assist_application_context(customer_number, customer_request):
         requirement_text = str(ashby.get("scope_text") or "")[:14000]
         live_url = str(ashby.get("job_url") or url)
         apply_url = str(ashby.get("apply_url") or "")
+        # Fill any incomplete identity from the freshly verified official posting.
+        if not str(selected.get("title") or "").strip():
+            selected["title"] = str(ashby.get("title") or "")[:180]
+        if not str(selected.get("location") or "").strip():
+            selected["location"] = str(ashby.get("location") or "")[:180]
+        if not str(selected.get("employer") or "").strip():
+            selected["employer"] = str(identity_hints.get("employer") or "").strip()[:180]
+        if not str(selected.get("employer") or "").strip():
+            # Last-resort identity label from the official Ashby board slug. This does
+            # not claim a legal company name; it only binds the application record to
+            # the ATS board when the customer supplied no employer label.
+            selected["employer"] = str(ashby.get("board") or "Ashby employer")[:180]
         current_evidence = "Exact posting is currently published in Ashby's public job-board feed."
     else:
         try:
@@ -13962,6 +14098,10 @@ def fetch_career_assist_application_context(customer_number, customer_request):
                 }], [], False
             requirement_text = str(page_text or "")[:14000]
             live_url = str(final_url or url)
+            if not str(selected.get("title") or "").strip() and identity_hints.get("title"):
+                selected["title"] = identity_hints["title"]
+            if not str(selected.get("employer") or "").strip() and identity_hints.get("employer"):
+                selected["employer"] = identity_hints["employer"]
             current_evidence = "Exact vacancy page was freshly fetched and did not show a closed/expired state."
         except Exception as error:
             print(f"CAREER ASSIST APPLICATION REVALIDATION FAILED: {type(error).__name__}", flush=True)
@@ -13974,6 +14114,29 @@ def fetch_career_assist_application_context(customer_number, customer_request):
                     "rechecked at this moment and invite a retry; do not claim submission."
                 ),
             }], [], False
+
+    if not str(selected.get("title") or "").strip() or not str(selected.get("employer") or "").strip():
+        return [{
+            "type": "input_text",
+            "text": (
+                "INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: VERIFIED_URL_IDENTITY_INCOMPLETE. "
+                "The exact vacancy URL was revalidated, but title/employer identity is incomplete. "
+                "Ask only for the missing title or employer identity. Do not ask for the URL again, do not ask for payment, "
+                "and do not claim submission."
+            ),
+        }], [live_url], False
+
+    # Persist the freshly resolved exact target so subsequent short answers continue
+    # the same application without requiring the customer to repeat the URL.
+    try:
+        update_application_pack_defaults(
+            customer_number,
+            target_role=str(selected.get("title") or "")[:180],
+            target_organisation=str(selected.get("employer") or "")[:180],
+            target_url=str(live_url or selected.get("application_url") or "")[:2000],
+        )
+    except Exception as error:
+        print(f"CAREER ASSIST APPLICATION TARGET PERSIST FAILED: {type(error).__name__}", flush=True)
 
     fit_strength, fit_gaps = _normalize_career_fit_assessment(
         selected.get("fit_strength"), selected.get("match_reason"), selected.get("fit_gaps")
