@@ -11756,7 +11756,7 @@ def _validate_career_search_payload(raw_text, today_date):
     return accepted, stats
 
 
-def _merge_validated_vacancies(primary, secondary, limit=5):
+def _merge_validated_vacancies(primary, secondary, limit=8):
     merged = []
     seen = set()
     for item in list(primary or []) + list(secondary or []):
@@ -11796,7 +11796,8 @@ def _parse_explicit_vacancy_deadline_from_text(page_text):
     compact = re.sub(r"[ \t]+", " ", text)
     label_re = re.compile(
         r"(?is)(?:deadline(?:\s+of\s+this\s+job)?|application\s+deadline|closing\s+date|"
-        r"applications?\s+close(?:s|d)?(?:\s+on)?|closing\s+on)\s*[:\-]?\s*([^\n\r]{0,120})"
+        r"applications?\s+close(?:s|d)?(?:\s+on)?|closing\s+on|apply\s+by|last\s+date|"
+        r"(?:valid\s+)?until)\s*[:\-]?\s*([^\n\r]{0,120})"
     )
     date_patterns = [
         re.compile(rf"(?i)(?:{_CAREER_WEEKDAY_RE}\s*,?\s*)?({_CAREER_MONTH_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?\s*,?\s*(\d{{4}})"),
@@ -11868,13 +11869,57 @@ def _page_has_active_application_signal(page_text):
     )
 
 
-def _secondary_verify_vacancy_candidates(candidates, today_date):
-    """Batch-verify candidates whose direct vacancy pages could not prove current status.
 
-    This is a fail-closed second opinion. It searches the exact candidate title/employer/URL
-    and asks for current status from the employer's current careers page or the exact live
-    application platform. A model-supplied deadline from discovery is never trusted here
-    unless this verification pass independently confirms it.
+def _page_mentions_candidate_identity(item, page_text):
+    """Require a secondary evidence page to actually mention the candidate vacancy."""
+    def norm(value):
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+    page = norm(page_text)
+    title = norm(item.get("title"))
+    employer = norm(item.get("employer"))
+    if not page or not title:
+        return False
+    if title in page:
+        return True
+
+    stop = {"and", "the", "for", "with", "from", "into", "role", "job", "senior", "junior"}
+    words = [w for w in title.split() if len(w) >= 4 and w not in stop]
+    matched = sum(1 for w in words if w in page)
+    employer_ok = bool(employer and employer in page)
+    needed = 2 if len(words) >= 2 else 1
+    return employer_ok and matched >= needed
+
+
+def _career_scope_is_eligible(item, page_text=""):
+    """For Malawi-first searches, accept Malawi roles or remote roles explicitly open to Malawi/Africa/worldwide."""
+    location = str(item.get("location") or "").strip().lower()
+    page = str(page_text or "").lower()
+    malawi_markers = ("malawi", "lilongwe", "blantyre", "mzuzu", "zomba")
+    if any(marker in location for marker in malawi_markers):
+        return True
+
+    combined = f"{location}\n{page}"
+    remote_signal = any(marker in combined for marker in (
+        "remote", "work from anywhere", "work anywhere", "distributed team",
+    ))
+    scope_signal = any(marker in combined for marker in (
+        "remote across africa", "remote in africa", "across africa", "anywhere in africa",
+        "candidates in africa", "applicants in africa", "africa-based", "based in africa",
+        "open to africa", "open to candidates across africa", "open to applicants across africa",
+        "worldwide remote", "remote worldwide", "open worldwide", "worldwide applicants",
+        "candidates worldwide", "applicants worldwide", "anywhere in the world",
+        "work from anywhere in the world", "open globally", "globally remote",
+        "malawi eligible", "open to malawi", "applicants in malawi", "candidates in malawi",
+    ))
+    return remote_signal and scope_signal
+
+def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_scope=False):
+    """Fail-closed verification for candidates whose first page check was ambiguous.
+
+    Search helps locate corroborating evidence, but server-side HTTP inspection of that
+    evidence URL is the final authority. Search-model dates are never sent to customers
+    unless the fetched evidence page itself exposes the same/current deadline.
     """
     candidates = [dict(x) for x in list(candidates or [])[:5]]
     stats = {
@@ -11885,6 +11930,9 @@ def _secondary_verify_vacancy_candidates(candidates, today_date):
         "unverified": 0,
         "malformed": 0,
         "failed": 0,
+        "eligibility_rejected": 0,
+        "deadline_conflict": 0,
+        "evidence_fetch_failed": 0,
     }
     if not candidates:
         return [], [], stats
@@ -11894,29 +11942,27 @@ def _secondary_verify_vacancy_candidates(candidates, today_date):
     for idx, item in enumerate(candidates, start=1):
         candidate_lines.append(
             f"{idx}. Title: {item.get('title')} | Employer: {item.get('employer')} | "
-            f"URL: {item.get('application_url')}"
+            f"Location: {item.get('location')} | URL: {item.get('application_url')}"
         )
     prompt = (
         f"Today is {today_label}. Verify CURRENT OPEN STATUS for ONLY these candidate vacancies.\n"
         + "\n".join(candidate_lines)
-        + "\n\nFor each candidate, inspect the exact vacancy/application URL first. If that page is dynamic, "
-          "unavailable, archived, or ambiguous, verify against the employer's official CURRENT careers/openings page "
-          "or the exact official application platform. Do not use an old cached advert as proof that a job is open. "
-          "If an official/current page gives a deadline, return that exact date. If the deadline is before today, "
-          "set current_open=false. If there is no deadline, set current_open=true only when current live evidence "
-          "affirmatively shows applications can still be submitted (Apply/Easy Apply/current application form/open until filled). "
-          "If the evidence is ambiguous, set current_open=false. Do not invent or estimate dates.\n\n"
+        + "\n\nInspect the exact vacancy/application URL first. If it is dynamic or ambiguous, find the "
+          "employer's official current careers/openings page or exact official application platform. If ANY credible "
+          "source shows a past deadline or closed status that conflicts with a still-visible Apply button, set "
+          "status_conflict=true and current_open=false unless a current official employer/application page explicitly "
+          "shows applications reopened after that date. Never invent or estimate a deadline. For a role outside Malawi, "
+          "set malawi_eligible=true only when current evidence explicitly says applicants in Malawi, Africa, worldwide, "
+          "or an equivalent global-remote population are eligible; a generic 'remote' label is not enough.\n\n"
           "Return JSON ONLY with exactly this structure:\n"
           '{"verifications":[{"title":"...","employer":"...","application_url":"https://...",'
           '"current_open":true,"deadline_iso":"YYYY-MM-DD or empty string",'
-          '"open_evidence":"specific current-status evidence","evidence_url":"https://..."}]} '
+          '"open_evidence":"specific current-status evidence","evidence_url":"https://...",'
+          '"status_conflict":false,"malawi_eligible":true,"eligibility_evidence":"..."}]} '
     )
 
     urls = []
     try:
-        # Use the Responses web-search path for verification. The previous implementation
-        # reused gpt-5-search-api after several discovery calls and could hit RateLimitError
-        # exactly when an ambiguous vacancy needed the final safety check.
         verify_client = client.with_options(timeout=CAREER_SEARCH_TIMEOUT_SECONDS, max_retries=0)
         completion = verify_client.responses.create(
             model=CAREER_SEARCH_RESPONSES_MODEL,
@@ -11928,7 +11974,7 @@ def _secondary_verify_vacancy_candidates(candidates, today_date):
             }],
             tool_choice="required",
             include=["web_search_call.action.sources"],
-            max_output_tokens=1400,
+            max_output_tokens=1600,
             input=prompt,
         )
         raw = str(completion.output_text or "").strip()
@@ -11950,7 +11996,6 @@ def _secondary_verify_vacancy_candidates(candidates, today_date):
         )
         return [], urls, stats
 
-    # Match verification rows back to candidates by normalized URL first, then title/employer.
     by_url = {}
     by_name = {}
     for item in candidates:
@@ -11963,13 +12008,12 @@ def _secondary_verify_vacancy_candidates(candidates, today_date):
 
     verified = []
     used = set()
-    active_markers = (
-        "apply now", "easy apply", "apply for this job", "submit application",
-        "applications are open", "applications open", "currently accepting",
-        "accepting applications", "application form", "application portal",
-        "open until filled", "rolling applications", "active vacancy", "active listing",
-        "be among the first", "be an early applicant", "actively hiring",
+    closed_markers = (
+        "no longer accepting applications", "applications are closed", "applications closed",
+        "vacancy closed", "job closed", "this job has expired", "job has expired",
+        "position has been filled",
     )
+
     for row in rows[:10]:
         if not isinstance(row, dict):
             continue
@@ -11989,59 +12033,90 @@ def _secondary_verify_vacancy_candidates(candidates, today_date):
             continue
         used.add(identity)
 
-        current_open = row.get("current_open") is True
-        deadline_iso = str(row.get("deadline_iso") or "").strip()
-        evidence = str(row.get("open_evidence") or "").strip()
+        if row.get("status_conflict") is True or row.get("current_open") is not True:
+            stats["closed"] += 1
+            continue
+
         evidence_url = str(row.get("evidence_url") or "").strip()
         if evidence_url:
             try:
                 evidence_url = _normalize_candidate_url(evidence_url)
             except Exception:
                 evidence_url = ""
-            if evidence_url and evidence_url not in urls:
-                urls.append(evidence_url)
+        verification_url = evidence_url or row_url or str(item.get("application_url") or "")
+        if not verification_url:
+            stats["unverified"] += 1
+            continue
+        if verification_url not in urls:
+            urls.append(verification_url)
 
-        if deadline_iso:
-            try:
-                deadline_date = datetime.strptime(deadline_iso, "%Y-%m-%d").date()
-            except ValueError:
-                stats["unverified"] += 1
-                continue
-            if deadline_date < today_date:
+        try:
+            evidence_text, final_evidence_url = _direct_page_text_for_vacancy(verification_url)
+        except (ValueError, requests.RequestException, socket.error) as error:
+            stats["evidence_fetch_failed"] += 1
+            stats["unverified"] += 1
+            print(
+                f"CAREER ASSIST SECONDARY EVIDENCE FETCH FAILED: {type(error).__name__} "
+                f"title={item.get('title')}",
+                flush=True,
+            )
+            continue
+
+        lower_page = evidence_text.lower()
+        if any(marker in lower_page for marker in closed_markers):
+            stats["closed"] += 1
+            continue
+        if not _page_mentions_candidate_identity(item, evidence_text):
+            stats["unverified"] += 1
+            print(
+                f"CAREER ASSIST SECONDARY REJECTED IDENTITY MISMATCH: title={item.get('title')}",
+                flush=True,
+            )
+            continue
+        if require_malawi_scope and not _career_scope_is_eligible(item, evidence_text):
+            stats["eligibility_rejected"] += 1
+            print(
+                f"CAREER ASSIST SECONDARY REJECTED LOCATION/ELIGIBILITY: "
+                f"title={item.get('title')} location={item.get('location')}",
+                flush=True,
+            )
+            continue
+
+        direct_deadline, _ = _parse_explicit_vacancy_deadline_from_text(evidence_text)
+        model_deadline = str(row.get("deadline_iso") or "").strip()
+        if direct_deadline is not None:
+            direct_iso = direct_deadline.isoformat()
+            if model_deadline and model_deadline != direct_iso:
+                stats["deadline_conflict"] += 1
+                print(
+                    f"CAREER ASSIST SECONDARY DEADLINE CONFLICT: model={model_deadline} "
+                    f"direct={direct_iso} title={item.get('title')}",
+                    flush=True,
+                )
+            if direct_deadline < today_date:
                 stats["expired"] += 1
                 print(
-                    f"CAREER ASSIST SECONDARY VERIFY REJECTED EXPIRED: deadline={deadline_iso} "
+                    f"CAREER ASSIST SECONDARY VERIFY REJECTED EXPIRED: deadline={direct_iso} "
                     f"title={item.get('title')}",
                     flush=True,
                 )
                 continue
-            if not current_open:
-                stats["closed"] += 1
-                continue
-            item["deadline_iso"] = deadline_iso
-            item["deadline_display"] = deadline_date.strftime("%d %B %Y")
-            item["open_evidence"] = evidence[:500] or f"Independent verification confirms deadline {item['deadline_display']}."
+            item["deadline_iso"] = direct_iso
+            item["deadline_display"] = direct_deadline.strftime("%d %B %Y")
+            item["open_evidence"] = f"Verified directly from current evidence page: deadline {item['deadline_display']}."
             verified.append(item)
             stats["verified"] += 1
             continue
 
-        if not current_open:
-            stats["closed"] += 1
-            continue
-        evidence_lower = evidence.lower()
-        if not any(marker in evidence_lower for marker in active_markers):
+        # A future date supplied only by search-model text is not independently verified.
+        # If the fetched page is demonstrably accepting applications, keep the role with
+        # NO deadline rather than repeating a potentially fabricated date.
+        if not _page_has_active_application_signal(evidence_text):
             stats["unverified"] += 1
             continue
-
-        # No independently verified deadline: remove any discovery-model date.
         item["deadline_iso"] = ""
-        if "open until filled" in evidence_lower:
-            item["deadline_display"] = "Open until filled (no closing date stated)"
-        elif "rolling applications" in evidence_lower:
-            item["deadline_display"] = "Rolling applications (no closing date stated)"
-        else:
-            item["deadline_display"] = "No closing date verified; current application evidence found"
-        item["open_evidence"] = evidence[:500]
+        item["deadline_display"] = "No closing date verified; current application evidence found"
+        item["open_evidence"] = "Current evidence page shows an active application action; no closing date was independently verified."
         verified.append(item)
         stats["verified"] += 1
 
@@ -12049,19 +12124,15 @@ def _secondary_verify_vacancy_candidates(candidates, today_date):
     print(
         "CAREER ASSIST SECONDARY VACANCY VERIFICATION: "
         f"requested={stats['requested']} verified={stats['verified']} expired={stats['expired']} "
-        f"closed={stats['closed']} unverified={stats['unverified']} malformed={stats['malformed']} failed={stats['failed']}",
+        f"closed={stats['closed']} unverified={stats['unverified']} "
+        f"eligibility_rejected={stats['eligibility_rejected']} deadline_conflict={stats['deadline_conflict']} "
+        f"evidence_fetch_failed={stats['evidence_fetch_failed']} malformed={stats['malformed']} failed={stats['failed']}",
         flush=True,
     )
     return verified, urls, stats
 
-
-def _final_live_page_vacancy_gate(vacancies, today_date):
-    """Cross-check model-discovered vacancies against actual live pages where possible.
-
-    Direct-page evidence wins over discovery-model claims. Candidates that cannot be
-    proven current from the fetched page are returned separately for a stricter hosted
-    verification pass rather than being silently trusted.
-    """
+def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=False):
+    """Cross-check discovered vacancies against actual pages before customer exposure."""
     kept = []
     needs_secondary = []
     stats = {
@@ -12072,6 +12143,7 @@ def _final_live_page_vacancy_gate(vacancies, today_date):
         "closed": 0,
         "deadline_conflict": 0,
         "needs_secondary": 0,
+        "eligibility_rejected": 0,
     }
     closed_markers = (
         "no longer accepting applications",
@@ -12083,7 +12155,9 @@ def _final_live_page_vacancy_gate(vacancies, today_date):
         "job has expired",
         "position has been filled",
     )
-    for original in list(vacancies or [])[:5]:
+    # Keep a wider discovery pool than the requested five because stale/foreign roles
+    # may be rejected here. Final customer output is capped to five after verification.
+    for original in list(vacancies or [])[:8]:
         item = dict(original)
         url = str(item.get("application_url") or "").strip()
         if not url:
@@ -12127,7 +12201,16 @@ def _final_live_page_vacancy_gate(vacancies, today_date):
             )
             continue
 
-        direct_deadline, deadline_evidence = _parse_explicit_vacancy_deadline_from_text(page_text)
+        if require_malawi_scope and not _career_scope_is_eligible(item, page_text):
+            stats["eligibility_rejected"] += 1
+            print(
+                f"CAREER ASSIST DIRECT PAGE REJECTED LOCATION/ELIGIBILITY: "
+                f"title={item.get('title')} location={item.get('location')}",
+                flush=True,
+            )
+            continue
+
+        direct_deadline, _ = _parse_explicit_vacancy_deadline_from_text(page_text)
         if direct_deadline is not None:
             stats["explicit_deadline"] += 1
             model_deadline = str(item.get("deadline_iso") or "").strip()
@@ -12149,16 +12232,11 @@ def _final_live_page_vacancy_gate(vacancies, today_date):
                 continue
             item["deadline_iso"] = direct_iso
             item["deadline_display"] = direct_deadline.strftime("%d %B %Y")
-            item["open_evidence"] = (
-                f"Direct vacancy page explicitly states deadline {item['deadline_display']}. "
-                + str(item.get("open_evidence") or "")
-            )[:500]
+            item["open_evidence"] = f"Direct vacancy page explicitly states deadline {item['deadline_display']}."
             item["application_url"] = final_url
             kept.append(item)
             continue
 
-        # If the fetched page itself clearly exposes an active application action, keep
-        # the vacancy but discard any unverified discovery-model deadline.
         if _page_has_active_application_signal(page_text):
             item["deadline_iso"] = ""
             item["deadline_display"] = "No closing date verified; live page shows applications open"
@@ -12167,7 +12245,6 @@ def _final_live_page_vacancy_gate(vacancies, today_date):
             kept.append(item)
             continue
 
-        # A 200 page with no deadline and no active application signal is not enough.
         item["application_url"] = final_url
         needs_secondary.append(item)
         stats["needs_secondary"] += 1
@@ -12180,6 +12257,9 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     today_label = today.strftime("%d %B %Y")
     request_text = str(customer_request or "")[:2600]
     request_lower = request_text.lower()
+    require_malawi_scope = any(marker in request_lower for marker in (
+        "malawi", "lilongwe", "malawi first", "remote roles", "remote opportunities", "suitable remote"
+    ))
     broad_match_request = any(marker in request_lower for marker in (
         "better fit", "better match", "best fit", "match my cv", "matching my cv",
         "using my verified cv", "up to 5", "five current", "5 current",
@@ -12452,8 +12532,12 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 "site:jobs.ashbyhq.com (Malawi OR Lilongwe) (data OR analyst OR business intelligence OR information OR systems); "
                 "site:boards.greenhouse.io OR site:job-boards.greenhouse.io (Malawi OR remote Africa) (data OR analyst OR systems); "
                 "site:jobs.lever.co OR site:jobs.workable.com (Malawi OR remote Africa) (data OR business analyst OR digital OR systems). "
-                "Prefer direct-employer ATS pages over talent networks/intermediaries. A talent-network listing may be returned only "
-                "when it is genuinely current and clearly labelled as an intermediary rather than as the underlying employer."
+                "Prefer direct-employer ATS pages over talent networks/intermediaries. FIRST exhaust Malawi/Lilongwe ATS results "
+                "before adding remote roles. Do not return a role located in India, the United States, Europe or another foreign "
+                "country merely because the page uses the word remote; include it only when the vacancy itself explicitly says "
+                "applicants in Malawi, Africa, worldwide, or an equivalent global-remote population are eligible. A talent-network "
+                "listing may be returned only when it is genuinely current and clearly labelled as an intermediary rather than "
+                "as the underlying employer."
             )
             ats_client = client.with_options(timeout=CAREER_SEARCH_TIMEOUT_SECONDS, max_retries=0)
             ats_completion = ats_client.responses.create(
@@ -12496,14 +12580,16 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     # Final source-of-truth check: direct pages first. Any candidate whose direct
     # page cannot prove current status is NOT trusted automatically; it goes through
     # one stricter hosted verification pass against the exact vacancy/employer source.
-    direct_kept, secondary_candidates, direct_page_stats = _final_live_page_vacancy_gate(all_vacancies, today)
+    direct_kept, secondary_candidates, direct_page_stats = _final_live_page_vacancy_gate(
+        all_vacancies, today, require_malawi_scope=require_malawi_scope
+    )
     secondary_kept, secondary_urls, secondary_stats = _secondary_verify_vacancy_candidates(
-        secondary_candidates, today
+        secondary_candidates, today, require_malawi_scope=require_malawi_scope
     )
     for url in secondary_urls:
         if url and url not in source_urls:
             source_urls.append(url)
-    all_vacancies = _merge_validated_vacancies(direct_kept, secondary_kept)
+    all_vacancies = _merge_validated_vacancies(direct_kept, secondary_kept, limit=5)
     print(
         "CAREER ASSIST DIRECT PAGE FILTER: "
         f"checked={direct_page_stats['checked']} kept_direct={len(direct_kept)} "
@@ -12512,6 +12598,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         f"explicit_deadline={direct_page_stats['explicit_deadline']} "
         f"expired={direct_page_stats['expired']} closed={direct_page_stats['closed']} "
         f"deadline_conflict={direct_page_stats['deadline_conflict']} "
+        f"eligibility_rejected={direct_page_stats['eligibility_rejected']} "
         f"fetch_failed={direct_page_stats['fetch_failed']}",
         flush=True,
     )
