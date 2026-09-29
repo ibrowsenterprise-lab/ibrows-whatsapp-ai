@@ -11319,9 +11319,40 @@ def _is_official_web_source(url):
     )
 
 
+_OFFICIAL_APPLICATION_SOURCE_HOST_SUFFIXES = (
+    "jobs.ashbyhq.com",
+    "boards.greenhouse.io",
+    "job-boards.greenhouse.io",
+    "jobs.lever.co",
+    "myworkdayjobs.com",
+    "careers.smartrecruiters.com",
+    "jobs.smartrecruiters.com",
+    "jobs.workable.com",
+    "apply.workable.com",
+)
+
+
+def _is_official_application_source(url):
+    """Return True for major employer-controlled applicant-tracking job pages.
+
+    These domains are not government sites, but an exact job page on them is the
+    employer's official application channel rather than an independent job aggregator.
+    """
+    try:
+        host = (urlsplit(str(url or "")).hostname or "").lower().strip(".")
+    except Exception:
+        return False
+    if host.startswith("www."):
+        host = host[4:]
+    return any(
+        host == suffix or host.endswith("." + suffix)
+        for suffix in _OFFICIAL_APPLICATION_SOURCE_HOST_SUFFIXES
+    )
+
+
 def _source_transparency_footer(source_urls):
-    """Build a short WhatsApp-friendly source list with official sources first."""
-    official, additional, seen = [], [], set()
+    """Build a short WhatsApp-friendly source list with primary sources first."""
+    official, official_application, additional, seen = [], [], [], set()
     for raw_url in source_urls or []:
         try:
             url = _normalize_candidate_url(raw_url)
@@ -11334,17 +11365,23 @@ def _source_transparency_footer(source_urls):
         if key in seen:
             continue
         seen.add(key)
-        bucket = official if _is_official_web_source(url) else additional
-        bucket.append(url)
-        if len(official) + len(additional) >= 4:
+        if _is_official_web_source(url):
+            official.append(url)
+        elif _is_official_application_source(url):
+            official_application.append(url)
+        else:
+            additional.append(url)
+        if len(official) + len(official_application) + len(additional) >= 4:
             break
 
-    if not official and not additional:
+    if not official and not official_application and not additional:
         return ""
 
     lines = ["Sources checked:"]
     for url in official:
         lines.append(f"Official: {url}")
+    for url in official_application:
+        lines.append(f"Official application source: {url}")
     for url in additional:
         lines.append(f"Additional: {url}")
     return "\n".join(lines)
@@ -14639,10 +14676,31 @@ Return ONLY the required JSON object.
         if web_source_urls:
             reply = _append_source_transparency(reply, web_source_urls)
             final_result["reply"] = reply
-            official_count = sum(1 for url in web_source_urls if _is_official_web_source(url))
-            additional_count = len({str(url).lower() for url in web_source_urls}) - official_count
+            unique_source_urls = []
+            seen_source_urls = set()
+            for source_url in web_source_urls:
+                try:
+                    normalized_source_url = _normalize_candidate_url(source_url)
+                except Exception:
+                    continue
+                source_key = normalized_source_url.lower()
+                if source_key in seen_source_urls:
+                    continue
+                seen_source_urls.add(source_key)
+                unique_source_urls.append(normalized_source_url)
+            official_count = sum(1 for url in unique_source_urls if _is_official_web_source(url))
+            official_application_count = sum(
+                1 for url in unique_source_urls
+                if not _is_official_web_source(url) and _is_official_application_source(url)
+            )
+            additional_count = max(
+                len(unique_source_urls) - official_count - official_application_count,
+                0,
+            )
             print(
-                f"SOURCE TRANSPARENCY ADDED: official={official_count}, additional={max(additional_count, 0)}",
+                "SOURCE TRANSPARENCY ADDED: "
+                f"official={official_count}, official_application={official_application_count}, "
+                f"additional={additional_count}",
                 flush=True
             )
 
