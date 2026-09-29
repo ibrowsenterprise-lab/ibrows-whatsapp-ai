@@ -11998,6 +11998,41 @@ def _career_same_host(url_a, url_b):
     return bool(a and b and a == b)
 
 
+def _trusted_ats_exact_job_url(url):
+    """Return True only for a job-specific URL on a trusted ATS host.
+
+    This is deliberately stricter than merely checking the ATS hostname. It is used
+    only after a secondary live-search pass has independently marked the role current.
+    """
+    try:
+        parsed = urlsplit(str(url or ""))
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower().strip(".")
+    path = parsed.path or ""
+    parts = [p for p in path.split("/") if p]
+    if not _career_host_matches(host, _CAREER_TRUSTED_ATS_HOST_SUFFIXES):
+        return False
+
+    if _career_host_matches(host, ("jobs.ashbyhq.com",)):
+        # /<company>/<uuid>
+        return len(parts) >= 2 and bool(re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            parts[-1],
+        ))
+    if _career_host_matches(host, ("boards.greenhouse.io", "job-boards.greenhouse.io")):
+        return "jobs" in [x.lower() for x in parts] and any(re.fullmatch(r"\d{5,}", x) for x in parts)
+    if _career_host_matches(host, ("jobs.lever.co",)):
+        return len(parts) >= 2 and parts[-1].lower() not in {"jobs", "search"}
+    if _career_host_matches(host, ("myworkdayjobs.com",)):
+        return "job" in [x.lower() for x in parts] and len(parts) >= 3
+    if _career_host_matches(host, ("careers.smartrecruiters.com", "jobs.smartrecruiters.com")):
+        return len(parts) >= 2
+    if _career_host_matches(host, ("jobs.workable.com", "apply.workable.com")):
+        return any(x.lower() in {"j", "job"} for x in parts) and len(parts) >= 2
+    return False
+
+
 def _trusted_ats_page_has_live_job_signal(item, url, page_text):
     """Recognize a live exact-job page on trusted ATS hosts without trusting a deadline.
 
@@ -12249,14 +12284,40 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
             continue
 
         # A future date supplied only by search-model text is not independently verified.
-        # If the fetched page is demonstrably accepting applications, keep the role with
-        # NO deadline rather than repeating a potentially fabricated date.
-        if not _page_has_active_application_signal(evidence_text):
+        # Prefer a rendered application signal. For a job-specific trusted ATS URL, a
+        # secondary live-search confirmation + exact candidate identity + no closure marker
+        # is also sufficient. This handles JavaScript-heavy ATS pages (notably Ashby) whose
+        # plain HTTP text often omits the rendered Apply button.
+        active_signal = _page_has_active_application_signal(evidence_text)
+        trusted_exact = _trusted_ats_exact_job_url(final_evidence_url or verification_url)
+        if not active_signal and trusted_exact:
+            item["deadline_iso"] = ""
+            item["deadline_display"] = "No closing date verified; current trusted ATS job page confirmed"
+            item["open_evidence"] = (
+                "Secondary live verification confirmed the exact trusted ATS vacancy page is current; "
+                "no closing date was independently verified."
+            )
+            item["application_url"] = final_evidence_url or verification_url
+            verified.append(item)
+            stats["verified"] += 1
+            print(
+                f"CAREER ASSIST SECONDARY TRUSTED ATS EXACT JOB CONFIRMED: "
+                f"title={item.get('title')} host={_career_url_host(final_evidence_url or verification_url)}",
+                flush=True,
+            )
+            continue
+        if not active_signal:
             stats["unverified"] += 1
+            print(
+                f"CAREER ASSIST SECONDARY REJECTED NO LIVE APPLICATION SIGNAL: "
+                f"title={item.get('title')} host={_career_url_host(final_evidence_url or verification_url)}",
+                flush=True,
+            )
             continue
         item["deadline_iso"] = ""
         item["deadline_display"] = "No closing date verified; current application evidence found"
         item["open_evidence"] = "Current evidence page shows an active application action; no closing date was independently verified."
+        item["application_url"] = final_evidence_url or verification_url
         verified.append(item)
         stats["verified"] += 1
 
@@ -12637,7 +12698,8 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 f"CAREER ASSIST MALAWI ATS SWEEP: model={CAREER_SEARCH_RESPONSES_MODEL} "
                 f"sources={len(malawi_ats_urls)} validated={len(malawi_ats_vacancies)} "
                 f"seen={stats.get('seen', 0)} not_open={stats.get('not_open', 0)} "
-                f"missing_evidence={stats.get('missing_evidence', 0)} cumulative={len(all_vacancies)}",
+                f"missing_evidence={stats.get('missing_evidence', 0)} expired={stats.get('expired', 0)} "
+                f"invalid_deadline={stats.get('invalid_deadline', 0)} cumulative={len(all_vacancies)}",
                 flush=True,
             )
             search_paths.append(f"malawi-ats:{CAREER_SEARCH_RESPONSES_MODEL}")
