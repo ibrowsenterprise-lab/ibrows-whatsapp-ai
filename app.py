@@ -687,6 +687,25 @@ def init_database():
                 )
             """)
 
+            # Append-only audit trail for Career Assist standing application consent.
+            # A GRANT authorizes future application handling only within the customer's
+            # exact recorded scope and only while Career Assist is active. A REVOKE
+            # immediately disables that standing authority without disabling vacancy alerts.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS career_assist_application_consent_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    customer_number TEXT NOT NULL,
+                    career_assist_lead_id BIGINT REFERENCES leads(id) ON DELETE SET NULL,
+                    event_type TEXT NOT NULL CHECK (event_type IN ('GRANT', 'REVOKE')),
+                    scope_text TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_career_assist_consent_customer
+                ON career_assist_application_consent_events(customer_number, created_at DESC, id DESC)
+            """)
+
             # Remember narrow, auditor-approved evidence wording corrections so a
             # phrase that was already corrected cannot silently reappear in a later
             # regenerated CV/cover letter for the same customer.
@@ -4850,6 +4869,30 @@ def build_verified_payment_context(customer_number):
     elif ca_state == "NOT_PAID":
         lines.append("- Career Assist activation: NOT_PAID. Not active.")
 
+    try:
+        standing = get_career_assist_standing_consent(customer_number)
+        if standing.get("event_type") == "GRANT" and standing.get("effective"):
+            lines.append(
+                "- Career Assist standing application authorization: ACTIVE. Exact customer scope: "
+                + standing.get("scope_text", "")[:2200]
+            )
+            lines.append(
+                "  Use standing authority only within that exact scope. Never invent or answer new/sensitive declarations. "
+                "Never claim an employer submission unless the system has real submission confirmation."
+            )
+        elif standing.get("event_type") == "REVOKE":
+            lines.append(
+                "- Career Assist standing application authorization: REVOKED. Do not submit future applications under standing authority. "
+                "Vacancy recommendations and individual application assistance may continue."
+            )
+        elif standing.get("event_type") == "GRANT" and not standing.get("effective"):
+            lines.append(
+                "- Career Assist standing application authorization: INACTIVE because the Career Assist term is not currently active. "
+                "Do not use it to submit applications."
+            )
+    except Exception as consent_context_error:
+        print(f"CAREER ASSIST CONSENT CONTEXT ERROR: {type(consent_context_error).__name__}", flush=True)
+
     return [{"role": "user", "content": "\n".join(lines)}]
 
 
@@ -4957,6 +5000,192 @@ def single_job_application_payment_gate(customer_number, customer_name):
     )
 
 
+def detect_career_assist_standing_consent_revoke(customer_message):
+    """Detect an explicit withdrawal of standing Career Assist application authority."""
+    text = " ".join(str(customer_message or "").lower().split())
+    if not text:
+        return False
+    exact_markers = (
+        "stop applying for jobs on my behalf",
+        "stop applying on my behalf",
+        "revoke my standing application authorization",
+        "revoke my standing application authorisation",
+        "revoke my application authorization",
+        "revoke my application authorisation",
+        "withdraw my standing application authorization",
+        "withdraw my standing application authorisation",
+        "cancel my standing application authorization",
+        "cancel my standing application authorisation",
+    )
+    if any(marker in text for marker in exact_markers):
+        return True
+    standing_marker = any(marker in text for marker in (
+        "standing consent", "standing authorization", "standing authorisation",
+        "automatic submission consent", "automatic application consent",
+    ))
+    revoke_marker = any(marker in text for marker in (
+        "revoke", "withdraw", "cancel", "stop", "disable", "turn off",
+    ))
+    return standing_marker and revoke_marker
+
+
+def detect_career_assist_standing_consent_grant(customer_message):
+    """Detect explicit standing authorization for future Career Assist applications."""
+    text = " ".join(str(customer_message or "").lower().split())
+    if not text or detect_career_assist_standing_consent_revoke(customer_message):
+        return False
+    authorization_marker = any(marker in text for marker in (
+        "i authorize ibrows", "i authorise ibrows", "authorize ibrows", "authorise ibrows",
+        "standing application authorization", "standing application authorisation",
+        "standing consent", "automatic application consent",
+    ))
+    application_marker = any(marker in text for marker in (
+        "apply", "application", "applications", "submit", "submission",
+    ))
+    future_scope_marker = any(marker in text for marker in (
+        "during my active career assist", "during career assist", "future jobs",
+        "future vacancies", "jobs in", "roles in", "vacancies in", "on my behalf",
+    ))
+    return authorization_marker and application_marker and future_scope_marker
+
+
+def get_career_assist_standing_consent(customer_number):
+    """Return the latest append-only standing-consent event and effective status."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, career_assist_lead_id, event_type, scope_text, created_at
+                FROM career_assist_application_consent_events
+                WHERE customer_number = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (customer_number,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return {
+            "event_id": None, "lead_id": None, "event_type": None,
+            "scope_text": "", "created_at": None, "effective": False,
+        }
+    event_id, lead_id, event_type, scope_text, created_at = row
+    effective = False
+    if str(event_type or "").upper() == "GRANT":
+        try:
+            effective = get_career_assist_lifecycle_state(customer_number).get("state") == "ACTIVE"
+        except Exception:
+            effective = False
+    return {
+        "event_id": event_id,
+        "lead_id": lead_id,
+        "event_type": str(event_type or "").upper(),
+        "scope_text": str(scope_text or ""),
+        "created_at": created_at,
+        "effective": effective,
+    }
+
+
+def _record_career_assist_consent_event(customer_number, lead_id, event_type, scope_text=""):
+    event_type = str(event_type or "").upper().strip()
+    if event_type not in {"GRANT", "REVOKE"}:
+        raise ValueError("Invalid Career Assist consent event type.")
+    scope_text = str(scope_text or "").strip()[:3500]
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO career_assist_application_consent_events
+                    (customer_number, career_assist_lead_id, event_type, scope_text)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, created_at
+                """,
+                (customer_number, lead_id, event_type, scope_text or None),
+            )
+            event_id, created_at = cur.fetchone()
+            if lead_id:
+                if event_type == "GRANT":
+                    note = (
+                        "Standing Career Assist application authorization GRANTED. "
+                        "Exact customer scope is preserved in the consent audit event. "
+                        "Unverified/sensitive declarations still require customer input; "
+                        "submission must never be claimed without real submission confirmation."
+                    )
+                    activity_type = "APPLICATION_CONSENT_GRANTED"
+                else:
+                    note = (
+                        "Standing Career Assist application authorization REVOKED. "
+                        "Future submissions under standing authority must stop immediately; "
+                        "vacancy recommendations may continue."
+                    )
+                    activity_type = "APPLICATION_CONSENT_REVOKED"
+                cur.execute(
+                    "INSERT INTO lead_notes (lead_id, note_text) VALUES (%s, %s)",
+                    (lead_id, note),
+                )
+                _activity_insert(cur, lead_id, activity_type, note)
+        conn.commit()
+    return {"event_id": event_id, "created_at": created_at}
+
+
+def handle_career_assist_standing_consent(customer_number, customer_message):
+    """Handle standing-consent grant/revocation deterministically before search routing."""
+    if detect_career_assist_standing_consent_revoke(customer_message):
+        current = get_career_assist_standing_consent(customer_number)
+        if current.get("event_type") != "GRANT":
+            print("CAREER ASSIST STANDING CONSENT REVOKE: no_active_grant", flush=True)
+            return (
+                "There is no active standing application authorization recorded for your Career Assist. "
+                "I will not submit future applications on standing authority. Vacancy recommendations can continue."
+            )
+        lead_id = current.get("lead_id")
+        if not lead_id:
+            try:
+                lead_id = get_career_assist_lifecycle_state(customer_number).get("lead_id")
+            except Exception:
+                lead_id = None
+        event = _record_career_assist_consent_event(customer_number, lead_id, "REVOKE")
+        print(
+            f"CAREER ASSIST STANDING CONSENT REVOKED: event={event['event_id']} lead={lead_id}",
+            flush=True,
+        )
+        return (
+            "Your standing Career Assist application authorization has been revoked. "
+            "IBROWS must not submit future job applications on your behalf under that standing authority. "
+            "You can still receive vacancy recommendations and ask for help with individual applications. "
+            "This does not withdraw any application that may already have been submitted."
+        )
+
+    if detect_career_assist_standing_consent_grant(customer_message):
+        state = get_career_assist_lifecycle_state(customer_number)
+        if state.get("state") != "ACTIVE":
+            print(
+                f"CAREER ASSIST STANDING CONSENT NOT ACTIVATED: lifecycle={state.get('state')}",
+                flush=True,
+            )
+            return (
+                "I can record standing application authorization only while Career Assist is active. "
+                "Your instruction has not been activated as standing consent."
+            )
+        event = _record_career_assist_consent_event(
+            customer_number,
+            state.get("lead_id"),
+            "GRANT",
+            customer_message,
+        )
+        print(
+            f"CAREER ASSIST STANDING CONSENT GRANTED: event={event['event_id']} lead={state.get('lead_id')}",
+            flush=True,
+        )
+        return (
+            "Your standing Career Assist application authorization has been recorded for the exact scope you provided. "
+            "IBROWS may use only your verified information within that scope. New or sensitive declarations that are not already verified still require your confirmation. "
+            "This authorization does not mean any application has been submitted, and the assistant must not claim submission unless a real submission is confirmed. "
+            "You can revoke this standing authorization at any time without stopping vacancy recommendations."
+        )
+    return None
+
+
 def detect_career_assist_vacancy_search_request(customer_message):
     """Detect job/vacancy discovery requests that belong to an ACTIVE Career Assist term.
 
@@ -4967,6 +5196,14 @@ def detect_career_assist_vacancy_search_request(customer_message):
     """
     text = " ".join(str(customer_message or "").lower().split())
     if not text:
+        return False
+
+    # Standing-consent instructions can contain phrases such as "jobs in Malawi".
+    # They are authorization changes, not vacancy-discovery requests.
+    if (
+        detect_career_assist_standing_consent_grant(customer_message)
+        or detect_career_assist_standing_consent_revoke(customer_message)
+    ):
         return False
 
     # Explicit execution of one already-identified vacancy is not discovery.
@@ -4995,6 +5232,11 @@ def detect_single_job_application_request(customer_message):
     """Detect execution of one identified application without confusing it with discovery/CV work."""
     text = " ".join(str(customer_message or "").lower().split())
     if not text:
+        return False
+    if (
+        detect_career_assist_standing_consent_grant(customer_message)
+        or detect_career_assist_standing_consent_revoke(customer_message)
+    ):
         return False
     if any(term in text for term in ("cv and cover letter", "cv & cover letter", "application pack")):
         return False
@@ -5026,6 +5268,11 @@ def detect_career_assist_application_request(customer_message):
     """
     text = " ".join(str(customer_message or "").lower().split())
     if not text:
+        return False
+    if (
+        detect_career_assist_standing_consent_grant(customer_message)
+        or detect_career_assist_standing_consent_revoke(customer_message)
+    ):
         return False
     if detect_career_assist_vacancy_search_request(customer_message):
         return False
@@ -14478,6 +14725,32 @@ def receive_webhook():
             print("LOCAL HUMAN HANDOVER ACTIVATED", flush=True)
             return "EVENT_RECEIVED", 200
 
+        # Standing Career Assist application consent is an authorization-state change,
+        # not a vacancy search or a one-off MK2,000 application request. Handle it
+        # deterministically before either detector can route the message elsewhere.
+        if message_type == "text" and (
+            detect_career_assist_standing_consent_grant(customer_message)
+            or detect_career_assist_standing_consent_revoke(customer_message)
+        ):
+            try:
+                reply = handle_career_assist_standing_consent(customer_number, customer_message)
+            except Exception as consent_error:
+                print(
+                    f"CAREER ASSIST STANDING CONSENT ERROR: {type(consent_error).__name__}",
+                    flush=True,
+                )
+                reply = (
+                    "I could not update your standing application authorization just now. "
+                    "No new standing authorization has been assumed. Please try again or ask to talk to Jones."
+                )
+            save_message(customer_number, "user", customer_message)
+            save_message(customer_number, "assistant", reply)
+            store_pending_reply(message_id, reply)
+            sent = send_whatsapp_message(customer_number, reply)
+            finish_whatsapp_message(message_id, sent)
+            print("CAREER ASSIST STANDING CONSENT MESSAGE HANDLED", flush=True)
+            return "EVENT_RECEIVED", 200
+
         # The MK2,000 Single Job Application remains a separate standalone service.
         # An ACTIVE Career Assist term, however, already includes vacancy discovery AND
         # application support/execution within the agreed customer scope. Never create or
@@ -15294,6 +15567,12 @@ CAREER APPLICATION INTEGRITY AND CONSENT
   when a material answer is not verified.
 - Payment does not replace customer consent. Standing application instructions may define scope,
   locations, salary limits and categories, but new sensitive/unverified declarations still require input.
+- When INTERNAL VERIFIED PAYMENT STATUS states that Career Assist standing application authorization is ACTIVE,
+  treat only the exact recorded scope as standing permission. Do not broaden roles, countries, fit levels, salary
+  limits or other boundaries beyond that stored scope. This authorization never supplies answers to unverified or
+  sensitive declarations and never proves that an employer application was actually submitted.
+- When that internal status says REVOKED or INACTIVE, do not use any older standing authorization for submission.
+  Vacancy search/recommendations may continue unless the customer separately asks to stop them.
 - Ask for a declaration only when the actual verified vacancy/application process requires it. Do not invent a generic
   checklist of salary expectations, work authorisation, availability, criminal/medical declarations or similar fields merely
   because such questions sometimes appear on applications. If the official form has not exposed such a question yet, do not
