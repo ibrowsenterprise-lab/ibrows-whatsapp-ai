@@ -11914,6 +11914,53 @@ def _career_scope_is_eligible(item, page_text=""):
     ))
     return remote_signal and scope_signal
 
+_CAREER_TRUSTED_ATS_HOST_SUFFIXES = (
+    "jobs.ashbyhq.com",
+    "boards.greenhouse.io",
+    "job-boards.greenhouse.io",
+    "jobs.lever.co",
+    "myworkdayjobs.com",
+    "careers.smartrecruiters.com",
+    "jobs.smartrecruiters.com",
+    "jobs.workable.com",
+    "apply.workable.com",
+)
+
+_CAREER_THIRD_PARTY_JOB_HOST_SUFFIXES = (
+    "jobsformalawi.com",
+    "careeradmw.com",
+    "greatmalawijobs.com",
+    "mvungi.com",
+    "linkedin.com",
+    "bebee.com",
+    "developerjobs.io",
+    "remotenex.us",
+    "freshtalent.africa",
+    "hireportal.us.com",
+)
+
+def _career_url_host(url):
+    try:
+        return (urlsplit(str(url or "")).hostname or "").lower().strip(".")
+    except Exception:
+        return ""
+
+def _career_host_matches(host, suffixes):
+    host = str(host or "").lower().strip(".")
+    return any(host == suffix or host.endswith("." + suffix) for suffix in suffixes)
+
+def _career_is_trusted_ats_source(url):
+    return _career_host_matches(_career_url_host(url), _CAREER_TRUSTED_ATS_HOST_SUFFIXES)
+
+def _career_is_third_party_job_source(url):
+    return _career_host_matches(_career_url_host(url), _CAREER_THIRD_PARTY_JOB_HOST_SUFFIXES)
+
+def _career_same_host(url_a, url_b):
+    a = _career_url_host(url_a)
+    b = _career_url_host(url_b)
+    return bool(a and b and a == b)
+
+
 def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_scope=False):
     """Fail-closed verification for candidates whose first page check was ambiguous.
 
@@ -11921,7 +11968,7 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
     evidence URL is the final authority. Search-model dates are never sent to customers
     unless the fetched evidence page itself exposes the same/current deadline.
     """
-    candidates = [dict(x) for x in list(candidates or [])[:5]]
+    candidates = [dict(x) for x in list(candidates or [])[:8]]
     stats = {
         "requested": len(candidates),
         "verified": 0,
@@ -11940,9 +11987,16 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
     today_label = today_date.strftime("%d %B %Y")
     candidate_lines = []
     for idx, item in enumerate(candidates, start=1):
+        independent_note = ""
+        if item.get("_requires_independent_corroboration"):
+            independent_note = (
+                " | INDEPENDENT CORROBORATION REQUIRED: do not use the same website/domain "
+                "as the candidate URL as the evidence source; actively look for an official employer/ATS "
+                "page or a different credible vacancy source and search for conflicting deadlines/closed status"
+            )
         candidate_lines.append(
             f"{idx}. Title: {item.get('title')} | Employer: {item.get('employer')} | "
-            f"Location: {item.get('location')} | URL: {item.get('application_url')}"
+            f"Location: {item.get('location')} | URL: {item.get('application_url')}{independent_note}"
         )
     prompt = (
         f"Today is {today_label}. Verify CURRENT OPEN STATUS for ONLY these candidate vacancies.\n"
@@ -11951,7 +12005,10 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
           "employer's official current careers/openings page or exact official application platform. If ANY credible "
           "source shows a past deadline or closed status that conflicts with a still-visible Apply button, set "
           "status_conflict=true and current_open=false unless a current official employer/application page explicitly "
-          "shows applications reopened after that date. Never invent or estimate a deadline. For a role outside Malawi, "
+          "shows applications reopened after that date. For candidates marked INDEPENDENT CORROBORATION REQUIRED, "
+          "you MUST search beyond the original website/domain and evidence_url MUST be on a different domain; if no "
+          "independent corroborating source can be found, set current_open=false. Specifically search the exact title + "
+          "employer + deadline/closing date so contradictory copies are not missed. Never invent or estimate a deadline. For a role outside Malawi, "
           "set malawi_eligible=true only when current evidence explicitly says applicants in Malawi, Africa, worldwide, "
           "or an equivalent global-remote population are eligible; a generic 'remote' label is not enough.\n\n"
           "Return JSON ONLY with exactly this structure:\n"
@@ -12043,6 +12100,21 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
                 evidence_url = _normalize_candidate_url(evidence_url)
             except Exception:
                 evidence_url = ""
+
+        origin_url = str(item.get("_origin_application_url") or item.get("application_url") or "").strip()
+        if item.get("_requires_independent_corroboration"):
+            # A third-party vacancy board cannot corroborate itself. The second check must
+            # come from a different host (preferably the employer/ATS, otherwise another
+            # credible source). Fail closed when search only points back to the same site.
+            if not evidence_url or _career_same_host(origin_url, evidence_url):
+                stats["unverified"] += 1
+                print(
+                    f"CAREER ASSIST SECONDARY REJECTED NO INDEPENDENT SOURCE: "
+                    f"title={item.get('title')} origin={_career_url_host(origin_url)}",
+                    flush=True,
+                )
+                continue
+
         verification_url = evidence_url or row_url or str(item.get("application_url") or "")
         if not verification_url:
             stats["unverified"] += 1
@@ -12234,6 +12306,19 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
             item["deadline_display"] = direct_deadline.strftime("%d %B %Y")
             item["open_evidence"] = f"Direct vacancy page explicitly states deadline {item['deadline_display']}."
             item["application_url"] = final_url
+            if _career_is_third_party_job_source(final_url):
+                # Aggregators can disagree about closing dates. A future date on one
+                # third-party page is not enough to call the vacancy verified/current.
+                item["_requires_independent_corroboration"] = True
+                item["_origin_application_url"] = final_url
+                needs_secondary.append(item)
+                stats["needs_secondary"] += 1
+                print(
+                    f"CAREER ASSIST THIRD-PARTY DEADLINE NEEDS INDEPENDENT CHECK: "
+                    f"deadline={direct_iso} title={item.get('title')} host={_career_url_host(final_url)}",
+                    flush=True,
+                )
+                continue
             kept.append(item)
             continue
 
@@ -12242,6 +12327,17 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
             item["deadline_display"] = "No closing date verified; live page shows applications open"
             item["open_evidence"] = "Direct vacancy page shows an active application action; no closing date was verified."
             item["application_url"] = final_url
+            if _career_is_third_party_job_source(final_url):
+                item["_requires_independent_corroboration"] = True
+                item["_origin_application_url"] = final_url
+                needs_secondary.append(item)
+                stats["needs_secondary"] += 1
+                print(
+                    f"CAREER ASSIST THIRD-PARTY OPEN SIGNAL NEEDS INDEPENDENT CHECK: "
+                    f"title={item.get('title')} host={_career_url_host(final_url)}",
+                    flush=True,
+                )
+                continue
             kept.append(item)
             continue
 
@@ -12571,7 +12667,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     # rejected by the direct-page freshness gate. The SAME deterministic validator and
     # direct-page verification still apply, so this improves recall without weakening
     # stale-job protection.
-    if broad_match_request and len(all_vacancies) < 5:
+    if broad_match_request:
         try:
             ats_prompt = (
                 f"Today is {today_label}. OFFICIAL ATS RECALL SEARCH for an active Career Assist customer.\n"
@@ -12646,6 +12742,81 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         except Exception as error:
             print(
                 f"CAREER ASSIST OFFICIAL ATS RECALL FAILED: {type(error).__name__}",
+                flush=True,
+            )
+
+    # If discovery still contains fewer than two direct ATS candidates, run one
+    # tightly scoped rescue pass. This avoids losing legitimate Malawi ATS vacancies
+    # behind better-indexed aggregator results. The normal deterministic verification
+    # gates still apply afterwards.
+    trusted_ats_count = sum(
+        1 for item in list(all_vacancies or [])
+        if _career_is_trusted_ats_source(item.get("application_url"))
+    )
+    if broad_match_request and trusted_ats_count < 2:
+        try:
+            priority_ats_prompt = (
+                f"Today is {today_label}. PRIORITY MALAWI ATS RESCUE SEARCH.\n"
+                f"Customer request: {request_text}\n"
+                + candidate_block
+                + "\n\nRun these direct-source searches separately rather than as one generic query: "
+                "site:jobs.ashbyhq.com Malawi; site:jobs.ashbyhq.com Lilongwe; "
+                "site:boards.greenhouse.io Malawi; site:job-boards.greenhouse.io Malawi; "
+                "site:jobs.lever.co Malawi; site:myworkdayjobs.com Malawi; "
+                "site:careers.smartrecruiters.com Malawi; site:jobs.workable.com Malawi. "
+                "From those DIRECT ATS pages, return current roles relevant to Business Intelligence, data analysis, "
+                "reporting/MIS, information management, business analysis, IT/business systems, digital solutions, "
+                "IT-supported administration, or media/digital work. Malawi or Lilongwe must be stated in the vacancy. "
+                "Do not use aggregator pages in this rescue pass. Do not invent a deadline: use an ISO date only when "
+                "the exact ATS page states one; otherwise leave deadline_iso empty and require a live application action. "
+                "Do not reject a role because of an optional/nice-to-have skill absent from the CV; reject only clear "
+                "core-requirement conflicts.\n\nReturn JSON ONLY with exactly this structure:\n"
+                '{"vacancies":[{"title":"...","employer":"...","location":"...",'
+                '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
+                '"current_open":true,"open_evidence":"specific current live ATS evidence",'
+                '"application_url":"https://...","match_reason":"brief CV-based reason including any gap"}],'
+                '"search_note":"brief note"}\n'
+                "Return up to 5 direct ATS candidates only."
+            )
+            priority_response = fast_client.responses.create(
+                model=CAREER_SEARCH_RESPONSES_MODEL,
+                store=False,
+                tools=[{
+                    "type": "web_search",
+                    "search_context_size": "medium",
+                    "external_web_access": True,
+                }],
+                tool_choice="required",
+                include=["web_search_call.action.sources"],
+                max_output_tokens=1800,
+                input=priority_ats_prompt,
+            )
+            priority_raw = str(priority_response.output_text or "").strip()
+            priority_urls = _extract_hosted_search_source_urls(priority_response)
+            priority_vacancies, stats = _validate_career_search_payload(priority_raw, today)
+            # Enforce the purpose of this pass: only trusted direct ATS URLs survive.
+            priority_vacancies = [
+                item for item in priority_vacancies
+                if _career_is_trusted_ats_source(item.get("application_url"))
+            ]
+            add_stats(stats)
+            for url in priority_urls:
+                if url not in source_urls:
+                    source_urls.append(url)
+            for item in priority_vacancies:
+                url = item.get("application_url")
+                if url and url not in source_urls:
+                    source_urls.insert(0, url)
+            all_vacancies = _merge_validated_vacancies(priority_vacancies, all_vacancies, limit=8)
+            print(
+                f"CAREER ASSIST PRIORITY ATS RESCUE: model={CAREER_SEARCH_RESPONSES_MODEL} "
+                f"sources={len(priority_urls)} validated={len(priority_vacancies)} cumulative={len(all_vacancies)}",
+                flush=True,
+            )
+            search_paths.append(f"priority-ats:{CAREER_SEARCH_RESPONSES_MODEL}")
+        except Exception as error:
+            print(
+                f"CAREER ASSIST PRIORITY ATS RESCUE FAILED: {type(error).__name__}",
                 flush=True,
             )
 
