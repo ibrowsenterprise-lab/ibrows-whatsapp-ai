@@ -11687,9 +11687,25 @@ def _validate_career_search_payload(raw_text, today_date):
         except Exception:
             stats["missing_evidence"] += 1
             continue
+        trusted_ats_source = _career_is_trusted_ats_source(application_url)
+        evidence_lower = open_evidence.lower()
+        explicit_closed_evidence = any(marker in evidence_lower for marker in (
+            "no longer accepting", "applications closed", "applications are closed",
+            "job closed", "vacancy closed", "job expired", "has expired",
+            "deadline has passed", "position has been filled",
+        ))
         if not current_open:
-            stats["not_open"] += 1
-            continue
+            # Discovery models are sometimes conservative on JavaScript-heavy ATS pages
+            # (especially Ashby) even when the exact live job page is present. Keep a
+            # trusted ATS page in the candidate pool unless the discovery evidence
+            # explicitly says it is closed/expired. The final live-page/secondary gate
+            # still decides whether it can ever reach the customer.
+            if not trusted_ats_source or explicit_closed_evidence:
+                stats["not_open"] += 1
+                continue
+            current_open = True
+            if not open_evidence:
+                open_evidence = "Trusted ATS discovery candidate; final live verification required."
 
         deadline_date = None
         if deadline_iso:
@@ -11723,8 +11739,17 @@ def _validate_career_search_payload(raw_text, today_date):
                 "submit application", "applications being accepted",
             ))
             if not affirmative:
-                stats["missing_evidence"] += 1
-                continue
+                if trusted_ats_source:
+                    # For discovery only, an exact trusted ATS job URL may proceed to
+                    # the stronger direct/secondary verification stage even when the
+                    # search model did not phrase its evidence using one of our marker
+                    # strings. This never exposes the role directly to the customer.
+                    deadline_display = "No closing date verified; direct ATS candidate pending live-page verification"
+                    if not open_evidence:
+                        open_evidence = "Trusted ATS discovery candidate pending direct verification."
+                else:
+                    stats["missing_evidence"] += 1
+                    continue
 
             # For live listings with no verified closing date, discard the model's
             # free-form deadline_display completely. It may contain speculative dates.
@@ -11751,7 +11776,7 @@ def _validate_career_search_payload(raw_text, today_date):
             "match_reason": match_reason[:700],
         })
         stats["accepted"] += 1
-        if len(accepted) >= 5:
+        if len(accepted) >= 8:
             break
     return accepted, stats
 
@@ -11899,6 +11924,18 @@ def _career_scope_is_eligible(item, page_text=""):
     if any(marker in location for marker in malawi_markers):
         return True
 
+    # Some ATS records use a primary/administrative location even though the vacancy
+    # text explicitly offers Lilongwe/Malawi as an alternative work location. Require
+    # role-specific phrasing rather than accepting any incidental mention of Malawi.
+    malawi_role_phrases = (
+        "based in malawi", "based in lilongwe", "location: malawi", "location malawi",
+        "work in malawi", "position in malawi", "role in malawi", "malawi-based",
+        "or lilongwe, malawi", "or lilongwe malawi", "lilongwe, malawi or",
+        "lilongwe malawi or", "malawi as a work location",
+    )
+    if any(phrase in page for phrase in malawi_role_phrases):
+        return True
+
     combined = f"{location}\n{page}"
     remote_signal = any(marker in combined for marker in (
         "remote", "work from anywhere", "work anywhere", "distributed team",
@@ -11959,6 +11996,37 @@ def _career_same_host(url_a, url_b):
     a = _career_url_host(url_a)
     b = _career_url_host(url_b)
     return bool(a and b and a == b)
+
+
+def _trusted_ats_page_has_live_job_signal(item, url, page_text):
+    """Recognize a live exact-job page on trusted ATS hosts without trusting a deadline.
+
+    Several ATS products are JavaScript-heavy. A plain HTTP fetch can still expose the
+    job identity but omit the rendered Apply button. For trusted ATS hosts only, an exact
+    job page may be treated as current when it clearly identifies the vacancy and exposes
+    application/job-page structure, provided no closure marker is present. Final customer
+    output still carries no invented deadline.
+    """
+    if not _career_is_trusted_ats_source(url):
+        return False
+    text = str(page_text or "")
+    lower = text.lower()
+    if not text or not _page_mentions_candidate_identity(item, text):
+        return False
+    if any(marker in lower for marker in (
+        "no longer accepting applications", "applications are closed",
+        "applications closed", "vacancy closed", "job closed",
+        "this job has expired", "job has expired", "position has been filled",
+        "job is no longer available", "position is no longer available",
+    )):
+        return False
+    compact = re.sub(r"\s+", " ", lower)
+    structural_markers = (
+        "overview application", "application form", "apply for this job",
+        "submit application", "submit your application", "application questions",
+        "resume", "cover letter", "first name", "last name",
+    )
+    return any(marker in compact for marker in structural_markers)
 
 
 def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_scope=False):
@@ -12322,10 +12390,17 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
             kept.append(item)
             continue
 
-        if _page_has_active_application_signal(page_text):
+        if _page_has_active_application_signal(page_text) or _trusted_ats_page_has_live_job_signal(item, final_url, page_text):
             item["deadline_iso"] = ""
             item["deadline_display"] = "No closing date verified; live page shows applications open"
-            item["open_evidence"] = "Direct vacancy page shows an active application action; no closing date was verified."
+            if _trusted_ats_page_has_live_job_signal(item, final_url, page_text) and not _page_has_active_application_signal(page_text):
+                item["open_evidence"] = "Trusted ATS exact-job page shows live application structure; no closing date was verified."
+                print(
+                    f"CAREER ASSIST TRUSTED ATS LIVE STRUCTURE: title={item.get('title')} host={_career_url_host(final_url)}",
+                    flush=True,
+                )
+            else:
+                item["open_evidence"] = "Direct vacancy page shows an active application action; no closing date was verified."
             item["application_url"] = final_url
             if _career_is_third_party_job_source(final_url):
                 item["_requires_independent_corroboration"] = True
@@ -12517,9 +12592,12 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 "business analysis/project delivery, IT/business systems support, digital solutions, IT-supported administration "
                 "or media/digital support. Do not reject a role merely because an optional/nice-to-have skill is not in the CV; "
                 "exclude it only when a CORE mandatory requirement clearly conflicts with the supplied candidate evidence. "
-                "Freshness is mandatory. If a deadline is stated and is before today, omit the role. If there is no deadline, "
-                "current_open=true only when the live direct page shows an active application state. Prefer exact job/application "
-                "pages over search-result pages and aggregators. Do not invent deadlines, requirements, locations or URLs.\n\n"
+                "Freshness is mandatory. If a deadline is stated and is before today, omit the role. For an exact DIRECT ATS "
+                "job page with no stated deadline, do not discard it merely because the site is JavaScript-heavy: if the search "
+                "result clearly identifies the job and there is no closed/expired notice, return it as a discovery candidate with "
+                "deadline_iso empty. Use current_open=true when an Application/Apply section or current job-page structure is visible. "
+                "The server performs a stricter final verification before customer exposure. Prefer exact job/application pages over "
+                "search-result pages and aggregators. Do not invent deadlines, requirements, locations or URLs.\n\n"
                 "Return JSON ONLY with exactly this structure:\n"
                 '{"vacancies":[{"title":"...","employer":"...","location":"...",'
                 '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
@@ -12558,7 +12636,8 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
             print(
                 f"CAREER ASSIST MALAWI ATS SWEEP: model={CAREER_SEARCH_RESPONSES_MODEL} "
                 f"sources={len(malawi_ats_urls)} validated={len(malawi_ats_vacancies)} "
-                f"cumulative={len(all_vacancies)}",
+                f"seen={stats.get('seen', 0)} not_open={stats.get('not_open', 0)} "
+                f"missing_evidence={stats.get('missing_evidence', 0)} cumulative={len(all_vacancies)}",
                 flush=True,
             )
             search_paths.append(f"malawi-ats:{CAREER_SEARCH_RESPONSES_MODEL}")
@@ -12759,8 +12838,8 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 f"Today is {today_label}. PRIORITY MALAWI ATS RESCUE SEARCH.\n"
                 f"Customer request: {request_text}\n"
                 + candidate_block
-                + "\n\nRun these direct-source searches separately rather than as one generic query: "
-                "site:jobs.ashbyhq.com Malawi; site:jobs.ashbyhq.com Lilongwe; "
+                + "\n\nASHBY FIRST: execute site:jobs.ashbyhq.com Malawi and site:jobs.ashbyhq.com Lilongwe as the first two "
+                "searches and inspect their exact job pages before checking other ATS platforms. Then search: "
                 "site:boards.greenhouse.io Malawi; site:job-boards.greenhouse.io Malawi; "
                 "site:jobs.lever.co Malawi; site:myworkdayjobs.com Malawi; "
                 "site:careers.smartrecruiters.com Malawi; site:jobs.workable.com Malawi. "
@@ -12768,8 +12847,10 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 "reporting/MIS, information management, business analysis, IT/business systems, digital solutions, "
                 "IT-supported administration, or media/digital work. Malawi or Lilongwe must be stated in the vacancy. "
                 "Do not use aggregator pages in this rescue pass. Do not invent a deadline: use an ISO date only when "
-                "the exact ATS page states one; otherwise leave deadline_iso empty and require a live application action. "
-                "Do not reject a role because of an optional/nice-to-have skill absent from the CV; reject only clear "
+                "the exact ATS page states one; otherwise leave deadline_iso empty. JavaScript-heavy ATS pages may still be "
+                "returned as discovery candidates when the exact job page is indexed, identifies the vacancy, and has no "
+                "closed/expired notice; the server will perform final live verification. Do not reject a role because of an "
+                "optional/nice-to-have skill absent from the CV; reject only clear "
                 "core-requirement conflicts.\n\nReturn JSON ONLY with exactly this structure:\n"
                 '{"vacancies":[{"title":"...","employer":"...","location":"...",'
                 '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
@@ -12810,7 +12891,9 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
             all_vacancies = _merge_validated_vacancies(priority_vacancies, all_vacancies, limit=8)
             print(
                 f"CAREER ASSIST PRIORITY ATS RESCUE: model={CAREER_SEARCH_RESPONSES_MODEL} "
-                f"sources={len(priority_urls)} validated={len(priority_vacancies)} cumulative={len(all_vacancies)}",
+                f"sources={len(priority_urls)} validated={len(priority_vacancies)} "
+                f"seen={stats.get('seen', 0)} not_open={stats.get('not_open', 0)} "
+                f"missing_evidence={stats.get('missing_evidence', 0)} cumulative={len(all_vacancies)}",
                 flush=True,
             )
             search_paths.append(f"priority-ats:{CAREER_SEARCH_RESPONSES_MODEL}")
