@@ -5218,14 +5218,46 @@ def detect_career_assist_vacancy_search_request(customer_message):
 
     discovery_markers = (
         "find me", "find jobs", "find vacancies", "find opportunities",
+        "find for me", "you find for me", "find and apply", "search and apply",
         "search for", "search jobs", "search vacancies", "look for",
         "show me jobs", "show me vacancies", "current jobs", "current vacancies",
         "open jobs", "open vacancies", "job openings", "available jobs",
         "available vacancies", "jobs in", "vacancies in", "opportunities in",
         "remote jobs", "remote roles", "roles in",
+        "next verified", "next suitable", "next strong fit", "next matching",
     )
     job_markers = ("job", "jobs", "vacancy", "vacancies", "role", "roles", "opportunit")
     return any(marker in text for marker in discovery_markers) and any(marker in text for marker in job_markers)
+
+
+def detect_career_assist_future_vacancy_apply_request(customer_message):
+    """Detect a find-then-apply request for a vacancy that is not identified yet.
+
+    Discovery happens first. After standing consent is revoked, this wording must not
+    silently restore standing authority or fall into the standalone MK2,000 payment gate.
+    """
+    text = " ".join(str(customer_message or "").lower().split())
+    if not text:
+        return False
+    if (
+        detect_career_assist_standing_consent_grant(customer_message)
+        or detect_career_assist_standing_consent_revoke(customer_message)
+    ):
+        return False
+    apply_intent = any(marker in text for marker in (
+        "apply for", "apply to", "submit an application", "submit applications",
+        "apply on my behalf", "application for",
+    ))
+    future_target = any(marker in text for marker in (
+        "next verified", "next suitable", "next strong fit", "next matching",
+        "next vacancy", "next job", "next role", "you find for me",
+        "find for me", "find and apply", "search and apply",
+    ))
+    job_target = any(marker in text for marker in (
+        "job", "vacancy", "role", "position", "data analyst",
+        "business intelligence", "it/business systems", "digital solutions",
+    ))
+    return apply_intent and future_target and job_target
 
 
 def detect_single_job_application_request(customer_message):
@@ -15133,6 +15165,34 @@ def generate_ai_reply(
                 print("CANDIDATE ELIGIBILITY SCREENING CONTEXT ENRICHED", flush=True)
 
         payment_context = build_verified_payment_context(customer_number)
+        if detect_career_assist_future_vacancy_apply_request(customer_message):
+            try:
+                standing_state = get_career_assist_standing_consent(customer_number)
+                standing_label = standing_state.get("event_type") or "NONE"
+                standing_effective = bool(standing_state.get("effective"))
+            except Exception as consent_state_error:
+                standing_label = "UNKNOWN"
+                standing_effective = False
+                print(
+                    f"CAREER ASSIST FUTURE-APPLY CONSENT STATE ERROR: {type(consent_state_error).__name__}",
+                    flush=True,
+                )
+            if not standing_effective:
+                payment_context.append({
+                    "role": "user",
+                    "content": (
+                        "INTERNAL CAREER ASSIST CONSENT ENFORCEMENT. The customer's latest message asks to find "
+                        "and apply for a future/not-yet-identified vacancy. Current standing application authority is "
+                        f"{standing_label} and is NOT effective. Treat this message as vacancy discovery first. Do not "
+                        "restore standing consent, do not submit, and do not route to the MK2,000 Single Job Application "
+                        "service while Career Assist is active. After a specific verified vacancy is identified, ask for "
+                        "fresh authorization naming that exact vacancy before any submission step."
+                    ),
+                })
+                print(
+                    f"CAREER ASSIST FUTURE-APPLY CONSENT ENFORCED: standing={standing_label}",
+                    flush=True,
+                )
         prior_conversation = get_recent_conversation(customer_number, limit=11)
         active_career_search = False
         active_career_application = False
@@ -15582,6 +15642,13 @@ CAREER APPLICATION INTEGRITY AND CONSENT
   outstanding unless a valid standing-submission instruction already covers that vacancy.
 - The newest clear customer instruction overrides an older conflicting standing instruction for future
   actions. A customer's revocation of automatic-submission consent takes effect immediately.
+- IMPORTANT AFTER REVOCATION: revoking standing application authority does NOT cancel active Career Assist
+  vacancy discovery or application-preparation support and does NOT create a new MK2,000 payment obligation.
+  If a customer whose standing authority is REVOKED says "apply for the next job/vacancy you find" or gives
+  similar permission before the exact vacancy is identified, treat that as a find-and-recommend request first,
+  NOT as restoration of standing consent and NOT as specific-vacancy submission authorization. Search for and
+  show the verified vacancy, then require fresh authorization that identifies that exact vacancy before any
+  submission step. Only an explicit new standing-consent grant may restore standing authority.
 - Do not claim IBROWS submitted an application unless the system explicitly confirms submission.
 - Do not assist with bribery, concealed payments, forged credentials, fraudulent recruitment claims,
   or hiding evidence of misconduct. Redirect to legitimate recruitment channels.
