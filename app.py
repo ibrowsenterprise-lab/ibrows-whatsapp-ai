@@ -727,11 +727,21 @@ def init_database():
                     location TEXT,
                     application_url TEXT NOT NULL,
                     match_reason TEXT,
+                    fit_strength TEXT,
+                    fit_gaps TEXT,
                     source_host TEXT,
                     first_verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     last_verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     UNIQUE(customer_number, application_url)
                 )
+            """)
+            cur.execute("""
+                ALTER TABLE career_verified_vacancies
+                ADD COLUMN IF NOT EXISTS fit_strength TEXT
+            """)
+            cur.execute("""
+                ALTER TABLE career_verified_vacancies
+                ADD COLUMN IF NOT EXISTS fit_gaps TEXT
             """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_career_verified_vacancies_customer
@@ -11774,6 +11784,85 @@ def _clean_search_json_text(raw_text):
     return text
 
 
+_CAREER_FIT_STRONG = "Strong fit"
+_CAREER_FIT_PARTIAL = "Reasonable fit with gaps"
+_CAREER_FIT_INSUFFICIENT = "Not enough evidence to recommend"
+
+
+def _career_fit_gaps_text(value):
+    if isinstance(value, (list, tuple)):
+        parts = [str(x or "").strip() for x in value]
+        return "; ".join(x for x in parts if x)[:900]
+    return str(value or "").strip()[:900]
+
+
+def _normalize_career_fit_assessment(fit_strength, match_reason="", fit_gaps=""):
+    """Normalize CV-fit labels without inventing candidate capabilities.
+
+    Search models may vary their wording. Server-side normalization keeps customer output
+    consistent and deliberately downgrades a claimed Strong fit whenever the supplied
+    match note/gap field itself acknowledges a material or unclear requirement.
+    """
+    raw = str(fit_strength or "").strip().lower()
+    reason = str(match_reason or "").strip()
+    gaps = _career_fit_gaps_text(fit_gaps)
+    evidence_text = f"{reason} {gaps}".lower()
+
+    insufficient_markers = (
+        "not enough evidence", "insufficient evidence", "core requirement is not met",
+        "core requirements are not met", "does not meet the core",
+        "clearly requires experience not evidenced", "major mandatory requirement not",
+    )
+    gap_markers = (
+        "not clearly evidenced", "not clearly evidence", "not evidenced",
+        "not confirmed", "not in the cv", "not stated in the cv", "unclear",
+        "important gap", "material gap", "skills gap", "experience gap",
+        "review the full advert", "does not clearly show", "not demonstrated",
+        "not verified in the cv", "not supported by the cv",
+    )
+
+    if raw in {
+        _CAREER_FIT_INSUFFICIENT.lower(), "insufficient", "not enough evidence",
+        "not enough evidence to recommend", "weak fit",
+    } or any(marker in evidence_text for marker in insufficient_markers):
+        normalized = _CAREER_FIT_INSUFFICIENT
+    elif raw in {
+        _CAREER_FIT_PARTIAL.lower(), "partial fit", "reasonable fit",
+        "reasonable fit with gaps", "fit with gaps",
+    }:
+        normalized = _CAREER_FIT_PARTIAL
+    elif raw in {_CAREER_FIT_STRONG.lower(), "strong", "strong match"}:
+        normalized = _CAREER_FIT_STRONG
+    elif gaps or any(marker in evidence_text for marker in gap_markers):
+        normalized = _CAREER_FIT_PARTIAL
+    elif reason:
+        normalized = _CAREER_FIT_STRONG
+    else:
+        # Missing comparison evidence must never become a Strong fit by default.
+        normalized = _CAREER_FIT_PARTIAL
+
+    # A model cannot call a role Strong while simultaneously flagging a material gap.
+    if normalized == _CAREER_FIT_STRONG and (gaps or any(marker in evidence_text for marker in gap_markers)):
+        normalized = _CAREER_FIT_PARTIAL
+
+    if normalized == _CAREER_FIT_PARTIAL and not gaps:
+        gaps = reason[:900] if reason else "One or more relevant requirements are not clearly evidenced in the verified CV."
+    if normalized == _CAREER_FIT_STRONG:
+        gaps = ""
+    return normalized, gaps
+
+
+def _career_fit_rank(item):
+    strength, _ = _normalize_career_fit_assessment(
+        item.get("fit_strength"), item.get("match_reason"), item.get("fit_gaps")
+    )
+    return {
+        _CAREER_FIT_STRONG: 0,
+        _CAREER_FIT_PARTIAL: 1,
+        _CAREER_FIT_INSUFFICIENT: 2,
+    }.get(strength, 2)
+
+
 def _validate_career_search_payload(raw_text, today_date):
     """Parse and deterministically reject stale/unsafe vacancy records.
 
@@ -11789,6 +11878,7 @@ def _validate_career_search_payload(raw_text, today_date):
         "invalid_deadline": 0,
         "not_open": 0,
         "missing_evidence": 0,
+        "fit_rejected": 0,
         "malformed": 0,
     }
     try:
@@ -11813,6 +11903,12 @@ def _validate_career_search_payload(raw_text, today_date):
         location = str(item.get("location") or "").strip()
         application_url = str(item.get("application_url") or "").strip()
         match_reason = str(item.get("match_reason") or "").strip()
+        fit_strength, fit_gaps = _normalize_career_fit_assessment(
+            item.get("fit_strength"), match_reason, item.get("fit_gaps")
+        )
+        if fit_strength == _CAREER_FIT_INSUFFICIENT:
+            stats["fit_rejected"] += 1
+            continue
         open_evidence = str(item.get("open_evidence") or "").strip()
         deadline_display = str(item.get("deadline_display") or "").strip()
         deadline_iso_raw = item.get("deadline_iso")
@@ -11914,6 +12010,8 @@ def _validate_career_search_payload(raw_text, today_date):
             "open_evidence": open_evidence[:500],
             "application_url": application_url,
             "match_reason": match_reason[:700],
+            "fit_strength": fit_strength,
+            "fit_gaps": fit_gaps[:900],
         })
         stats["accepted"] += 1
         if len(accepted) >= 8:
@@ -12195,7 +12293,7 @@ def _parse_trusted_ats_seed_from_reply(content, url):
     if line_index < 0:
         return None
 
-    title = employer = location = match_reason = ""
+    title = employer = location = match_reason = fit_strength = fit_gaps = ""
     start = max(0, line_index - 14)
     for i in range(line_index - 1, start - 1, -1):
         line = lines[i].strip()
@@ -12211,8 +12309,18 @@ def _parse_trusted_ats_seed_from_reply(content, url):
             if m:
                 location = m.group(1).strip()
                 continue
+        if not fit_strength:
+            m = re.match(r"(?i)^fit(?: strength)?\s*:\s*(.+)$", line)
+            if m:
+                fit_strength = m.group(1).strip()
+                continue
+        if not fit_gaps:
+            m = re.match(r"(?i)^(?:gaps?|evidence gaps?)\s*:\s*(.+)$", line)
+            if m:
+                fit_gaps = m.group(1).strip()
+                continue
         if not match_reason:
-            m = re.match(r"(?i)^(?:why it fits|cv match(?: note)?)\s*:\s*(.+)$", line)
+            m = re.match(r"(?i)^(?:why it fits|why it matches|cv match(?: note)?)\s*:\s*(.+)$", line)
             if m:
                 match_reason = m.group(1).strip()
                 continue
@@ -12228,6 +12336,7 @@ def _parse_trusted_ats_seed_from_reply(content, url):
 
     if not title or not employer:
         return None
+    fit_strength, fit_gaps = _normalize_career_fit_assessment(fit_strength, match_reason, fit_gaps)
     return {
         "title": title[:180],
         "employer": employer[:180],
@@ -12238,6 +12347,8 @@ def _parse_trusted_ats_seed_from_reply(content, url):
         "open_evidence": "Previously verified direct ATS URL queued for fresh live revalidation; cached reply is not status evidence.",
         "application_url": str(url),
         "match_reason": match_reason[:700],
+        "fit_strength": fit_strength,
+        "fit_gaps": fit_gaps[:900],
         "_revalidation_seed": True,
     }
 
@@ -12260,7 +12371,7 @@ def _load_recent_verified_vacancy_seeds(customer_number, request_text, limit=4):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT title, employer, location, application_url, match_reason
+                    SELECT title, employer, location, application_url, match_reason, fit_strength, fit_gaps
                     FROM career_verified_vacancies
                     WHERE customer_number=%s
                       AND last_verified_at >= NOW() - INTERVAL '30 days'
@@ -12270,10 +12381,13 @@ def _load_recent_verified_vacancy_seeds(customer_number, request_text, limit=4):
                     (customer_number,),
                 )
                 rows = cur.fetchall()
-        for title, employer, location, application_url, match_reason in rows:
+        for title, employer, location, application_url, match_reason, fit_strength, fit_gaps in rows:
             url = str(application_url or "").strip()
             if not url or not _career_is_trusted_ats_source(url) or not _trusted_ats_exact_job_url(url):
                 continue
+            normalized_fit, normalized_gaps = _normalize_career_fit_assessment(
+                fit_strength, match_reason, fit_gaps
+            )
             item = {
                 "title": str(title or "")[:180],
                 "employer": str(employer or "")[:180],
@@ -12284,6 +12398,8 @@ def _load_recent_verified_vacancy_seeds(customer_number, request_text, limit=4):
                 "open_evidence": "Previously verified direct ATS URL queued for fresh live revalidation; cache is not status evidence.",
                 "application_url": url,
                 "match_reason": str(match_reason or "")[:700],
+                "fit_strength": normalized_fit,
+                "fit_gaps": normalized_gaps[:900],
                 "_revalidation_seed": True,
             }
             if _career_seed_matches_request(item, request_text):
@@ -12342,6 +12458,11 @@ def _store_verified_vacancy_seeds(customer_number, vacancies):
         url = str(item.get("application_url") or "").strip()
         if not url or not _career_is_trusted_ats_source(url) or not _trusted_ats_exact_job_url(url):
             continue
+        fit_strength, fit_gaps = _normalize_career_fit_assessment(
+            item.get("fit_strength"), item.get("match_reason"), item.get("fit_gaps")
+        )
+        if fit_strength == _CAREER_FIT_INSUFFICIENT:
+            continue
         rows.append((
             customer_number,
             str(item.get("title") or "")[:180],
@@ -12349,6 +12470,8 @@ def _store_verified_vacancy_seeds(customer_number, vacancies):
             str(item.get("location") or "")[:180],
             url,
             str(item.get("match_reason") or "")[:700],
+            fit_strength,
+            fit_gaps[:900],
             _career_url_host(url),
         ))
     if not rows:
@@ -12360,14 +12483,16 @@ def _store_verified_vacancy_seeds(customer_number, vacancies):
                     cur.execute(
                         """
                         INSERT INTO career_verified_vacancies
-                            (customer_number, title, employer, location, application_url, match_reason, source_host)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s)
+                            (customer_number, title, employer, location, application_url, match_reason, fit_strength, fit_gaps, source_host)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         ON CONFLICT (customer_number, application_url)
                         DO UPDATE SET
                             title=EXCLUDED.title,
                             employer=EXCLUDED.employer,
                             location=EXCLUDED.location,
                             match_reason=EXCLUDED.match_reason,
+                            fit_strength=EXCLUDED.fit_strength,
+                            fit_gaps=EXCLUDED.fit_gaps,
                             source_host=EXCLUDED.source_host,
                             last_verified_at=NOW()
                         """,
@@ -13116,12 +13241,17 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         "Do not use any vacancy from prior conversation memory. Do not invent titles, employers, dates, "
         "requirements, salaries or URLs. Aim for up to five good-fit roles when the request asks for several. "
         "Match against the candidate evidence when supplied and avoid roles whose core mandatory requirements "
-        "clearly conflict with that evidence.\n\n"
+        "clearly conflict with that evidence. Classify CV fit conservatively: fit_strength must be exactly Strong fit, "
+        "Reasonable fit with gaps, or Not enough evidence to recommend. Use Strong fit only when the supplied CV "
+        "supports the role's core requirements with no material gap identified. Use Reasonable fit with gaps when the "
+        "role is relevant but one or more material requirements are missing or unclear in the CV. Use Not enough evidence "
+        "to recommend when major core requirements are unsupported. Put the concrete unsupported/unclear requirements in "
+        "fit_gaps and never infer a skill merely because it is adjacent to a confirmed skill.\n\n"
         "Return JSON ONLY, with exactly this top-level structure:\n"
         '{"vacancies":[{"title":"...","employer":"...","location":"...",'
         '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
         '"current_open":true,"open_evidence":"specific live evidence that it is open",'
-        '"application_url":"https://...","match_reason":"brief CV-based reason"}],'
+        '"application_url":"https://...","match_reason":"brief CV-based reason","fit_strength":"Strong fit | Reasonable fit with gaps | Not enough evidence to recommend","fit_gaps":"material CV-evidence gaps or empty string"}],'
         '"search_note":"brief note about breadth/limitations"}\n'
         "Do not include expired, closed, removed, or unverifiable vacancies in vacancies[]."
     )
@@ -13151,7 +13281,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         search_paths.append("verified-ats-revalidation")
     aggregate_stats = {
         "seen": 0, "accepted": 0, "expired": 0, "invalid_deadline": 0,
-        "not_open": 0, "missing_evidence": 0, "malformed": 0,
+        "not_open": 0, "missing_evidence": 0, "fit_rejected": 0, "malformed": 0,
     }
 
     def add_stats(stats):
@@ -13263,12 +13393,13 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 "result clearly identifies the job and there is no closed/expired notice, return it as a discovery candidate with "
                 "deadline_iso empty. Use current_open=true when an Application/Apply section or current job-page structure is visible. "
                 "The server performs a stricter final verification before customer exposure. Prefer exact job/application pages over "
-                "search-result pages and aggregators. Do not invent deadlines, requirements, locations or URLs.\n\n"
+                "search-result pages and aggregators. Do not invent deadlines, requirements, locations or URLs. Classify fit conservatively "
+                "as Strong fit, Reasonable fit with gaps, or Not enough evidence to recommend; put material CV-evidence gaps in fit_gaps.\n\n"
                 "Return JSON ONLY with exactly this structure:\n"
                 '{"vacancies":[{"title":"...","employer":"...","location":"...",'
                 '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
                 '"current_open":true,"open_evidence":"specific live evidence that it is open/current",'
-                '"application_url":"https://...","match_reason":"brief CV-based reason including any important gap"}],'
+                '"application_url":"https://...","match_reason":"brief CV-based reason including any important gap","fit_strength":"Strong fit | Reasonable fit with gaps | Not enough evidence to recommend","fit_gaps":"material CV-evidence gaps or empty string"}],'
                 '"search_note":"brief note"}\n'
                 "Return up to 5 strong direct-source candidates. Do not include expired, closed, removed or unverifiable roles."
             )
@@ -13358,12 +13489,14 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                     "active-job indicator, and the page does not say closed or no longer accepting applications. "
                     "If a deadline is stated, compare it with today and omit the role when it has passed. Do not "
                     "invent deadlines or requirements. Match against the supplied candidate evidence and avoid roles "
-                    "whose core mandatory requirements clearly conflict with it.\n\n"
+                    "whose core mandatory requirements clearly conflict with it. Set fit_strength conservatively to Strong fit, "
+                    "Reasonable fit with gaps, or Not enough evidence to recommend, and list unsupported/unclear requirements in fit_gaps. "
+                    "Never infer an unstated skill.\n\n"
                     "Return JSON ONLY with exactly this structure:\n"
                     '{"vacancies":[{"title":"...","employer":"...","location":"...",'
                     '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
                     '"current_open":true,"open_evidence":"specific live evidence that it is open/current",'
-                    '"application_url":"https://...","match_reason":"brief CV-based reason"}],'
+                    '"application_url":"https://...","match_reason":"brief CV-based reason","fit_strength":"Strong fit | Reasonable fit with gaps | Not enough evidence to recommend","fit_gaps":"material CV-evidence gaps or empty string"}],'
                     '"search_note":"brief note"}\n'
                     "Do not include expired, closed, removed or unverifiable vacancies."
                 )
@@ -13432,12 +13565,13 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 "If there is no deadline, current_open=true only when the official ATS/application page or "
                 "current employer careers page clearly shows the role is accepting applications. Do not "
                 "invent deadlines, requirements, locations or eligibility. Match only against the supplied "
-                "candidate evidence and do not strengthen missing skills.\n\n"
+                "candidate evidence and do not strengthen missing skills. Set fit_strength conservatively to Strong fit, "
+                "Reasonable fit with gaps, or Not enough evidence to recommend; fit_gaps must name material unsupported/unclear requirements.\n\n"
                 "Return JSON ONLY with exactly this structure:\n"
                 '{"vacancies":[{"title":"...","employer":"...","location":"...",'
                 '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
                 '"current_open":true,"open_evidence":"specific live evidence that it is open/current",'
-                '"application_url":"https://...","match_reason":"brief CV-based reason"}],'
+                '"application_url":"https://...","match_reason":"brief CV-based reason","fit_strength":"Strong fit | Reasonable fit with gaps | Not enough evidence to recommend","fit_gaps":"material CV-evidence gaps or empty string"}],'
                 '"search_note":"brief note"}\n'
                 "Do not include expired, closed, removed or unverifiable vacancies."
             )
@@ -13518,11 +13652,12 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 "returned as discovery candidates when the exact job page is indexed, identifies the vacancy, and has no "
                 "closed/expired notice; the server will perform final live verification. Do not reject a role because of an "
                 "optional/nice-to-have skill absent from the CV; reject only clear "
-                "core-requirement conflicts.\n\nReturn JSON ONLY with exactly this structure:\n"
+                "core-requirement conflicts. Classify fit conservatively as Strong fit, Reasonable fit with gaps, or Not enough evidence "
+                "to recommend; name material unsupported/unclear requirements in fit_gaps and never infer missing skills.\n\nReturn JSON ONLY with exactly this structure:\n"
                 '{"vacancies":[{"title":"...","employer":"...","location":"...",'
                 '"deadline_iso":"YYYY-MM-DD or empty string","deadline_display":"...",'
                 '"current_open":true,"open_evidence":"specific current live ATS evidence",'
-                '"application_url":"https://...","match_reason":"brief CV-based reason including any gap"}],'
+                '"application_url":"https://...","match_reason":"brief CV-based reason including any gap","fit_strength":"Strong fit | Reasonable fit with gaps | Not enough evidence to recommend","fit_gaps":"material CV-evidence gaps or empty string"}],'
                 '"search_note":"brief note"}\n'
                 "Return up to 5 direct ATS candidates only."
             )
@@ -13592,7 +13727,29 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     for url in secondary_urls:
         if url and url not in source_urls:
             source_urls.append(url)
-    all_vacancies = _merge_validated_vacancies(direct_kept, secondary_kept, limit=5)
+    all_vacancies = _merge_validated_vacancies(direct_kept, secondary_kept, limit=12)
+    fit_ready = []
+    final_fit_rejected = 0
+    for item in all_vacancies:
+        fit_strength, fit_gaps = _normalize_career_fit_assessment(
+            item.get("fit_strength"), item.get("match_reason"), item.get("fit_gaps")
+        )
+        item["fit_strength"] = fit_strength
+        item["fit_gaps"] = fit_gaps
+        if fit_strength == _CAREER_FIT_INSUFFICIENT:
+            final_fit_rejected += 1
+            continue
+        fit_ready.append(item)
+    fit_ready.sort(key=_career_fit_rank)
+    all_vacancies = fit_ready[:5]
+    strong_fit_count = sum(1 for item in all_vacancies if item.get("fit_strength") == _CAREER_FIT_STRONG)
+    partial_fit_count = sum(1 for item in all_vacancies if item.get("fit_strength") == _CAREER_FIT_PARTIAL)
+    print(
+        f"CAREER ASSIST FIT CLASSIFICATION: strong={strong_fit_count} "
+        f"reasonable_with_gaps={partial_fit_count} "
+        f"rejected_insufficient={aggregate_stats.get('fit_rejected', 0) + final_fit_rejected}",
+        flush=True,
+    )
     print(
         "CAREER ASSIST DIRECT PAGE FILTER: "
         f"checked={direct_page_stats['checked']} kept_direct={len(direct_kept)} "
@@ -13612,6 +13769,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         f"seen={aggregate_stats['seen']} accepted={len(all_vacancies)} "
         f"expired={aggregate_stats['expired']} invalid_deadline={aggregate_stats['invalid_deadline']} "
         f"not_open={aggregate_stats['not_open']} missing_evidence={aggregate_stats['missing_evidence']} "
+        f"fit_rejected={aggregate_stats.get('fit_rejected', 0) + final_fit_rejected} "
         f"malformed={aggregate_stats['malformed']}",
         flush=True,
     )
@@ -13647,8 +13805,10 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         f"Search date: {today_label}.",
         "Every vacancy below survived a deterministic deadline/current-open validation step. "
         "Do not add vacancies that are not listed below. This context already IS the fresh live search. "
-        "Use the Deadline/status value exactly as supplied below. Never estimate, approximate, infer, or invent "
-        "a closing date when the validated result says no closing date is stated.",
+        "Use the Deadline/status and Fit strength values exactly as supplied below. Never estimate, approximate, infer, or invent "
+        "a closing date when the validated result says no closing date is stated. For every vacancy, include a customer-facing "
+        "Fit: line using the exact supplied label. If the label is Reasonable fit with gaps, also include a Gaps: line using the "
+        "supplied evidence gaps. Never upgrade a Reasonable fit with gaps to Strong fit, and do not invent additional candidate skills.",
     ]
     for idx, item in enumerate(all_vacancies, start=1):
         deadline = item.get("deadline_display") or item.get("deadline_iso") or "No stated deadline; live-open evidence required"
@@ -13661,6 +13821,8 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
             f"Deadline/status: {deadline}",
             f"Current-open evidence: {item.get('open_evidence') or 'Validated by live search'}",
             f"Application/source URL (COPY EXACTLY; never alter any character): {item['application_url']}",
+            f"Fit strength (COPY EXACTLY): {item.get('fit_strength') or _CAREER_FIT_PARTIAL}",
+            f"Evidence gaps: {item.get('fit_gaps') or 'No material fit gap flagged by the live-search comparison.'}",
             f"CV match note: {item.get('match_reason') or 'Assess against the supplied candidate CV context.'}",
         ])
     lines.extend([
