@@ -2397,6 +2397,127 @@ def upsert_career_assist_application_record(
     return row[0] if row else None
 
 
+def get_career_assist_application_for_submission(customer_number, customer_message=""):
+    """Return one prepared Career Assist application that is safe to hand off for final submission.
+
+    Prefer an exact URL in the customer's message; otherwise use the most recently
+    updated DRAFT_READY application for this customer.
+    """
+    direct_urls = extract_public_urls_from_text(customer_message)
+    direct_url = direct_urls[0] if len(direct_urls) == 1 else ""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if direct_url:
+                cur.execute(
+                    """
+                    SELECT id, career_assist_lead_id, vacancy_title, employer,
+                           application_url, status
+                    FROM career_assist_applications
+                    WHERE customer_number=%s AND LOWER(application_url)=LOWER(%s)
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (customer_number, direct_url),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, career_assist_lead_id, vacancy_title, employer,
+                           application_url, status
+                    FROM career_assist_applications
+                    WHERE customer_number=%s
+                      AND status IN ('DRAFT_READY','NEEDS_INFO','PREPARING')
+                    ORDER BY CASE WHEN status='DRAFT_READY' THEN 0 ELSE 1 END,
+                             updated_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (customer_number,),
+                )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "career_assist_lead_id": row[1],
+        "title": str(row[2] or "").strip(),
+        "employer": str(row[3] or "").strip(),
+        "application_url": str(row[4] or "").strip(),
+        "status": str(row[5] or "").strip().upper(),
+    }
+
+
+def record_career_assist_submission_handoff(customer_number, application, customer_name=""):
+    """Record customer approval for the final employer-form submission step.
+
+    The WhatsApp/Render service does not itself operate arbitrary employer forms.
+    Keep the application DRAFT_READY until a real browser/human submission succeeds,
+    and create a visible admin note/follow-up instead of regenerating the documents.
+    """
+    if not application or application.get("status") != "DRAFT_READY":
+        raise ValueError("Career Assist application is not draft-ready")
+
+    app_id = application["id"]
+    lead_id = application.get("career_assist_lead_id")
+    title = application.get("title") or "selected vacancy"
+    employer = application.get("employer") or "employer"
+    url = application.get("application_url") or ""
+    note = (
+        f"Customer approved final submission handling for {title} at {employer}. "
+        f"Prepared drafts are approved; manual/browser employer-form submission is pending. "
+        f"Do not mark SUBMITTED until the employer confirms successful submission. URL: {url}"
+    )
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE career_assist_applications
+                SET authorization_note=%s, updated_at=NOW()
+                WHERE id=%s AND customer_number=%s AND status='DRAFT_READY'
+                """,
+                (note[:1200], app_id, customer_number),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Draft-ready application changed before handoff")
+
+            if lead_id:
+                cur.execute(
+                    "INSERT INTO lead_notes (lead_id, note_text) VALUES (%s, %s)",
+                    (lead_id, note[:1800]),
+                )
+                cur.execute(
+                    """
+                    UPDATE leads
+                    SET follow_up_at=NOW(),
+                        handover_reason=%s,
+                        updated_at=NOW()
+                    WHERE id=%s
+                    """,
+                    (
+                        f"Customer approved final employer submission for {title}; actual submission pending confirmation."[:800],
+                        lead_id,
+                    ),
+                )
+        conn.commit()
+
+    # Send an immediate admin notification when configured. This is intentionally a
+    # handoff notification, not a claim that the employer application was submitted.
+    if lead_id:
+        try:
+            send_new_lead_email(
+                lead_id=lead_id,
+                customer_name=customer_name,
+                customer_number=customer_number,
+                service="Career Assist",
+                summary=f"Submission approval received: {title} at {employer}.",
+                handover_reason="Prepared drafts approved; complete the employer application form and confirm the real submission result.",
+            )
+        except Exception as notify_error:
+            print(f"CAREER ASSIST SUBMISSION HANDOFF EMAIL ERROR: {type(notify_error).__name__}", flush=True)
+
+    return app_id
+
+
 # =========================================================
 # WHATSAPP NUMBERED SERVICE MENU
 # =========================================================
@@ -2879,6 +3000,51 @@ def detect_career_assist_preparation_request(customer_message):
         "vacancy", "job", "role", "position", "application", "cv", "cover letter",
     ))
     return prep_action and target_hint
+
+
+def detect_career_assist_submission_approval_request(customer_message):
+    """Detect explicit approval to move an already-prepared Career Assist draft to final submission handling.
+
+    This is deliberately separate from preparation detection so wording such as
+    "I reviewed the prepared CV; proceed toward submission" cannot regenerate the documents.
+    Actual employer submission is still a controlled human/browser step and must never
+    be marked SUBMITTED until a real employer confirmation exists.
+    """
+    text = " ".join(str(customer_message or "").lower().split())
+    if not text:
+        return False
+
+    # Explicit stop/hold language always wins.
+    if any(phrase in text for phrase in (
+        "do not submit", "don't submit", "dont submit",
+        "do not apply yet", "don't apply yet", "dont apply yet",
+        "hold submission", "hold the submission", "wait before submitting",
+        "stop submission", "cancel submission",
+    )):
+        return False
+
+    direct = any(phrase in text for phrase in (
+        "submit now", "submit the application", "submit this application",
+        "proceed to submission", "proceed with submission",
+        "proceed toward submission", "proceed towards submission",
+        "go ahead and submit", "you may submit", "ready to submit",
+        "move to submission", "next application stage",
+        "proceed to the next application stage",
+    ))
+    if direct:
+        return True
+
+    # Natural approval after reviewing drafts. Require both approval language and a
+    # submission/apply concept so simple mentions of "prepared CV" do not trigger.
+    approval = any(phrase in text for phrase in (
+        "i approve", "approved", "i authorize", "i authorise",
+        "i have reviewed", "i reviewed", "looks good", "go ahead", "proceed",
+    ))
+    submit_concept = any(term in text for term in (
+        "submit", "submission", "apply to employer", "apply with employer",
+        "employer form", "application form",
+    ))
+    return approval and submit_concept
 
 
 def _clean_pack_string(value, max_len=4000):
@@ -15695,6 +15861,86 @@ def receive_webhook():
         pack_active = is_application_pack_active(customer_number)
         pack_source = get_application_pack_source_service(customer_number) if pack_active else ""
         career_pack_continuation = pack_active and pack_source == "Career Assist"
+
+        # Final submission approval is a separate state transition. It must run before
+        # preparation detection because phrases such as "reviewed the prepared CV"
+        # contain the substring "prepar" and previously regenerated the entire pack.
+        career_submission_requested = (
+            message_type == "text"
+            and detect_career_assist_submission_approval_request(customer_message)
+        )
+        if career_submission_requested:
+            try:
+                submission_state = get_career_assist_lifecycle_state(customer_number)
+            except Exception as lifecycle_error:
+                submission_state = {"state": "UNKNOWN"}
+                print(
+                    f"CAREER ASSIST SUBMISSION STATE CHECK FAILED: {type(lifecycle_error).__name__}",
+                    flush=True,
+                )
+
+            if submission_state.get("state") != "ACTIVE":
+                reply = (
+                    "I cannot move this application to final submission handling because Career Assist is not currently active. "
+                    "Nothing has been submitted and no extra fee has been created. Please ask Jones to review the Career Assist status."
+                )
+            else:
+                try:
+                    submission_application = get_career_assist_application_for_submission(
+                        customer_number, customer_message
+                    )
+                except Exception as lookup_error:
+                    submission_application = None
+                    print(
+                        f"CAREER ASSIST SUBMISSION RECORD LOOKUP ERROR: {type(lookup_error).__name__}: {lookup_error}",
+                        flush=True,
+                    )
+
+                if submission_application is None:
+                    reply = (
+                        "I could not find a prepared Career Assist application to move to the final submission step. "
+                        "Nothing has been submitted and no extra fee applies. Please identify the vacancy or prepare its application drafts first."
+                    )
+                elif submission_application.get("status") != "DRAFT_READY":
+                    reply = (
+                        f"The {submission_application.get('title') or 'selected'} application is not yet draft-ready. "
+                        "I will not submit or regenerate it automatically from this approval message. "
+                        "Please resolve the outstanding preparation information first. No extra fee applies."
+                    )
+                else:
+                    try:
+                        handoff_id = record_career_assist_submission_handoff(
+                            customer_number, submission_application, customer_name=customer_name
+                        )
+                        reply = (
+                            f"Your approval to proceed with final submission for {submission_application['title']} at "
+                            f"{submission_application['employer']} has been recorded. The prepared CV and cover letter will not be regenerated. "
+                            "The employer-form submission is now queued for IBROWS/Jones to complete using only your verified information. "
+                            "If the employer form presents a genuinely mandatory unanswered field, IBROWS will ask only for that specific detail. "
+                            "Your active Career Assist covers this step, so no MK2,000 or MK5,000 charge applies. "
+                            "The application is NOT yet marked submitted; that status will change only after a real employer confirmation."
+                        )
+                        print(
+                            f"CAREER ASSIST SUBMISSION APPROVAL RECORDED: record={handoff_id}",
+                            flush=True,
+                        )
+                    except Exception as handoff_error:
+                        print(
+                            f"CAREER ASSIST SUBMISSION HANDOFF ERROR: {type(handoff_error).__name__}: {handoff_error}",
+                            flush=True,
+                        )
+                        reply = (
+                            "I could not safely record the final submission handoff just now, so nothing has been submitted. "
+                            "Your Career Assist entitlement and prepared drafts are unchanged. Please try again shortly or talk to Jones."
+                        )
+
+            save_message(customer_number, "user", customer_message)
+            save_message(customer_number, "assistant", reply)
+            store_pending_reply(message_id, reply)
+            sent = send_whatsapp_message(customer_number, reply)
+            finish_whatsapp_message(message_id, sent)
+            return "EVENT_RECEIVED", 200
+
         career_prep_requested = detect_career_assist_preparation_request(customer_message)
         career_pack_start = active_career_assist_application and career_prep_requested
         if career_prep_requested and not career_pack_start:
