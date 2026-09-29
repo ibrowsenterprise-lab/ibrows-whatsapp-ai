@@ -11914,15 +11914,25 @@ def _secondary_verify_vacancy_candidates(candidates, today_date):
 
     urls = []
     try:
+        # Use the Responses web-search path for verification. The previous implementation
+        # reused gpt-5-search-api after several discovery calls and could hit RateLimitError
+        # exactly when an ambiguous vacancy needed the final safety check.
         verify_client = client.with_options(timeout=CAREER_SEARCH_TIMEOUT_SECONDS, max_retries=0)
-        completion = verify_client.chat.completions.create(
-            model=CAREER_SEARCH_CHAT_MODEL,
-            web_search_options={"search_context_size": "medium"},
-            messages=[{"role": "user", "content": prompt}],
+        completion = verify_client.responses.create(
+            model=CAREER_SEARCH_RESPONSES_MODEL,
+            store=False,
+            tools=[{
+                "type": "web_search",
+                "search_context_size": "low",
+                "external_web_access": True,
+            }],
+            tool_choice="required",
+            include=["web_search_call.action.sources"],
+            max_output_tokens=1400,
+            input=prompt,
         )
-        message = completion.choices[0].message
-        raw = str(getattr(message, "content", "") or "").strip()
-        urls = _extract_chat_search_source_urls(completion)
+        raw = str(completion.output_text or "").strip()
+        urls = _extract_hosted_search_source_urls(completion)
         try:
             payload = json.loads(_clean_search_json_text(raw))
         except Exception:
@@ -12267,7 +12277,10 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
 
     # For broad matching, supplement a thin result set with an independent search.
     # Also use this path when the first model returned only expired/unverifiable roles.
-    need_fallback = not all_vacancies or (broad_match_request and len(all_vacancies) < 3)
+    # Broad CV-matching searches use the focused recall + official ATS passes below.
+    # Avoid an extra chat-search fallback here because it consumes the same search-model
+    # quota needed later for verification and previously caused RateLimitError failures.
+    need_fallback = (not broad_match_request) and not all_vacancies
     if need_fallback:
         try:
             fallback_prompt = prompt + (
@@ -12434,15 +12447,30 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 '"search_note":"brief note"}\n'
                 "Do not include expired, closed, removed or unverifiable vacancies."
             )
-            ats_client = client.with_options(timeout=CAREER_SEARCH_TIMEOUT_SECONDS, max_retries=0)
-            ats_completion = ats_client.chat.completions.create(
-                model=CAREER_SEARCH_CHAT_MODEL,
-                web_search_options={"search_context_size": "medium"},
-                messages=[{"role": "user", "content": ats_prompt}],
+            ats_prompt += (
+                "\n\nUse focused searches equivalent to these patterns rather than relying on generic job-board ranking: "
+                "site:jobs.ashbyhq.com (Malawi OR Lilongwe) (data OR analyst OR business intelligence OR information OR systems); "
+                "site:boards.greenhouse.io OR site:job-boards.greenhouse.io (Malawi OR remote Africa) (data OR analyst OR systems); "
+                "site:jobs.lever.co OR site:jobs.workable.com (Malawi OR remote Africa) (data OR business analyst OR digital OR systems). "
+                "Prefer direct-employer ATS pages over talent networks/intermediaries. A talent-network listing may be returned only "
+                "when it is genuinely current and clearly labelled as an intermediary rather than as the underlying employer."
             )
-            ats_message = ats_completion.choices[0].message
-            ats_raw = str(getattr(ats_message, "content", "") or "").strip()
-            ats_urls = _extract_chat_search_source_urls(ats_completion)
+            ats_client = client.with_options(timeout=CAREER_SEARCH_TIMEOUT_SECONDS, max_retries=0)
+            ats_completion = ats_client.responses.create(
+                model=CAREER_SEARCH_RESPONSES_MODEL,
+                store=False,
+                tools=[{
+                    "type": "web_search",
+                    "search_context_size": "medium",
+                    "external_web_access": True,
+                }],
+                tool_choice="required",
+                include=["web_search_call.action.sources"],
+                max_output_tokens=1800,
+                input=ats_prompt,
+            )
+            ats_raw = str(ats_completion.output_text or "").strip()
+            ats_urls = _extract_hosted_search_source_urls(ats_completion)
             ats_vacancies, stats = _validate_career_search_payload(ats_raw, today)
             add_stats(stats)
             for url in ats_urls:
@@ -12454,11 +12482,11 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                     source_urls.insert(0, url)
             all_vacancies = _merge_validated_vacancies(all_vacancies, ats_vacancies)
             print(
-                f"CAREER ASSIST OFFICIAL ATS RECALL: model={CAREER_SEARCH_CHAT_MODEL} "
+                f"CAREER ASSIST OFFICIAL ATS RECALL: model={CAREER_SEARCH_RESPONSES_MODEL} "
                 f"sources={len(ats_urls)} validated={len(ats_vacancies)} cumulative={len(all_vacancies)}",
                 flush=True,
             )
-            search_paths.append(f"official-ats:{CAREER_SEARCH_CHAT_MODEL}")
+            search_paths.append(f"official-ats:{CAREER_SEARCH_RESPONSES_MODEL}")
         except Exception as error:
             print(
                 f"CAREER ASSIST OFFICIAL ATS RECALL FAILED: {type(error).__name__}",
@@ -12511,7 +12539,9 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
             "fresh search is still needed. Tell the customer the fresh search completed but did not verify a suitable "
             "current opening in the returned evidence. Do not charge an additional MK2,000 for this Career Assist search."
         )
-        return [{"type": "input_text", "text": context_text}], source_urls[:20]
+        # Do not expose rejected/expired discovery URLs in the customer-facing source footer.
+        # With zero verified vacancies there is no accepted vacancy source to show.
+        return [{"type": "input_text", "text": context_text}], []
 
     lines = [
         "INTERNAL ACTIVE CAREER ASSIST LIVE VACANCY SEARCH — SERVER-VALIDATED CURRENT RESULTS.",
@@ -12546,7 +12576,15 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
         f"sources={len(source_urls)} verified_current={len(all_vacancies)}",
         flush=True,
     )
-    return [{"type": "input_text", "text": context_text}], source_urls[:20]
+    # Customer-facing source transparency should contain only vacancies that actually
+    # survived all freshness/current-status gates. Discovery sources for rejected roles
+    # are useful in logs, but showing them beside the final answer is misleading.
+    accepted_source_urls = []
+    for item in all_vacancies:
+        url = str(item.get("application_url") or "").strip()
+        if url and url not in accepted_source_urls:
+            accepted_source_urls.append(url)
+    return [{"type": "input_text", "text": context_text}], accepted_source_urls[:10]
 
 
 # =========================================================
