@@ -5600,6 +5600,13 @@ def detect_career_assist_vacancy_search_request(customer_message):
     ):
         return False
 
+    # A mixed "find/search a vacancy and then apply/proceed" request is discovery-first
+    # because no exact vacancy exists yet. Check this before the single-application phrases
+    # below so wording such as "find a verified Strong Fit job ... and proceed with the
+    # application" cannot be misrouted as an already-identified application.
+    if detect_career_assist_future_vacancy_apply_request(customer_message):
+        return True
+
     # Explicit execution of one already-identified vacancy is not discovery.
     explicit_single_execution = any(phrase in text for phrase in (
         "apply for this job", "apply to this job", "submit this application",
@@ -5612,6 +5619,8 @@ def detect_career_assist_vacancy_search_request(customer_message):
 
     discovery_markers = (
         "find me", "find jobs", "find vacancies", "find opportunities",
+        "find a job", "find a vacancy", "find a role", "find an opportunity",
+        "find a verified", "find a strong fit", "find verified", "find strong fit",
         "find for me", "you find for me", "find and apply", "search and apply",
         "search for", "search jobs", "search vacancies", "look for",
         "show me jobs", "show me vacancies", "current jobs", "current vacancies",
@@ -5638,19 +5647,30 @@ def detect_career_assist_future_vacancy_apply_request(customer_message):
         or detect_career_assist_standing_consent_revoke(customer_message)
     ):
         return False
+    job_target = any(marker in text for marker in (
+        "job", "jobs", "vacancy", "vacancies", "role", "roles", "position",
+        "opportunity", "opportunities", "data analyst", "business intelligence",
+        "it/business systems", "digital solutions",
+    ))
     apply_intent = any(marker in text for marker in (
         "apply for", "apply to", "submit an application", "submit applications",
-        "apply on my behalf", "application for",
-    ))
-    future_target = any(marker in text for marker in (
+        "apply on my behalf", "application for", "proceed with the application",
+        "proceed with application", "proceed to apply", "continue with the application",
+        "go ahead with the application", "go ahead and apply",
+    )) or (
+        "proceed" in text and "application" in text
+    )
+    explicit_future_target = any(marker in text for marker in (
         "next verified", "next suitable", "next strong fit", "next matching",
         "next vacancy", "next job", "next role", "you find for me",
         "find for me", "find and apply", "search and apply",
+        "find a verified", "find a strong fit", "find verified", "find strong fit",
+        "find a job", "find a vacancy", "find a role", "find an opportunity",
     ))
-    job_target = any(marker in text for marker in (
-        "job", "vacancy", "role", "position", "data analyst",
-        "business intelligence", "it/business systems", "digital solutions",
+    discovery_verb = any(marker in text for marker in (
+        "find ", "search ", "search for ", "look for ", "show me ",
     ))
+    future_target = explicit_future_target or (discovery_verb and job_target)
     return apply_intent and future_target and job_target
 
 
@@ -15605,25 +15625,50 @@ def generate_ai_reply(
                 standing_state = get_career_assist_standing_consent(customer_number)
                 standing_label = standing_state.get("event_type") or "NONE"
                 standing_effective = bool(standing_state.get("effective"))
+                standing_scope = str(standing_state.get("scope_text") or "")[:2200]
             except Exception as consent_state_error:
                 standing_label = "UNKNOWN"
                 standing_effective = False
+                standing_scope = ""
                 print(
                     f"CAREER ASSIST FUTURE-APPLY CONSENT STATE ERROR: {type(consent_state_error).__name__}",
                     flush=True,
                 )
+
+            # A future/not-yet-identified target is always discovery-first. Standing
+            # authorization may allow later execution only after the exact verified
+            # vacancy has been compared with the recorded scope. It never expands
+            # itself merely because the customer asks for a role outside that scope.
+            discovery_instruction = (
+                "INTERNAL CAREER ASSIST FUTURE-APPLY DISCOVERY-FIRST. The customer's latest message asks IBROWS "
+                "to FIND/SEARCH for a vacancy that is not yet identified and then potentially proceed with an "
+                "application. Perform vacancy discovery first under active Career Assist. Do not ask the customer "
+                "to supply a title, employer, or URL merely because the target is not yet identified. Do not route "
+                "this mixed request to the standalone MK2,000 Single Job Application service. Nothing is submitted "
+                "during discovery. After a specific verified vacancy is found, compare it against the exact standing "
+                "authorization scope before any submission step. "
+            )
+            if standing_effective:
+                discovery_instruction += (
+                    "Current standing application authority is ACTIVE, but it applies ONLY within this exact recorded "
+                    "scope and must not be broadened: " + standing_scope + "\n"
+                    "If the newly found vacancy falls outside any recorded country/location, field/category, fit-level, "
+                    "salary, or other scope boundary, the standing authorization does NOT cover that application. "
+                    "Show the verified vacancy and require fresh authorization naming that exact vacancy before any "
+                    "submission step. Do not silently update or widen standing consent."
+                )
+            else:
+                discovery_instruction += (
+                    f"Current standing application authority is {standing_label} and is NOT effective. Do not restore "
+                    "standing consent. After a specific verified vacancy is identified, require fresh authorization "
+                    "naming that exact vacancy before any submission step."
+                )
+            payment_context.append({"role": "user", "content": discovery_instruction})
+            print(
+                f"CAREER ASSIST FUTURE-APPLY DISCOVERY FIRST: standing={standing_label} effective={int(standing_effective)}",
+                flush=True,
+            )
             if not standing_effective:
-                payment_context.append({
-                    "role": "user",
-                    "content": (
-                        "INTERNAL CAREER ASSIST CONSENT ENFORCEMENT. The customer's latest message asks to find "
-                        "and apply for a future/not-yet-identified vacancy. Current standing application authority is "
-                        f"{standing_label} and is NOT effective. Treat this message as vacancy discovery first. Do not "
-                        "restore standing consent, do not submit, and do not route to the MK2,000 Single Job Application "
-                        "service while Career Assist is active. After a specific verified vacancy is identified, ask for "
-                        "fresh authorization naming that exact vacancy before any submission step."
-                    ),
-                })
                 print(
                     f"CAREER ASSIST FUTURE-APPLY CONSENT ENFORCED: standing={standing_label}",
                     flush=True,
