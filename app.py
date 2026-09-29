@@ -1530,8 +1530,8 @@ def _historical_application_confirmation_pairs(customer_number, limit=500):
     return pairs
 
 
-def build_application_confirmation_evidence_context(customer_number, limit=12):
-    """Return exact prior customer-confirmed non-sensitive application answers for reuse."""
+def _load_reusable_application_confirmation_pairs(customer_number, limit=80):
+    """Load exact reusable non-sensitive precheck Q/A pairs, including older conversation history."""
     pairs = []
     try:
         with get_db() as conn:
@@ -1552,8 +1552,6 @@ def build_application_confirmation_evidence_context(customer_number, limit=12):
     except Exception as error:
         print(f"APPLICATION CONFIRMATION EVIDENCE LOAD FAILED: {type(error).__name__}", flush=True)
 
-    # Older confirmations pre-date this table. Recover them from retained conversations
-    # so existing active Career Assist applications do not force customers to repeat answers.
     try:
         pairs.extend(_historical_application_confirmation_pairs(customer_number))
     except Exception as error:
@@ -1562,18 +1560,196 @@ def build_application_confirmation_evidence_context(customer_number, limit=12):
     deduped = []
     seen = set()
     for prompt, response in pairs:
-        # Older builds could accidentally store a later workflow command (for example
-        # "proceed with the verified vacancy") as though it answered the prior precheck.
-        # Preserve the database row for audit history, but never surface it as factual
-        # application evidence once the improved command detector identifies it.
+        prompt = str(prompt or "").strip()
+        response = str(response or "").strip()
+        if not prompt or not response:
+            continue
+        if not _application_confirmation_prompt_is_reusable(prompt):
+            continue
         if _application_confirmation_response_looks_like_new_command(response):
             continue
         key = (" ".join(prompt.split()).lower(), " ".join(response.split()).lower())
-        if not key[0] or not key[1] or key in seen:
+        if key in seen:
             continue
         seen.add(key)
-        deduped.append((prompt, response))
-    deduped = deduped[-limit:]
+        deduped.append((prompt[:5000], response[:3500]))
+    return deduped[-limit:]
+
+
+def _numbered_application_items(text):
+    """Return {number: item text} for ordinary 1./2.) precheck lists."""
+    raw = str(text or "")
+    matches = list(re.finditer(r"(?m)^\s*(\d{1,2})[.)]\s+(.+?)(?=\n\s*\d{1,2}[.)]\s+|\Z)", raw, re.S))
+    items = {}
+    for match in matches:
+        try:
+            number = int(match.group(1))
+        except Exception:
+            continue
+        value = " ".join(str(match.group(2) or "").split()).strip()
+        if value:
+            items[number] = value
+    return items
+
+
+def _application_confirmation_concepts(text):
+    """Identify a small set of stable, non-sensitive application facts in text."""
+    lower = " ".join(str(text or "").lower().split())
+    concepts = set()
+    if any(marker in lower for marker in ("typing speed", "words per minute", " wpm", "wpm ")):
+        concepts.add("typing_speed")
+    if "english" in lower and any(marker in lower for marker in (
+        "communication", "communicate", "speaking", "speak", "reading", "read",
+        "writing", "write", "clear english", "correct english", "fluency", "fluent",
+    )):
+        concepts.add("english_communication")
+    if any(marker in lower for marker in (
+        "public health", "health outcomes", "healthcare outcomes", "save human life",
+        "save lives", "using data to improve health", "using data to save",
+    )):
+        concepts.add("public_health_interest")
+    if any(marker in lower for marker in ("excel", "google sheets", "spreadsheet")):
+        concepts.add("spreadsheet_skill")
+    return concepts
+
+
+def _application_response_resolves_concept(concept, response_text):
+    """Require explicit evidence in the customer's own answer; never infer a stronger fact."""
+    response = " ".join(str(response_text or "").lower().split())
+    if not response or _application_confirmation_response_looks_like_new_command(response):
+        return False
+    if concept == "typing_speed":
+        # A typing-speed answer needs an actual numeric rate. Accept 10-200 as a plausible
+        # WPM range but keep the customer's exact response as the evidence shown downstream.
+        for value in re.findall(r"(?<!\d)(\d{2,3})(?!\d)", response):
+            try:
+                if 10 <= int(value) <= 200:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    affirmative = bool(re.search(
+        r"\b(yes|confirmed|i do|i can|i meet|i have|i am|fluent|proficient|clear|strong|passion|passionate|interest|interested|experienced|comfortable|competent)\b",
+        response,
+    ))
+    if concept == "english_communication":
+        return affirmative or ("english" in response and any(x in response for x in ("fluent", "clear", "proficient", "communicat")))
+    if concept == "public_health_interest":
+        return affirmative or any(x in response for x in ("public health", "health outcome", "passion", "interested", "save lives", "save human life"))
+    if concept == "spreadsheet_skill":
+        return affirmative or any(x in response for x in ("excel", "google sheets", "spreadsheet"))
+    return False
+
+
+def get_resolved_application_confirmations(customer_number):
+    """Resolve only facts the customer's exact prior answer clearly supplied."""
+    resolved = {}
+    for prompt, response in _load_reusable_application_confirmation_pairs(customer_number, limit=80):
+        prompt_items = _numbered_application_items(prompt)
+        response_items = _numbered_application_items(response)
+        if prompt_items and response_items:
+            for number, prompt_item in prompt_items.items():
+                answer_item = response_items.get(number)
+                if not answer_item:
+                    continue
+                for concept in _application_confirmation_concepts(prompt_item):
+                    if _application_response_resolves_concept(concept, answer_item):
+                        resolved[concept] = {
+                            "prompt": prompt_item[:1800],
+                            "response": answer_item[:1400],
+                        }
+            continue
+
+        # Some customers answer a numbered precheck in prose. In that case keep the
+        # entire exact response but still require explicit evidence for each concept.
+        for concept in _application_confirmation_concepts(prompt):
+            if _application_response_resolves_concept(concept, response):
+                resolved[concept] = {
+                    "prompt": prompt[:1800],
+                    "response": response[:1400],
+                }
+    return resolved
+
+
+def build_resolved_application_confirmation_context(customer_number):
+    """Create a deterministic resolved-fact block for the current pre-submission check."""
+    resolved = get_resolved_application_confirmations(customer_number)
+    if not resolved:
+        return {}, []
+    labels = {
+        "typing_speed": "English typing speed",
+        "english_communication": "English communication",
+        "public_health_interest": "Public-health / health-outcomes interest",
+        "spreadsheet_skill": "Excel / Google Sheets",
+    }
+    lines = [
+        "SERVER-RESOLVED PRIOR CUSTOMER CONFIRMATIONS.",
+        "The server matched the exact prior customer answers below to these non-sensitive requirements.",
+        "These requirements are already answered. DO NOT ask them again unless the vacancy conflicts with the answer or the customer says it changed.",
+        "Never strengthen the answer beyond the exact quoted customer response.",
+        "",
+    ]
+    for concept, evidence in resolved.items():
+        lines.extend([
+            f"Resolved requirement: {labels.get(concept, concept)}",
+            f"Prior question: {evidence.get('prompt', '')}",
+            f"Customer's exact answer: {evidence.get('response', '')}",
+            "",
+        ])
+    print(
+        "APPLICATION CONFIRMATION REQUIREMENTS RESOLVED: "
+        + " ".join(f"{key}=1" for key in sorted(resolved)),
+        flush=True,
+    )
+    return resolved, [{"role": "user", "content": "\n".join(lines)[:12000]}]
+
+
+def _replace_reasked_resolved_application_questions(reply, resolved):
+    """Fail closed if the model re-asks only requirements the server already resolved."""
+    if not resolved:
+        return str(reply or "")
+    text = str(reply or "").strip()
+    numbered = _numbered_application_items(text)
+    if not numbered:
+        return text
+
+    asked = set()
+    for item in numbered.values():
+        concepts = _application_confirmation_concepts(item)
+        # Unknown numbered questions may be genuinely new; never suppress them.
+        if not concepts:
+            return text
+        if any(concept not in resolved for concept in concepts):
+            return text
+        asked.update(concepts)
+    if not asked:
+        return text
+
+    labels = {
+        "typing_speed": "typing speed",
+        "english_communication": "English communication",
+        "public_health_interest": "public-health/health-outcomes interest",
+        "spreadsheet_skill": "Excel/Google Sheets capability",
+    }
+    reused = ", ".join(labels.get(key, key) for key in sorted(asked))
+    print(
+        "APPLICATION PRECHECK REPEAT QUESTION BLOCKED: "
+        + ",".join(sorted(asked)),
+        flush=True,
+    )
+    return (
+        "The vacancy has been rechecked and is currently published. Your active Career Assist covers this application. "
+        f"I will reuse the non-sensitive information you already confirmed for {reused}, so I will not ask you to repeat it. "
+        "No new unresolved mandatory detail was identified in this pre-submission check. Nothing has been submitted. "
+        "Preparation can continue under your active standing authorization using only your verified information. "
+        "If the official application process presents a new sensitive, ambiguous, or unverified question, I will ask only for that specific information before it is used."
+    )
+
+
+def build_application_confirmation_evidence_context(customer_number, limit=12):
+    """Return exact prior customer-confirmed non-sensitive application answers for reuse."""
+    deduped = _load_reusable_application_confirmation_pairs(customer_number, limit=max(limit, 12))[-limit:]
     if not deduped:
         return []
 
@@ -15456,6 +15632,7 @@ def generate_ai_reply(
         active_career_search = False
         active_career_application = False
         career_verified_urls = []
+        resolved_application_confirmations = {}
 
         # An active Career Assist customer choosing a specific vacancy is still inside
         # the monthly Career Assist entitlement; this is not the standalone MK2,000 service.
@@ -15524,14 +15701,19 @@ def generate_ai_reply(
                         ),
                     }]
                 confirmation_context = build_application_confirmation_evidence_context(customer_number)
+                resolved_application_confirmations, resolved_confirmation_context = (
+                    build_resolved_application_confirmation_context(customer_number)
+                )
                 if application_cv_context:
                     memory_context = application_cv_context + memory_context
                 if contact_context:
                     memory_context = contact_context + memory_context
                 if confirmation_context:
                     memory_context = confirmation_context + memory_context
+                if resolved_confirmation_context:
+                    memory_context = resolved_confirmation_context + memory_context
                 print(
-                    f"ACTIVE CAREER ASSIST APPLICATION EVIDENCE CONTEXT ENRICHED: contacts={len(contact_lines)} confirmations={len(confirmation_context)}",
+                    f"ACTIVE CAREER ASSIST APPLICATION EVIDENCE CONTEXT ENRICHED: contacts={len(contact_lines)} confirmations={len(confirmation_context)} resolved={len(resolved_application_confirmations)}",
                     flush=True,
                 )
 
@@ -15582,6 +15764,14 @@ def generate_ai_reply(
                         )[:16000],
                     })
                     print("APPLICATION CONFIRMATION EVIDENCE ATTACHED TO ACTIVE VACANCY", flush=True)
+            if resolved_application_confirmations:
+                _, resolved_near_vacancy = build_resolved_application_confirmation_context(customer_number)
+                if resolved_near_vacancy:
+                    web_input_parts.append({
+                        "type": "input_text",
+                        "text": str(resolved_near_vacancy[0].get("content") or "")[:12000],
+                    })
+                    print("RESOLVED APPLICATION CONFIRMATIONS ATTACHED TO ACTIVE VACANCY", flush=True)
             if application_urls:
                 career_verified_urls = list(application_urls)
                 web_source_urls = list(application_urls)
@@ -16452,6 +16642,12 @@ Return ONLY the required JSON object.
         )
 
         reply = final_result["reply"]
+
+        if active_career_application and resolved_application_confirmations:
+            reply = _replace_reasked_resolved_application_questions(
+                reply, resolved_application_confirmations
+            )
+            final_result["reply"] = reply
 
         if active_career_search or active_career_application:
             # Application URLs are immutable verified data. Correct/block any URL the
