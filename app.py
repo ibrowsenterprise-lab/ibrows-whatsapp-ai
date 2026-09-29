@@ -13077,6 +13077,8 @@ def _validate_career_search_payload(raw_text, today_date):
                 # the search result also set current_open=true; a stale page that
                 # merely exists is still insufficient.
                 "apply button", "easy apply", "apply for this job",
+                "apply for this role", "apply by email", "how to apply",
+                "send your cv", "send your resume", "submit your cv", "submit your resume",
                 "be among the first", "be an early applicant",
                 "actively hiring", "application portal open",
                 "submit application", "applications being accepted",
@@ -13223,8 +13225,10 @@ def _page_has_active_application_signal(page_text):
     """Return True only for affirmative live-application signals on a fetched vacancy page."""
     lower = str(page_text or "").lower()
     active_markers = (
-        "apply now", "easy apply", "apply for this job", "submit application",
-        "submit your application", "applications are open", "applications open",
+        "apply now", "easy apply", "apply for this job", "apply for this role",
+        "apply by email", "how to apply", "submit application", "submit your application",
+        "send your cv", "send your resume", "submit your cv", "submit your resume",
+        "applications are open", "applications open",
         "currently accepting applications", "accepting applications",
         "application portal open", "open until filled", "rolling applications",
         "be among the first applicants", "be an early applicant", "actively hiring",
@@ -14771,8 +14775,12 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
     ))
     broad_match_request = any(marker in request_lower for marker in (
         "better fit", "better match", "best fit", "match my cv", "matching my cv",
-        "using my verified cv", "up to 5", "five current", "5 current",
-        "malawi first", "remote roles", "remote opportunities", "alternatives",
+        "reasonable fit", "reasonable match", "reasonable matches", "with gaps",
+        "using my verified cv", "up to 3", "three current", "3 current", "3 verified",
+        "up to 5", "five current", "5 current", "verified opportunities",
+        "malawi first", "remote roles", "remote opportunities", "worldwide remote",
+        "standing fields", "standing authorization", "standing authorisation",
+        "search again", "alternatives",
     ))
 
     candidate_block = ""
@@ -15029,20 +15037,30 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
                 "Malawi current IT-supported administration, digital/media support and information-management "
                 "vacancies, then remote data/BI/business-analysis roles explicitly open worldwide or to Malawi",
             ),
+            (
+                "GLOBAL_REMOTE_CORE",
+                "Worldwide-remote current Data Analyst, Business Intelligence, Business Analyst, IT/business systems, "
+                "digital solutions and information-management vacancies on official employer career pages or direct ATS pages, "
+                "explicitly open to applicants worldwide or globally",
+            ),
         ]
 
         for recall_index, (recall_label, focused_query) in enumerate(focused_queries, start=1):
-            if len(all_vacancies) >= 5:
-                break
+            # Run every role-family pass. Early discovery candidates may later fail the
+            # deterministic current-status or eligibility gate, so stopping at five raw
+            # candidates can incorrectly produce zero verified results.
             try:
                 focused_prompt = (
                     f"Today is {today_label}. TARGETED CAREER ASSIST RECALL SEARCH.\n"
                     f"Search specifically for: {focused_query}.\n"
                     f"Customer request: {request_text}\n"
                     + candidate_block
-                    + "\n\nUse several focused web queries rather than a single broad query. Explicitly check "
+                    + "\n\nUse several focused web queries rather than a single broad query. For Malawi-focused searches, check "
                     "mw.linkedin.com/jobs result pages and direct /jobs/view/ pages, official employer career pages, "
-                    "and reputable Malawi vacancy sources. Prefer recently posted vacancies. For LinkedIn or another "
+                    "and reputable Malawi vacancy sources. For worldwide-remote searches, prioritize original employer "
+                    "career pages and direct ATS job pages that explicitly say Worldwide, Global, Remote - Global, open worldwide, "
+                    "or equivalent applicant eligibility; do not require the employer to use a major ATS. Prefer recently posted vacancies. "
+                    "For LinkedIn or another "
                     "live job board with no stated closing date, set current_open=true only when the live evidence "
                     "shows a current application/listing signal such as Apply, Easy Apply, Be an early applicant, "
                     "Be among the first applicants, Actively hiring, currently accepting applications, or an equivalent "
