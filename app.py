@@ -11379,6 +11379,80 @@ def _is_official_application_source(url):
     )
 
 
+
+def _sanitize_active_career_search_reply_urls(reply, allowed_urls):
+    """Keep Career Assist customer-facing vacancy URLs pinned to server-verified URLs.
+
+    The language model may occasionally mistype a long ATS UUID/path while paraphrasing
+    an otherwise valid vacancy. During an ACTIVE Career Assist live search, URLs are
+    therefore data, not prose: only exact server-verified URLs may reach the customer.
+    A same-host typo is corrected only when exactly one verified URL exists for that
+    host; otherwise the unverified URL is replaced with a neutral pointer to the source
+    footer rather than guessed.
+    """
+    text = str(reply or "")
+    allowed = []
+    seen = set()
+    for raw_url in allowed_urls or []:
+        try:
+            normalized = _normalize_candidate_url(raw_url)
+        except Exception:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        allowed.append(normalized)
+
+    if not text or not allowed:
+        return text
+
+    allowed_by_key = {url.lower(): url for url in allowed}
+    by_host = {}
+    for url in allowed:
+        host = _career_url_host(url)
+        if host:
+            by_host.setdefault(host, []).append(url)
+
+    url_pattern = re.compile(r"https?://[^\s<>()\[\]{}\"'`]+", re.IGNORECASE)
+
+    def replace_url(match):
+        raw = match.group(0)
+        core = raw.rstrip(".,;:!?")
+        trailing = raw[len(core):]
+        try:
+            normalized = _normalize_candidate_url(core)
+        except Exception:
+            print(
+                "CAREER ASSIST REPLY URL BLOCKED: reason=invalid_url",
+                flush=True,
+            )
+            return "verified application link listed under Sources checked below" + trailing
+
+        exact = allowed_by_key.get(normalized.lower())
+        if exact:
+            # Emit the canonical verified form even if harmless URL normalization differed.
+            return exact + trailing
+
+        host = _career_url_host(normalized)
+        same_host = by_host.get(host, [])
+        if len(same_host) == 1:
+            corrected = same_host[0]
+            print(
+                f"CAREER ASSIST REPLY URL CORRECTED: host={host}",
+                flush=True,
+            )
+            return corrected + trailing
+
+        print(
+            f"CAREER ASSIST REPLY URL BLOCKED: reason=not_verified host={host or 'unknown'}",
+            flush=True,
+        )
+        return "verified application link listed under Sources checked below" + trailing
+
+    return url_pattern.sub(replace_url, text)
+
+
 def _source_transparency_footer(source_urls):
     """Build a short WhatsApp-friendly source list with primary sources first."""
     official, official_application, additional, seen = [], [], [], set()
@@ -13586,7 +13660,7 @@ def fetch_career_assist_vacancy_search_context(customer_request, candidate_conte
             f"Location: {item.get('location') or 'Not stated'}",
             f"Deadline/status: {deadline}",
             f"Current-open evidence: {item.get('open_evidence') or 'Validated by live search'}",
-            f"Application/source URL: {item['application_url']}",
+            f"Application/source URL (COPY EXACTLY; never alter any character): {item['application_url']}",
             f"CV match note: {item.get('match_reason') or 'Assess against the supplied candidate CV context.'}",
         ])
     lines.extend([
@@ -14122,6 +14196,7 @@ def generate_ai_reply(
         payment_context = build_verified_payment_context(customer_number)
         prior_conversation = get_recent_conversation(customer_number, limit=11)
         active_career_search = False
+        career_verified_urls = []
 
         direct_urls = extract_public_urls_from_text(customer_message)
         if direct_urls:
@@ -14169,9 +14244,12 @@ def generate_ai_reply(
                     customer_number=customer_number,
                 )
                 web_input_parts.extend(live_parts)
+                # For an active Career Assist search, the final source allow-list is
+                # exactly the vacancies that survived server-side verification. Do not
+                # let pre-search discovery pages or model-generated URLs enter it.
+                career_verified_urls = list(live_urls)
+                web_source_urls = list(live_urls)
                 for url in live_urls:
-                    if url not in web_source_urls:
-                        web_source_urls.append(url)
                     label = _web_source_label(url)
                     if label not in web_sources:
                         web_sources.append(label)
@@ -14884,6 +14962,13 @@ Return ONLY the required JSON object.
 
         final_result = _call_business_ai(api_input)
 
+        # The live Career Assist vacancy pipeline has already performed discovery and
+        # deterministic verification. Do not follow model-suggested URLs afterward: a
+        # mistyped ATS path must never become a fetched/allowed source merely because
+        # the model emitted it in detected_urls.
+        if active_career_search:
+            final_result["detected_urls"] = []
+
         # At most two tightly bounded follow-up fetch rounds. This allows a poster to
         # point to a jobs landing page and that page to point to the specific vacancy,
         # without turning the assistant into an open-ended crawler. Only one new URL
@@ -14966,6 +15051,12 @@ Return ONLY the required JSON object.
         )
 
         reply = final_result["reply"]
+
+        if active_career_search:
+            # Application URLs are immutable verified data. Correct/block any URL the
+            # language model altered while composing the natural-language reply.
+            reply = _sanitize_active_career_search_reply_urls(reply, career_verified_urls)
+            final_result["reply"] = reply
 
         if web_source_urls:
             reply = _append_source_transparency(reply, web_source_urls)
