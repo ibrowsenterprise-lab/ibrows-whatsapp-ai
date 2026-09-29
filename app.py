@@ -2358,7 +2358,13 @@ def upsert_career_assist_application_record(
         raise ValueError("Career Assist application requires an exact verified vacancy identity")
     state = get_career_assist_lifecycle_state(customer_number)
     lead_id = state.get("lead_id") if state.get("state") == "ACTIVE" else None
-    submitted_sql = "NOW()" if status == "SUBMITTED" else "submitted_at"
+    # In PostgreSQL ON CONFLICT, an unqualified column name can become ambiguous
+    # between the target row and EXCLUDED. Preserve the existing timestamp explicitly
+    # for non-submission status changes.
+    submitted_sql = (
+        "NOW()" if status == "SUBMITTED"
+        else "career_assist_applications.submitted_at"
+    )
     insert_submitted_sql = "NOW()" if status == "SUBMITTED" else "NULL"
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -15808,7 +15814,10 @@ def receive_webhook():
                 )
                 print(f"CAREER ASSIST APPLICATION PREPARING: record={app_record_id}", flush=True)
             except Exception as record_error:
-                print(f"CAREER ASSIST APPLICATION RECORD ERROR: {type(record_error).__name__}", flush=True)
+                print(
+                    f"CAREER ASSIST APPLICATION RECORD ERROR: {type(record_error).__name__}: {record_error}",
+                    flush=True,
+                )
                 reply = (
                     "I could not create the internal application-preparation record safely, so I have not generated or submitted anything. "
                     "Your Career Assist entitlement is unchanged. Please try again shortly or ask to talk to Jones."
