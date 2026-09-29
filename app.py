@@ -706,6 +706,23 @@ def init_database():
                 ON career_assist_application_consent_events(customer_number, created_at DESC, id DESC)
             """)
 
+            # Customer-confirmed, non-sensitive application answers that may be reused
+            # in later pre-submission checks. Store the exact question + exact customer
+            # response rather than converting it into a stronger inferred fact.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS application_confirmation_evidence (
+                    id BIGSERIAL PRIMARY KEY,
+                    customer_number TEXT NOT NULL,
+                    prompt_text TEXT NOT NULL,
+                    response_text TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_application_confirmation_customer
+                ON application_confirmation_evidence(customer_number, created_at DESC, id DESC)
+            """)
+
             # Remember narrow, auditor-approved evidence wording corrections so a
             # phrase that was already corrected cannot silently reappear in a later
             # regenerated CV/cover letter for the same customer.
@@ -1378,6 +1395,192 @@ def capture_application_contact_confirmation(customer_number, customer_message):
             flush=True,
         )
     return updates
+
+
+_APPLICATION_CONFIRMATION_SENSITIVE_PROMPT_MARKERS = (
+    "criminal", "conviction", "arrest", "medical", "health condition", "disability",
+    "hiv", "pregnan", "race", "ethnicity", "religion", "sex", "gender",
+    "marital", "national id", "national identity", "passport number", "pin", "otp",
+    "password", "security code", "work authorization", "work authorisation",
+    "right to work", "visa status", "salary expectation", "expected salary",
+)
+
+
+def _application_confirmation_prompt_is_reusable(prompt_text):
+    """Return True only for non-sensitive application/pre-submission questions.
+
+    The stored evidence remains the customer's exact wording; this helper merely decides
+    whether it is safe/useful to surface that prior wording again as application evidence.
+    Sensitive or changeable declarations are deliberately excluded and must be asked again
+    when an actual application requires them.
+    """
+    lower = " ".join(str(prompt_text or "").lower().split())
+    if not lower:
+        return False
+    if any(marker in lower for marker in _APPLICATION_CONFIRMATION_SENSITIVE_PROMPT_MARKERS):
+        return False
+    question_signal = any(marker in lower for marker in (
+        "please confirm", "confirm only", "still needed", "before submission",
+        "pre-submission", "before proceeding", "required points", "missing information",
+        "need from you", "need you to confirm",
+    ))
+    application_signal = any(marker in lower for marker in (
+        "application", "vacancy", "job", "typing speed", "words per minute",
+        "communication", "public health", "qualification", "experience", "skill",
+    ))
+    return question_signal and application_signal
+
+
+def _application_confirmation_response_looks_like_new_command(response_text):
+    lower = " ".join(str(response_text or "").lower().split())
+    return any(marker in lower for marker in (
+        "find me a job", "find me jobs", "search for jobs", "search vacancies",
+        "apply for the next", "apply for this job", "apply for this vacancy",
+        "revoke my", "stop applying", "i authorize ibrows", "i authorise ibrows",
+        "standing authorization", "standing authorisation", "standing consent",
+    ))
+
+
+def capture_application_confirmation_evidence(customer_number, customer_message):
+    """Persist an exact, non-sensitive customer answer to a recent application precheck.
+
+    This never interprets the answer or upgrades it into an independently verified fact.
+    It preserves the question/answer pair so later checks can avoid asking the same
+    non-sensitive question repeatedly.
+    """
+    response = redact_sensitive_credentials_for_storage(customer_message).strip()
+    if not response or _application_confirmation_response_looks_like_new_command(response):
+        return False
+
+    recent = get_recent_conversation(customer_number, limit=8)
+    previous_assistant = ""
+    for item in reversed(recent):
+        if str(item.get("role") or "").lower() == "assistant":
+            previous_assistant = str(item.get("content") or "").strip()
+            break
+    if not _application_confirmation_prompt_is_reusable(previous_assistant):
+        return False
+
+    prompt = redact_sensitive_credentials_for_storage(previous_assistant).strip()[:5000]
+    response = response[:3500]
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM application_confirmation_evidence
+                WHERE customer_number=%s AND prompt_text=%s AND response_text=%s
+                ORDER BY id DESC LIMIT 1
+                """,
+                (customer_number, prompt, response),
+            )
+            if cur.fetchone():
+                return True
+            cur.execute(
+                """
+                INSERT INTO application_confirmation_evidence
+                    (customer_number, prompt_text, response_text)
+                VALUES (%s, %s, %s)
+                """,
+                (customer_number, prompt, response),
+            )
+        conn.commit()
+    print("APPLICATION CONFIRMATION EVIDENCE STORED", flush=True)
+    return True
+
+
+def _historical_application_confirmation_pairs(customer_number, limit=120):
+    """Recover older precheck answers from conversation history for backward compatibility."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT role, content
+                FROM conversations
+                WHERE customer_number=%s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (customer_number, limit),
+            )
+            rows = cur.fetchall()
+    rows.reverse()
+    pairs = []
+    for idx in range(len(rows) - 1):
+        role, prompt = rows[idx]
+        next_role, response = rows[idx + 1]
+        if str(role).lower() != "assistant" or str(next_role).lower() != "user":
+            continue
+        if not _application_confirmation_prompt_is_reusable(prompt):
+            continue
+        if _application_confirmation_response_looks_like_new_command(response):
+            continue
+        response = str(response or "").strip()
+        if not response:
+            continue
+        pairs.append((str(prompt or "").strip()[:5000], response[:3500]))
+    return pairs
+
+
+def build_application_confirmation_evidence_context(customer_number, limit=12):
+    """Return exact prior customer-confirmed non-sensitive application answers for reuse."""
+    pairs = []
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT prompt_text, response_text
+                    FROM application_confirmation_evidence
+                    WHERE customer_number=%s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (customer_number, limit),
+                )
+                stored = cur.fetchall()
+        stored.reverse()
+        pairs.extend((str(q or ""), str(a or "")) for q, a in stored)
+    except Exception as error:
+        print(f"APPLICATION CONFIRMATION EVIDENCE LOAD FAILED: {type(error).__name__}", flush=True)
+
+    # Older confirmations pre-date this table. Recover them from retained conversations
+    # so existing active Career Assist applications do not force customers to repeat answers.
+    try:
+        pairs.extend(_historical_application_confirmation_pairs(customer_number))
+    except Exception as error:
+        print(f"APPLICATION CONFIRMATION HISTORY RECOVERY FAILED: {type(error).__name__}", flush=True)
+
+    deduped = []
+    seen = set()
+    for prompt, response in pairs:
+        key = (" ".join(prompt.split()).lower(), " ".join(response.split()).lower())
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        deduped.append((prompt, response))
+    deduped = deduped[-limit:]
+    if not deduped:
+        return []
+
+    lines = [
+        "CUSTOMER-CONFIRMED APPLICATION EVIDENCE FOR THIS SAME CUSTOMER.",
+        "These are exact prior non-sensitive precheck question/answer pairs supplied by the customer.",
+        "Reuse an answer only when it directly answers the current vacancy requirement and remains unambiguous.",
+        "Do not infer anything beyond the customer's words. Do not re-ask an already answered requirement unless the current vacancy conflicts with it, the answer is ambiguous, or the customer says it changed.",
+        "Sensitive/changeable declarations (for example criminal/medical status, work authorization, identity/security data or salary expectations) are deliberately excluded and must still be confirmed when actually required.",
+        "",
+    ]
+    for idx, (prompt, response) in enumerate(deduped, 1):
+        lines.extend([
+            f"Evidence {idx} — question previously asked:",
+            prompt[:1800],
+            "Customer's exact answer:",
+            response[:1400],
+            "",
+        ])
+    text = "\n".join(lines)[:12000]
+    print(f"APPLICATION CONFIRMATION EVIDENCE CONTEXT INCLUDED: pairs={len(deduped)}", flush=True)
+    return [{"role": "user", "content": text}]
 
 
 def seed_application_contacts_from_cv_memory(customer_number):
@@ -14802,6 +15005,18 @@ def receive_webhook():
             print("CAREER ASSIST STANDING CONSENT MESSAGE HANDLED", flush=True)
             return "EVENT_RECEIVED", 200
 
+        # Preserve exact non-sensitive answers to an application precheck before the
+        # next model call. This is deliberately narrow and never stores a model-inferred
+        # answer or a sensitive/changeable declaration as reusable application evidence.
+        if message_type == "text":
+            try:
+                capture_application_confirmation_evidence(customer_number, customer_message)
+            except Exception as evidence_capture_error:
+                print(
+                    f"APPLICATION CONFIRMATION EVIDENCE CAPTURE FAILED: {type(evidence_capture_error).__name__}",
+                    flush=True,
+                )
+
         # The MK2,000 Single Job Application remains a separate standalone service.
         # An ACTIVE Career Assist term, however, already includes vacancy discovery AND
         # application support/execution within the agreed customer scope. Never create or
@@ -15293,12 +15508,15 @@ def generate_ai_reply(
                             "\n".join(contact_lines)
                         ),
                     }]
+                confirmation_context = build_application_confirmation_evidence_context(customer_number)
                 if application_cv_context:
                     memory_context = application_cv_context + memory_context
                 if contact_context:
                     memory_context = contact_context + memory_context
+                if confirmation_context:
+                    memory_context = confirmation_context + memory_context
                 print(
-                    f"ACTIVE CAREER ASSIST APPLICATION EVIDENCE CONTEXT ENRICHED: contacts={len(contact_lines)}",
+                    f"ACTIVE CAREER ASSIST APPLICATION EVIDENCE CONTEXT ENRICHED: contacts={len(contact_lines)} confirmations={len(confirmation_context)}",
                     flush=True,
                 )
 
@@ -15510,6 +15728,14 @@ Use them to understand follow-up answers.
 
 Do not ask again for information already supplied unless
 clarification is genuinely required.
+
+When CUSTOMER-CONFIRMED APPLICATION EVIDENCE is supplied, treat each quoted answer
+as the customer's own prior statement. Reuse it only for the exact fact it directly
+supports and do not strengthen or reinterpret it. Do not ask the same non-sensitive
+question again unless the current vacancy conflicts with that answer, the answer is
+ambiguous, or the customer says it changed. Sensitive/changeable declarations are
+never supplied through that reusable-evidence block and still require fresh input
+when the actual application requires them.
 
 If INTERNAL CONTEXT says that this same customer has a CV / candidate document
 on file, treat that CV as already supplied. For CV & Cover Letter, Career Assist,
