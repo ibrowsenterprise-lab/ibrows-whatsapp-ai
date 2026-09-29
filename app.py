@@ -811,6 +811,17 @@ def init_database():
                     UNIQUE(customer_number, application_url)
                 )
             """)
+            # Durable workflow markers. These let submission approval reuse an already
+            # delivered application pack instead of regenerating it, and provide an
+            # auditable timestamp for customer approval of the final handoff.
+            cur.execute("""
+                ALTER TABLE career_assist_applications
+                ADD COLUMN IF NOT EXISTS drafts_delivered_at TIMESTAMPTZ
+            """)
+            cur.execute("""
+                ALTER TABLE career_assist_applications
+                ADD COLUMN IF NOT EXISTS submission_authorized_at TIMESTAMPTZ
+            """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_career_assist_applications_customer
                 ON career_assist_applications(customer_number, updated_at DESC, id DESC)
@@ -2345,7 +2356,13 @@ def get_verified_vacancy_identity(customer_number, application_url):
 def upsert_career_assist_application_record(
     customer_number, vacancy, status="PREPARING", authorization_note=""
 ):
-    """Create/update a real per-vacancy Career Assist application record."""
+    """Create/update a real per-vacancy Career Assist application record.
+
+    Workflow state is monotonic for delivered/submitted applications: once a pack
+    has reached DRAFT_READY, a later preparation retry or QA failure must not
+    silently downgrade it to PREPARING/NEEDS_INFO. Likewise SUBMITTED can never
+    regress. A genuinely new vacancy still receives its requested initial state.
+    """
     allowed_statuses = {"PREPARING", "NEEDS_INFO", "DRAFT_READY", "SUBMITTED", "CANCELLED"}
     status = str(status or "PREPARING").upper().strip()
     if status not in allowed_statuses:
@@ -2358,34 +2375,52 @@ def upsert_career_assist_application_record(
         raise ValueError("Career Assist application requires an exact verified vacancy identity")
     state = get_career_assist_lifecycle_state(customer_number)
     lead_id = state.get("lead_id") if state.get("state") == "ACTIVE" else None
-    # In PostgreSQL ON CONFLICT, an unqualified column name can become ambiguous
-    # between the target row and EXCLUDED. Preserve the existing timestamp explicitly
-    # for non-submission status changes.
+
     submitted_sql = (
         "NOW()" if status == "SUBMITTED"
         else "career_assist_applications.submitted_at"
     )
     insert_submitted_sql = "NOW()" if status == "SUBMITTED" else "NULL"
+    insert_drafts_sql = "NOW()" if status == "DRAFT_READY" else "NULL"
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 INSERT INTO career_assist_applications
                     (customer_number, career_assist_lead_id, vacancy_title, employer,
-                     application_url, status, authorization_note, updated_at, submitted_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), {insert_submitted_sql})
+                     application_url, status, authorization_note, updated_at,
+                     submitted_at, drafts_delivered_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(),
+                        {insert_submitted_sql}, {insert_drafts_sql})
                 ON CONFLICT (customer_number, application_url)
                 DO UPDATE SET career_assist_lead_id=EXCLUDED.career_assist_lead_id,
                               vacancy_title=EXCLUDED.vacancy_title,
                               employer=EXCLUDED.employer,
-                              status=EXCLUDED.status,
+                              status=CASE
+                                  WHEN career_assist_applications.status='SUBMITTED'
+                                      THEN 'SUBMITTED'
+                                  WHEN career_assist_applications.status='DRAFT_READY'
+                                       AND EXCLUDED.status IN ('PREPARING','NEEDS_INFO')
+                                      THEN 'DRAFT_READY'
+                                  ELSE EXCLUDED.status
+                              END,
                               authorization_note=CASE
-                                  WHEN EXCLUDED.authorization_note <> '' THEN EXCLUDED.authorization_note
+                                  WHEN career_assist_applications.status IN ('DRAFT_READY','SUBMITTED')
+                                       AND EXCLUDED.status IN ('PREPARING','NEEDS_INFO')
+                                      THEN career_assist_applications.authorization_note
+                                  WHEN EXCLUDED.authorization_note <> ''
+                                      THEN EXCLUDED.authorization_note
                                   ELSE career_assist_applications.authorization_note
                               END,
                               updated_at=NOW(),
-                              submitted_at={submitted_sql}
-                RETURNING id
+                              submitted_at={submitted_sql},
+                              drafts_delivered_at=CASE
+                                  WHEN EXCLUDED.status='DRAFT_READY'
+                                      THEN COALESCE(career_assist_applications.drafts_delivered_at, NOW())
+                                  ELSE career_assist_applications.drafts_delivered_at
+                              END
+                RETURNING id, status
                 """,
                 (
                     customer_number, lead_id, title[:180], employer[:180],
@@ -2394,14 +2429,22 @@ def upsert_career_assist_application_record(
             )
             row = cur.fetchone()
         conn.commit()
-    return row[0] if row else None
+    if not row:
+        return None
+    if row[1] != status:
+        print(
+            f"CAREER ASSIST APPLICATION STATE PRESERVED: requested={status} actual={row[1]}",
+            flush=True,
+        )
+    return row[0]
 
 
 def get_career_assist_application_for_submission(customer_number, customer_message=""):
-    """Return one prepared Career Assist application that is safe to hand off for final submission.
+    """Return one prepared Career Assist application for final-submission handling.
 
-    Prefer an exact URL in the customer's message; otherwise use the most recently
-    updated DRAFT_READY application for this customer.
+    Prefer an exact URL in the customer's message; otherwise use the most recent
+    relevant application. Durable draft-delivery timestamps are returned so older
+    records can be repaired safely after the former state-regression bug.
     """
     direct_urls = extract_public_urls_from_text(customer_message)
     direct_url = direct_urls[0] if len(direct_urls) == 1 else ""
@@ -2411,7 +2454,8 @@ def get_career_assist_application_for_submission(customer_number, customer_messa
                 cur.execute(
                     """
                     SELECT id, career_assist_lead_id, vacancy_title, employer,
-                           application_url, status
+                           application_url, status, drafts_delivered_at,
+                           submission_authorized_at, started_at, updated_at
                     FROM career_assist_applications
                     WHERE customer_number=%s AND LOWER(application_url)=LOWER(%s)
                     ORDER BY updated_at DESC, id DESC
@@ -2423,7 +2467,8 @@ def get_career_assist_application_for_submission(customer_number, customer_messa
                 cur.execute(
                     """
                     SELECT id, career_assist_lead_id, vacancy_title, employer,
-                           application_url, status
+                           application_url, status, drafts_delivered_at,
+                           submission_authorized_at, started_at, updated_at
                     FROM career_assist_applications
                     WHERE customer_number=%s
                       AND status IN ('DRAFT_READY','NEEDS_INFO','PREPARING')
@@ -2443,7 +2488,84 @@ def get_career_assist_application_for_submission(customer_number, customer_messa
         "employer": str(row[3] or "").strip(),
         "application_url": str(row[4] or "").strip(),
         "status": str(row[5] or "").strip().upper(),
+        "drafts_delivered_at": row[6],
+        "submission_authorized_at": row[7],
+        "started_at": row[8],
+        "updated_at": row[9],
     }
+
+
+def recover_legacy_career_assist_draft_ready(customer_number, application):
+    """Repair only the legacy state-regression case from already-delivered drafts.
+
+    Older builds could overwrite DRAFT_READY with PREPARING/NEEDS_INFO when an
+    approval message was misrouted back through document generation. Recovery is
+    allowed only when (a) the selected vacancy is still the customer's stored target
+    and (b) the conversation contains the deterministic ready-for-review message
+    emitted only by the successful application-pack path after this record began.
+    """
+    if not application:
+        return application
+    if application.get("status") not in {"PREPARING", "NEEDS_INFO"}:
+        return application
+
+    defaults = get_application_pack_defaults(customer_number)
+    stored_target = str(defaults.get("target_url") or "").strip().casefold()
+    application_url = str(application.get("application_url") or "").strip().casefold()
+    if not stored_target or stored_target != application_url:
+        return application
+
+    started_at = application.get("started_at")
+    if not started_at:
+        return application
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT created_at
+                FROM conversations
+                WHERE customer_number=%s
+                  AND role='assistant'
+                  AND created_at >= %s
+                  AND content ILIKE %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (
+                    customer_number,
+                    started_at,
+                    "%Please review every detail before submitting. IBROWS has not submitted the application on your behalf.%",
+                ),
+            )
+            delivered = cur.fetchone()
+            if not delivered:
+                return application
+
+            cur.execute(
+                """
+                UPDATE career_assist_applications
+                SET status='DRAFT_READY',
+                    drafts_delivered_at=COALESCE(drafts_delivered_at, %s),
+                    updated_at=NOW()
+                WHERE id=%s
+                  AND customer_number=%s
+                  AND status IN ('PREPARING','NEEDS_INFO')
+                """,
+                (delivered[0], application["id"], customer_number),
+            )
+            recovered = cur.rowcount == 1
+        conn.commit()
+
+    if recovered:
+        application = dict(application)
+        application["status"] = "DRAFT_READY"
+        application["drafts_delivered_at"] = delivered[0]
+        print(
+            f"CAREER ASSIST LEGACY DRAFT STATE RECOVERED: record={application['id']}",
+            flush=True,
+        )
+    return application
 
 
 def record_career_assist_submission_handoff(customer_number, application, customer_name=""):
@@ -2472,7 +2594,9 @@ def record_career_assist_submission_handoff(customer_number, application, custom
             cur.execute(
                 """
                 UPDATE career_assist_applications
-                SET authorization_note=%s, updated_at=NOW()
+                SET authorization_note=%s,
+                    submission_authorized_at=COALESCE(submission_authorized_at, NOW()),
+                    updated_at=NOW()
                 WHERE id=%s AND customer_number=%s AND status='DRAFT_READY'
                 """,
                 (note[:1200], app_id, customer_number),
@@ -15888,6 +16012,9 @@ def receive_webhook():
                 try:
                     submission_application = get_career_assist_application_for_submission(
                         customer_number, customer_message
+                    )
+                    submission_application = recover_legacy_career_assist_draft_ready(
+                        customer_number, submission_application
                     )
                 except Exception as lookup_error:
                     submission_application = None
