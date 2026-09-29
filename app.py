@@ -14050,21 +14050,7 @@ def fetch_career_assist_application_context(customer_number, customer_request):
     apply_url = ""
     current_evidence = ""
     ashby = _ashby_public_posting_verification(selected, url)
-    if ashby.get("api_ok"):
-        if not ashby.get("live"):
-            print(
-                f"CAREER ASSIST APPLICATION REVALIDATION REJECTED: title={selected.get('title')} reason={ashby.get('reason')}",
-                flush=True,
-            )
-            return [{
-                "type": "input_text",
-                "text": (
-                    "INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: SELECTED_VACANCY_NO_LONGER_CURRENT. "
-                    f"The exact previously verified vacancy {selected.get('title')} at {selected.get('employer')} no longer appears "
-                    "in the official current Ashby posting feed. Do not prepare or submit it as an open vacancy. Tell the customer "
-                    "its current status could not be reconfirmed and offer to search for a replacement under active Career Assist."
-                ),
-            }], [], False
+    if ashby.get("api_ok") and ashby.get("live"):
         requirement_text = str(ashby.get("scope_text") or "")[:14000]
         live_url = str(ashby.get("job_url") or url)
         apply_url = str(ashby.get("apply_url") or "")
@@ -14081,6 +14067,53 @@ def fetch_career_assist_application_context(customer_number, customer_request):
             # the ATS board when the customer supplied no employer label.
             selected["employer"] = str(ashby.get("board") or "Ashby employer")[:180]
         current_evidence = "Exact posting is currently published in Ashby's public job-board feed."
+    elif ashby.get("api_ok") and not ashby.get("live"):
+        # A missing item in the Ashby board feed is NOT, by itself, enough to call a
+        # direct-link vacancy closed. Boards can expose aliases/unlisted direct links,
+        # and a feed mismatch can otherwise create a false-negative closure. Require a
+        # second current-status check before blocking preparation.
+        print(
+            f"CAREER ASSIST ASHBY FEED MISS — SECONDARY REVALIDATION REQUIRED: "
+            f"title={selected.get('title')} reason={ashby.get('reason')}",
+            flush=True,
+        )
+        secondary_verified, secondary_urls, secondary_stats = _secondary_verify_vacancy_candidates(
+            [selected], date.today(), require_malawi_scope=False
+        )
+        if secondary_verified:
+            selected = dict(secondary_verified[0])
+            live_url = str(selected.get("application_url") or url)
+            requirement_text = str(selected.get("_job_requirement_text") or "")[:14000]
+            current_evidence = str(selected.get("open_evidence") or "Secondary current-status verification confirmed this vacancy.")
+            if secondary_urls:
+                print(
+                    f"CAREER ASSIST ASHBY FEED MISS RECOVERED BY SECONDARY VERIFICATION: "
+                    f"title={selected.get('title')} sources={len(secondary_urls)}",
+                    flush=True,
+                )
+        else:
+            # Distinguish 'not confirmed' from 'confirmed closed'. Only explicit closed/
+            # expired evidence may produce a closed-vacancy status.
+            explicitly_closed = bool(secondary_stats.get("closed") or secondary_stats.get("expired"))
+            status = (
+                "SELECTED_VACANCY_NO_LONGER_CURRENT"
+                if explicitly_closed else
+                "VACANCY_REVALIDATION_UNAVAILABLE"
+            )
+            if explicitly_closed:
+                detail = (
+                    "A secondary current-status check found explicit closed/expired evidence for the selected vacancy. "
+                    "Do not prepare or submit it as an open vacancy."
+                )
+            else:
+                detail = (
+                    "The exact vacancy is still identified, but the Ashby feed miss could not be independently resolved right now. "
+                    "Do not call the vacancy closed and do not ask for payment or the URL again. Invite a retry of current-status verification."
+                )
+            return [{
+                "type": "input_text",
+                "text": f"INTERNAL ACTIVE CAREER ASSIST APPLICATION STATUS: {status}. " + detail,
+            }], secondary_urls[:10], False
     else:
         try:
             page_text, final_url = _direct_page_text_for_vacancy(url)
@@ -14345,15 +14378,7 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
         # source of truth. This avoids falsely closing a live JavaScript-heavy vacancy
         # merely because a search model could not see a rendered Apply control.
         ashby_check = _ashby_public_posting_verification(item, candidate_url)
-        if ashby_check.get("api_ok"):
-            if not ashby_check.get("live"):
-                stats["closed"] += 1
-                print(
-                    f"CAREER ASSIST ASHBY PUBLIC API REJECTED NOT PUBLISHED: "
-                    f"title={item.get('title')} board={ashby_check.get('board')} reason={ashby_check.get('reason')}",
-                    flush=True,
-                )
-                continue
+        if ashby_check.get("api_ok") and ashby_check.get("live"):
             ashby_scope_text = str(ashby_check.get("scope_text") or "")
             ashby_scope_item = dict(item)
             ashby_scope_item["location"] = str(ashby_check.get("location") or item.get("location") or "")
@@ -14382,6 +14407,14 @@ def _secondary_verify_vacancy_candidates(candidates, today_date, require_malawi_
                 flush=True,
             )
             continue
+        elif ashby_check.get("api_ok") and not ashby_check.get("live"):
+            # Feed absence is an ambiguity signal, not conclusive closure. Continue
+            # through the independent current-status search/page verification below.
+            print(
+                f"CAREER ASSIST ASHBY PUBLIC API MISS — CONTINUING SECONDARY CHECK: "
+                f"title={item.get('title')} board={ashby_check.get('board')} reason={ashby_check.get('reason')}",
+                flush=True,
+            )
 
         if status_conflict:
             stats["closed"] += 1
@@ -14569,15 +14602,7 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
         # Prefer Ashby's own public currently-published postings feed over rendered-page
         # heuristics. The feed is specifically designed to list current public postings.
         ashby_check = _ashby_public_posting_verification(item, url)
-        if ashby_check.get("api_ok"):
-            if not ashby_check.get("live"):
-                stats["closed"] += 1
-                print(
-                    f"CAREER ASSIST ASHBY PUBLIC API REJECTED NOT PUBLISHED: "
-                    f"title={item.get('title')} board={ashby_check.get('board')} reason={ashby_check.get('reason')}",
-                    flush=True,
-                )
-                continue
+        if ashby_check.get("api_ok") and ashby_check.get("live"):
             ashby_scope_text = str(ashby_check.get("scope_text") or "")
             ashby_scope_item = dict(item)
             ashby_scope_item["location"] = str(ashby_check.get("location") or item.get("location") or "")
@@ -14605,6 +14630,14 @@ def _final_live_page_vacancy_gate(vacancies, today_date, require_malawi_scope=Fa
                 flush=True,
             )
             continue
+        elif ashby_check.get("api_ok") and not ashby_check.get("live"):
+            # Do not equate a board-feed miss with a closed job. Push it through the
+            # same direct-page/secondary verification used for other ambiguous ATS pages.
+            print(
+                f"CAREER ASSIST ASHBY PUBLIC API MISS — PAGE/SECONDARY CHECK REQUIRED: "
+                f"title={item.get('title')} board={ashby_check.get('board')} reason={ashby_check.get('reason')}",
+                flush=True,
+            )
 
         try:
             page_text, final_url = _direct_page_text_for_vacancy(url)
