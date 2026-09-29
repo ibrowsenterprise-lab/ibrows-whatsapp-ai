@@ -5292,11 +5292,13 @@ def detect_single_job_application_request(customer_message):
 
 
 def detect_career_assist_application_request(customer_message):
-    """Detect an identified-vacancy application request that may be covered by active Career Assist.
+    """Detect a specific-vacancy application request covered by active Career Assist.
 
-    This is intentionally separate from vacancy discovery. An active Career Assist term covers
-    application support/execution within the customer's agreed scope; it must not be redirected
-    into the standalone MK2,000 Single Job Application payment gate.
+    This detector intentionally accepts ordinary wording such as "proceed with the verified
+    QED vacancy" as well as explicit "apply for this job" wording. A customer with an ACTIVE
+    Career Assist term must not be pushed into the standalone MK2,000 gate merely because the
+    sentence does not match one narrow phrase. Find-then-apply requests for a vacancy that is
+    not identified yet remain discovery-first and are handled separately.
     """
     text = " ".join(str(customer_message or "").lower().split())
     if not text:
@@ -5306,21 +5308,38 @@ def detect_career_assist_application_request(customer_message):
         or detect_career_assist_standing_consent_revoke(customer_message)
     ):
         return False
+
+    # A request for a future/not-yet-identified vacancy must search first.
+    if detect_career_assist_future_vacancy_apply_request(customer_message):
+        return False
     if detect_career_assist_vacancy_search_request(customer_message):
         return False
+
     application_intent = any(phrase in text for phrase in (
         "i want to apply", "want to apply", "apply for vacancy", "apply to vacancy",
         "apply for this job", "apply to this job", "apply for this role", "apply to this role",
         "apply for the first one", "apply for the second one", "apply for the third one",
         "proceed with this application", "proceed with my application",
-        "continue this application", "start this application", "submit this application",
-        "before anything is submitted", "before submission",
+        "proceed with the verified", "proceed with verified", "proceed with the vacancy",
+        "continue this application", "continue with the application", "start this application",
+        "submit this application", "submit the application", "using my standing application authorization",
+        "using my standing application authorisation", "use my standing application authorization",
+        "use my standing application authorisation", "before anything is submitted", "before submission",
     ))
     target_hint = any(term in text for term in (
         "vacancy", "job", "role", "position", "first one", "second one", "third one",
         "vacancy 1", "vacancy 2", "vacancy 3", "role 1", "role 2", "role 3",
     ))
-    return application_intent and target_hint
+
+    # Generic action + a specific vacancy/job target is also enough. This catches natural
+    # variants such as "Under my active Career Assist, proceed with the verified QED.ai
+    # Data Analyst – Lilongwe vacancy" without weakening discovery-first handling above.
+    action_word = any(word in text for word in ("apply", "proceed", "continue", "start", "submit"))
+    specific_target = target_hint and not any(marker in text for marker in (
+        "next vacancy", "next job", "next role", "next verified", "next suitable",
+        "next strong fit", "next matching", "you find for me", "find for me",
+    ))
+    return (application_intent and target_hint) or (action_word and specific_target)
 
 
 def ensure_cv_package_lead(customer_number, customer_name):
@@ -14793,6 +14812,7 @@ def receive_webhook():
         if message_type == "text" and (
             detect_career_assist_vacancy_search_request(customer_message)
             or detect_career_assist_application_request(customer_message)
+            or detect_single_job_application_request(customer_message)
         ):
             try:
                 career_state = get_career_assist_lifecycle_state(customer_number)
@@ -14800,8 +14820,17 @@ def receive_webhook():
                 active_career_assist_discovery = (
                     career_active and detect_career_assist_vacancy_search_request(customer_message)
                 )
+                # While Career Assist is ACTIVE, application support for a specific vacancy
+                # stays inside the monthly entitlement even when the message also matches the
+                # generic standalone Single Job Application detector. Discovery always wins
+                # for a future/not-yet-identified vacancy.
                 active_career_assist_application = (
-                    career_active and detect_career_assist_application_request(customer_message)
+                    career_active
+                    and not active_career_assist_discovery
+                    and (
+                        detect_career_assist_application_request(customer_message)
+                        or detect_single_job_application_request(customer_message)
+                    )
                 )
             except Exception as lifecycle_error:
                 print(
@@ -15198,9 +15227,18 @@ def generate_ai_reply(
         active_career_application = False
         career_verified_urls = []
 
-        # An active Career Assist customer choosing a verified vacancy is still inside
+        # An active Career Assist customer choosing a specific vacancy is still inside
         # the monthly Career Assist entitlement; this is not the standalone MK2,000 service.
-        if detect_career_assist_application_request(customer_message):
+        # The generic Single Job detector is intentionally accepted here as a fallback so
+        # natural wording cannot accidentally escape Career Assist routing.
+        specific_application_request = (
+            not detect_career_assist_vacancy_search_request(customer_message)
+            and (
+                detect_career_assist_application_request(customer_message)
+                or detect_single_job_application_request(customer_message)
+            )
+        )
+        if specific_application_request:
             try:
                 application_state = get_career_assist_lifecycle_state(customer_number)
             except Exception as lifecycle_error:
@@ -15211,6 +15249,30 @@ def generate_ai_reply(
                 )
             if application_state.get("state") == "ACTIVE":
                 active_career_application = True
+                try:
+                    standing_for_application = get_career_assist_standing_consent(customer_number)
+                    if standing_for_application.get("effective"):
+                        payment_context.append({
+                            "role": "user",
+                            "content": (
+                                "INTERNAL ACTIVE CAREER ASSIST APPLICATION AUTHORITY. Standing application authorization "
+                                "is currently ACTIVE. Exact authorized scope: "
+                                + str(standing_for_application.get("scope_text") or "")[:2200]
+                                + "\nFor a verified vacancy that falls within this exact scope, do not ask the customer to "
+                                  "authorize that same vacancy again. Still stop and ask for any sensitive, new, ambiguous, "
+                                  "or unverified declaration/answer. Authorization is not submission; never claim submitted "
+                                  "without real employer/application-system confirmation."
+                            ),
+                        })
+                        print(
+                            f"CAREER ASSIST STANDING CONSENT ACTIVE FOR APPLICATION: event={standing_for_application.get('event_id')}",
+                            flush=True,
+                        )
+                except Exception as standing_application_error:
+                    print(
+                        f"CAREER ASSIST APPLICATION STANDING CONSENT CHECK FAILED: {type(standing_application_error).__name__}",
+                        flush=True,
+                    )
                 # Application readiness is evidence-sensitive. Always include the wider
                 # candidate-only CV evidence and resolved stored contact defaults.
                 application_cv_context = build_candidate_cv_evidence_context(customer_number)
