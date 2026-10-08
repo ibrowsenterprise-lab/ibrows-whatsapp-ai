@@ -1,0 +1,31 @@
+name: V131 Python and gallery smoke checks
+on:
+  push:
+    branches:
+      - feature/v131-gallery-performance
+  pull_request:
+    branches:
+      - main
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout proposal
+        uses: actions/checkout@v4
+      - name: Use Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check Python syntax
+        run: python -m py_compile app.py tools/apply_v131.py
+      - name: Verify expected V131 app source and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object app.py)" = "625a24ab770300271351e25e25b5ee72a71b909c"
+          grep -q 'IBROWS_BUILD_VERSION = "2026-10-08-gallery-previews-v131"' app.py
+          grep -q 'WEB_GALLERY_ADMIN_PREVIEW_MAX_SIDE = 640' app.py
+          grep -q 'Pillow>=10.4,<13' requirements.txt
+          echo 'Verified V131 source SHA, marker and Pillow dependency.'
