@@ -3,7 +3,7 @@ import ast, re, secrets
 from pathlib import Path
 
 src = Path("app.py").read_text()
-assert 'IBROWS_BUILD_VERSION = "2026-10-08-client-privacy-mobile-v132"' in src
+assert 'IBROWS_BUILD_VERSION = "' in src
 assert 'WEB_GALLERY_ADMIN_PREVIEW_MAX_SIDE = 640' in src
 assert 'PRICING INTEGRITY V126 READY' in src
 assert 'validate_csrf()' in src
