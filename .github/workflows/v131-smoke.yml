@@ -33,3 +33,6 @@ jobs:
         run: |
           python tools/test_v132.py
           node --check /tmp/ibrows-v132-admin.js
+      - name: Run V133 responsive media and PDF checks
+        if: hashFiles('tools/test_v133.py') != ''
+        run: python tools/test_v133.py
