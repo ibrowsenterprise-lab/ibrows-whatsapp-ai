@@ -1,0 +1,31 @@
+name: Build verified V132 app.py
+on:
+  push:
+    branches:
+      - feature/v132-client-privacy-mobile
+    paths:
+      - 'tools/apply_v132.py'
+      - '.github/workflows/v132-build.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout development branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Build and verify V132
+        run: python tools/apply_v132.py
+      - name: Commit only generated app.py
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          if git diff --cached --quiet; then
+            echo 'V132 already current'
+            exit 0
+          fi
+          git commit -m 'Generate verified V132 client privacy and mobile hints'
+          git push origin HEAD:feature/v132-client-privacy-mobile
