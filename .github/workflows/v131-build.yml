@@ -1,0 +1,31 @@
+name: Build tested V131 app.py from verified V130
+on:
+  push:
+    branches:
+      - feature/v131-gallery-performance
+    paths:
+      - 'tools/apply_v131.py'
+      - '.github/workflows/v131-build.yml'
+permissions:
+  contents: write
+jobs:
+  build-v131:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout development branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Apply and verify V131 source
+        run: python tools/apply_v131.py
+      - name: Commit generated app.py to development branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          if git diff --cached --quiet; then
+            echo 'No app.py changes needed'
+            exit 0
+          fi
+          git commit -m 'Build verified V131 app.py gallery performance update'
+          git push origin HEAD:feature/v131-gallery-performance
