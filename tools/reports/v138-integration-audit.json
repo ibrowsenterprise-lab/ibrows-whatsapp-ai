@@ -1,0 +1,794 @@
+{
+  "build": "2026-10-09-readmalawi-community-v137",
+  "route_count": 168,
+  "team": [
+    {
+      "name": "Jones Nalikungwi",
+      "role": "Founder & Managing Director",
+      "slug": "jones-nalikungwi",
+      "photo_present": true
+    },
+    {
+      "name": "Martha Nalikungwi",
+      "role": "Co-Founder",
+      "slug": "martha-nalikungwi",
+      "photo_present": true
+    },
+    {
+      "name": "Sylvester Katopola",
+      "role": "Operations & Administration",
+      "slug": "sylvester-katopola",
+      "photo_present": true
+    },
+    {
+      "name": "Christopher Ngalu",
+      "role": "Creative Media",
+      "slug": "christopher-ngalu",
+      "photo_present": true
+    },
+    {
+      "name": "Amos Mngoli",
+      "role": "Finance Consultant",
+      "slug": "amos-mngoli",
+      "photo_present": true
+    },
+    {
+      "name": "Lewis Tambala",
+      "role": "Projects Lead",
+      "slug": "lewis-tambala",
+      "photo_present": true
+    },
+    {
+      "name": "Kumbukani Mkandawire",
+      "role": "Field Services Coordinator",
+      "slug": "kumbukani-mkandawire",
+      "photo_present": true
+    },
+    {
+      "name": "Fatuma Nyirenda",
+      "role": "IT Specialist Lead",
+      "slug": "fatuma-nyirenda",
+      "photo_present": true
+    }
+  ],
+  "homepage": {
+    "href=\"/team\"": true,
+    "href=\"/company-profile\"": true,
+    "href=\"/project-discovery\"": false,
+    "id=\"community-project\"": true,
+    "readmalawi-library.onrender.com": true,
+    "{{ team_members|length }} people": true
+  },
+  "team_page": {
+    "team_members": true,
+    "member.slug": true
+  },
+  "service_form": {
+    "csrf_token": true,
+    "consent": true,
+    "service_key": true
+  },
+  "discovery": {
+    "step": true,
+    "csrf_token": true
+  },
+  "profile_html": {
+    "present": false
+  },
+  "route_presence": {
+    "/": true,
+    "/team": true,
+    "/company-profile": true,
+    "/company-profile.pdf": true,
+    "/project-discovery": true,
+    "/business-registration": true,
+    "/design-branding": true,
+    "/photo-restoration": true,
+    "/landscaping": true,
+    "/fumigation": true,
+    "/business-email": true,
+    "/privacy": true,
+    "/pricing": true,
+    "/admin/login": true
+  },
+  "all_routes": [
+    {
+      "path": "/assets/ibrows-logo.jpg",
+      "handler": "public_ibrows_logo"
+    },
+    {
+      "path": "/favicon.ico",
+      "handler": "favicon"
+    },
+    {
+      "path": "/apple-touch-icon.png",
+      "handler": "apple_touch_icon"
+    },
+    {
+      "path": "/apple-touch-icon-precomposed.png",
+      "handler": "apple_touch_icon"
+    },
+    {
+      "path": "/assets/jones-nalikungwi-founder.jpg",
+      "handler": "public_jones_nalikungwi_founder"
+    },
+    {
+      "path": "/assets/team/<slug>.jpg",
+      "handler": "public_team_photo"
+    },
+    {
+      "path": "/team",
+      "handler": "public_team_page"
+    },
+    {
+      "path": "/company-profile",
+      "handler": "public_company_profile_page"
+    },
+    {
+      "path": "/company-profile.pdf",
+      "handler": "public_company_profile_pdf"
+    },
+    {
+      "path": "/",
+      "handler": "home"
+    },
+    {
+      "path": "/pricing",
+      "handler": "pricing_overview"
+    },
+    {
+      "path": "/robots.txt",
+      "handler": "robots_txt"
+    },
+    {
+      "path": "/sitemap.xml",
+      "handler": "sitemap_xml"
+    },
+    {
+      "path": "/security.txt",
+      "handler": "security_txt"
+    },
+    {
+      "path": "/.well-known/security.txt",
+      "handler": "security_txt"
+    },
+    {
+      "path": "/health",
+      "handler": "health"
+    },
+    {
+      "path": "/admin/confirm-actions.js",
+      "handler": "admin_confirm_actions_js"
+    },
+    {
+      "path": "/tasks/followup-reminders",
+      "handler": "follow_up_reminder_task"
+    },
+    {
+      "path": "/admin/login",
+      "handler": "admin_login"
+    },
+    {
+      "path": "/admin/logout",
+      "handler": "admin_logout"
+    },
+    {
+      "path": "/admin/manifest.webmanifest",
+      "handler": "admin_manifest"
+    },
+    {
+      "path": "/admin/icon.svg",
+      "handler": "admin_icon"
+    },
+    {
+      "path": "/admin/sw.js",
+      "handler": "admin_service_worker"
+    },
+    {
+      "path": "/admin/pwa.js",
+      "handler": "admin_pwa_js"
+    },
+    {
+      "path": "/admin/leads",
+      "handler": "admin_leads"
+    },
+    {
+      "path": "/admin/monitoring",
+      "handler": "admin_monitoring"
+    },
+    {
+      "path": "/admin/meta-readiness",
+      "handler": "admin_meta_readiness"
+    },
+    {
+      "path": "/admin/customers",
+      "handler": "admin_customers"
+    },
+    {
+      "path": "/admin/inbox",
+      "handler": "admin_inbox"
+    },
+    {
+      "path": "/admin/inbox/<customer_number>",
+      "handler": "admin_inbox_chat"
+    },
+    {
+      "path": "/admin/inbox/<customer_number>/send",
+      "handler": "admin_inbox_send"
+    },
+    {
+      "path": "/admin/applications",
+      "handler": "admin_career_applications"
+    },
+    {
+      "path": "/admin/finance/history",
+      "handler": "admin_monthly_history"
+    },
+    {
+      "path": "/admin/finance/reports",
+      "handler": "admin_financial_reports"
+    },
+    {
+      "path": "/admin/finance/reports.pdf",
+      "handler": "admin_financial_report_pdf"
+    },
+    {
+      "path": "/admin/finance/export.csv",
+      "handler": "admin_finance_export_csv"
+    },
+    {
+      "path": "/admin/finance/payments/<int:payment_id>/void",
+      "handler": "admin_void_payment"
+    },
+    {
+      "path": "/admin/finance",
+      "handler": "admin_finance"
+    },
+    {
+      "path": "/admin/finance/profitability",
+      "handler": "admin_profitability"
+    },
+    {
+      "path": "/admin/finance/expenses",
+      "handler": "admin_expenses"
+    },
+    {
+      "path": "/admin/finance/expenses/add",
+      "handler": "admin_expenses_add"
+    },
+    {
+      "path": "/admin/finance/expenses/<int:expense_id>/delete",
+      "handler": "admin_expenses_delete"
+    },
+    {
+      "path": "/admin/finance/receivables",
+      "handler": "admin_receivables"
+    },
+    {
+      "path": "/admin/customers/<customer_number>",
+      "handler": "admin_customer_history"
+    },
+    {
+      "path": "/admin/customers/<customer_number>/merge-duplicates",
+      "handler": "admin_merge_customer_duplicates"
+    },
+    {
+      "path": "/admin/leads/<int:lead_id>/document/<doc_type>",
+      "handler": "admin_business_document_download"
+    },
+    {
+      "path": "/admin/leads/<int:lead_id>/send-document/<doc_type>",
+      "handler": "admin_business_document_send"
+    },
+    {
+      "path": "/admin/customers/<customer_number>/ai",
+      "handler": "admin_ai_takeover"
+    },
+    {
+      "path": "/admin/leads/<int:lead_id>/single-job/complete",
+      "handler": "admin_single_job_application_complete"
+    },
+    {
+      "path": "/admin/leads/<int:lead_id>/career-assist/activate",
+      "handler": "admin_career_assist_activate"
+    },
+    {
+      "path": "/admin/career-assist/applications/<int:application_id>/submitted",
+      "handler": "admin_career_assist_application_submitted"
+    },
+    {
+      "path": "/admin/leads/<int:lead_id>/operations",
+      "handler": "admin_lead_operations"
+    },
+    {
+      "path": "/admin/customers/<customer_number>/privacy",
+      "handler": "admin_customer_privacy"
+    },
+    {
+      "path": "/admin/leads/<int:lead_id>/status",
+      "handler": "admin_lead_status"
+    },
+    {
+      "path": "/webhook",
+      "handler": "verify_webhook"
+    },
+    {
+      "path": "/webhook",
+      "handler": "receive_webhook"
+    },
+    {
+      "path": "/privacy",
+      "handler": "privacy_policy"
+    },
+    {
+      "path": "/terms",
+      "handler": "terms_of_service"
+    },
+    {
+      "path": "/data-deletion",
+      "handler": "data_deletion"
+    },
+    {
+      "path": "/project-discovery/ui.js",
+      "handler": "project_discovery_ui_js"
+    },
+    {
+      "path": "/project-discovery",
+      "handler": "project_discovery_start"
+    },
+    {
+      "path": "/project-discovery/start",
+      "handler": "project_discovery_create"
+    },
+    {
+      "path": "/project-discovery/<public_token>/step/<int:step>",
+      "handler": "project_discovery_step"
+    },
+    {
+      "path": "/project-discovery/<public_token>/complete",
+      "handler": "project_discovery_complete"
+    },
+    {
+      "path": "/admin/projects",
+      "handler": "admin_projects"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>",
+      "handler": "admin_project_detail"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/status",
+      "handler": "admin_project_status"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/analyze",
+      "handler": "admin_project_analyze"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/note",
+      "handler": "admin_project_note"
+    },
+    {
+      "path": "/admin/projects/costing-ui.js",
+      "handler": "admin_costing_ui_js"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/costing/template.csv",
+      "handler": "admin_project_costing_template"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/costing/import",
+      "handler": "admin_project_costing_import"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/costing/import/apply",
+      "handler": "admin_project_costing_import_apply"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/costing",
+      "handler": "admin_project_costing"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/costing/approve",
+      "handler": "admin_project_costing_approve"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/quotation-preview",
+      "handler": "admin_project_quotation_preview"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/quotation-preview/issue",
+      "handler": "admin_project_quotation_issue"
+    },
+    {
+      "path": "/admin/projects/quotation-delivery-ui.js",
+      "handler": "admin_quotation_delivery_ui_js"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/quotations/<int:quotation_id>",
+      "handler": "admin_project_quotation_detail"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/quotations/<int:quotation_id>/pdf",
+      "handler": "admin_project_quotation_pdf"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/quotations/<int:quotation_id>/client-preview",
+      "handler": "admin_project_quotation_client_preview"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/quotations/<int:quotation_id>/whatsapp",
+      "handler": "admin_project_quotation_whatsapp"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/quotations/<int:quotation_id>/email",
+      "handler": "admin_project_quotation_email"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/deposit-invoice/pdf",
+      "handler": "admin_project_deposit_invoice_pdf"
+    },
+    {
+      "path": "/quotation/<public_token>/deposit-invoice.pdf",
+      "handler": "public_project_deposit_invoice_pdf"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/sandbox/enable",
+      "handler": "admin_project_sandbox_enable"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/sandbox/payments/record",
+      "handler": "admin_project_sandbox_payment_record"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/sandbox/payments/<int:payment_id>/void",
+      "handler": "admin_project_sandbox_payment_void"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/sandbox/start",
+      "handler": "admin_project_sandbox_start"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/sandbox/reset",
+      "handler": "admin_project_sandbox_reset"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/sandbox/exit",
+      "handler": "admin_project_sandbox_exit"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/payments/record",
+      "handler": "admin_project_payment_record"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/payments/<int:payment_id>/void",
+      "handler": "admin_project_payment_void"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/start",
+      "handler": "admin_project_start"
+    },
+    {
+      "path": "/quotation/<public_token>",
+      "handler": "public_project_quotation"
+    },
+    {
+      "path": "/quotation/<public_token>/pdf",
+      "handler": "public_project_quotation_pdf"
+    },
+    {
+      "path": "/quotation/<public_token>/respond",
+      "handler": "public_project_quotation_respond"
+    },
+    {
+      "path": "/admin/finance/budgets",
+      "handler": "admin_budget_dashboard"
+    },
+    {
+      "path": "/admin/finance/budgets/save",
+      "handler": "admin_budget_save"
+    },
+    {
+      "path": "/admin/finance/budgets/<int:budget_id>/delete",
+      "handler": "admin_budget_delete"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/execution",
+      "handler": "admin_project_execution"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/execution/milestones/<milestone_id>/update",
+      "handler": "admin_project_execution_milestone_update"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/execution/tasks/add",
+      "handler": "admin_project_execution_task_add"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/execution/tasks/<task_id>/update",
+      "handler": "admin_project_execution_task_update"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/execution/tasks/<task_id>/delete",
+      "handler": "admin_project_execution_task_delete"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/execution/updates/add",
+      "handler": "admin_project_execution_update_add"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/execution/invoices/<stage>/create",
+      "handler": "admin_project_stage_invoice_create"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/execution/invoices/<stage>/pdf",
+      "handler": "admin_project_stage_invoice_pdf"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/execution/complete",
+      "handler": "admin_project_execution_complete"
+    },
+    {
+      "path": "/admin/projects/<int:project_id>/execution/client-preview",
+      "handler": "admin_project_execution_client_preview"
+    },
+    {
+      "path": "/project-status/<public_token>",
+      "handler": "public_project_status"
+    },
+    {
+      "path": "/project-status/<public_token>/invoice/<stage>.pdf",
+      "handler": "public_project_stage_invoice_pdf"
+    },
+    {
+      "path": "/construction",
+      "handler": "construction_portfolio"
+    },
+    {
+      "path": "/construction/media/<int:asset_id>",
+      "handler": "construction_portfolio_asset"
+    },
+    {
+      "path": "/construction/company-profile",
+      "handler": "construction_company_profile"
+    },
+    {
+      "path": "/admin/construction-portfolio",
+      "handler": "admin_construction_portfolio"
+    },
+    {
+      "path": "/admin/construction-portfolio/media/<int:asset_id>",
+      "handler": "admin_construction_asset_media"
+    },
+    {
+      "path": "/admin/construction-portfolio/profile",
+      "handler": "admin_construction_profile_upload"
+    },
+    {
+      "path": "/admin/construction-portfolio/profile/remove",
+      "handler": "admin_construction_profile_remove"
+    },
+    {
+      "path": "/admin/construction-portfolio/images",
+      "handler": "admin_construction_images_upload"
+    },
+    {
+      "path": "/admin/construction-portfolio/images/bulk-update",
+      "handler": "admin_construction_images_bulk_update"
+    },
+    {
+      "path": "/admin/construction-portfolio/images/<int:asset_id>/update",
+      "handler": "admin_construction_image_update"
+    },
+    {
+      "path": "/admin/construction-portfolio/images/<int:asset_id>/delete",
+      "handler": "admin_construction_image_delete"
+    },
+    {
+      "path": "/career-jobs",
+      "handler": "career_jobs_service"
+    },
+    {
+      "path": "/scholarships-opportunities",
+      "handler": "scholarships_opportunities_service"
+    },
+    {
+      "path": "/cleaning-services",
+      "handler": "cleaning_services_alias"
+    },
+    {
+      "path": "/cleaning",
+      "handler": "cleaning_service"
+    },
+    {
+      "path": "/car-wash",
+      "handler": "car_wash_service"
+    },
+    {
+      "path": "/design-branding/enquiry",
+      "handler": "design_branding_service"
+    },
+    {
+      "path": "/landscaping/enquiry",
+      "handler": "landscaping_service"
+    },
+    {
+      "path": "/construction/enquiry",
+      "handler": "construction_service"
+    },
+    {
+      "path": "/landscaping/preview",
+      "handler": "landscaping_preview_service"
+    },
+    {
+      "path": "/construction/design-quote",
+      "handler": "construction_design_service"
+    },
+    {
+      "path": "/construction/tender-boq-support",
+      "handler": "construction_tender_service"
+    },
+    {
+      "path": "/business-registration",
+      "handler": "business_registration_service"
+    },
+    {
+      "path": "/business-email",
+      "handler": "business_email_service"
+    },
+    {
+      "path": "/photo-restoration",
+      "handler": "photo_restoration_service"
+    },
+    {
+      "path": "/fumigation",
+      "handler": "fumigation_service"
+    },
+    {
+      "path": "/agriculture",
+      "handler": "agriculture_service"
+    },
+    {
+      "path": "/design-branding",
+      "handler": "design_branding_portfolio"
+    },
+    {
+      "path": "/landscaping",
+      "handler": "landscaping_portfolio"
+    },
+    {
+      "path": "/fumigation/gallery",
+      "handler": "fumigation_portfolio"
+    },
+    {
+      "path": "/cleaning/office-gallery",
+      "handler": "office_cleaning_portfolio"
+    },
+    {
+      "path": "/cleaning/home-gallery",
+      "handler": "home_cleaning_portfolio"
+    },
+    {
+      "path": "/landscaping/comparison/<int:pair_id>/<side>",
+      "handler": "landscaping_comparison_media"
+    },
+    {
+      "path": "/service-portfolio/media/<int:asset_id>",
+      "handler": "service_portfolio_media"
+    },
+    {
+      "path": "/admin/google-photos/start",
+      "handler": "admin_google_photos_start"
+    },
+    {
+      "path": "/admin/google-photos/oauth/callback",
+      "handler": "admin_google_photos_oauth_callback"
+    },
+    {
+      "path": "/admin/google-photos/import",
+      "handler": "admin_google_photos_import"
+    },
+    {
+      "path": "/admin/service-portfolios",
+      "handler": "admin_service_portfolios"
+    },
+    {
+      "path": "/admin/service-portfolios/media/<int:asset_id>",
+      "handler": "admin_service_portfolio_media"
+    },
+    {
+      "path": "/admin/service-portfolios/landscaping-comparison/<int:pair_id>/<side>",
+      "handler": "admin_landscape_comparison_media"
+    },
+    {
+      "path": "/admin/service-portfolios/landscaping-comparison/upload",
+      "handler": "admin_landscape_comparison_upload"
+    },
+    {
+      "path": "/admin/service-portfolios/landscaping-comparison/<int:pair_id>/update",
+      "handler": "admin_landscape_comparison_update"
+    },
+    {
+      "path": "/admin/service-portfolios/landscaping-comparison/<int:pair_id>/delete",
+      "handler": "admin_landscape_comparison_delete"
+    },
+    {
+      "path": "/admin/service-portfolios/<service_key>/images",
+      "handler": "admin_service_portfolio_upload"
+    },
+    {
+      "path": "/admin/service-portfolios/design-branding/media",
+      "handler": "admin_design_media_upload"
+    },
+    {
+      "path": "/admin/service-portfolios/<service_key>/images/bulk-update",
+      "handler": "admin_service_portfolio_bulk_update"
+    },
+    {
+      "path": "/admin/service-portfolios/<service_key>/images/<int:asset_id>/update",
+      "handler": "admin_service_portfolio_update"
+    },
+    {
+      "path": "/admin/service-portfolios/<service_key>/images/<int:asset_id>/delete",
+      "handler": "admin_service_portfolio_delete"
+    },
+    {
+      "path": "/admin/service-requests",
+      "handler": "admin_service_requests"
+    },
+    {
+      "path": "/admin/service-requests/run-reminder-check",
+      "handler": "admin_service_requests_run_reminder_check"
+    },
+    {
+      "path": "/admin/service-requests/<int:request_id>",
+      "handler": "admin_service_request_detail"
+    },
+    {
+      "path": "/admin/service-requests/<int:request_id>/tender-workflow",
+      "handler": "admin_service_request_tender_workflow"
+    },
+    {
+      "path": "/admin/service-requests/<int:request_id>/send-follow-up-reminder",
+      "handler": "admin_service_request_send_follow_up_reminder"
+    },
+    {
+      "path": "/admin/service-requests/<int:request_id>/files/<int:file_id>",
+      "handler": "admin_service_request_file"
+    },
+    {
+      "path": "/admin/service-requests/<int:request_id>/update",
+      "handler": "admin_service_request_update"
+    },
+    {
+      "path": "/admin/service-requests/<int:request_id>/delete",
+      "handler": "admin_service_request_delete"
+    }
+  ],
+  "security_code_markers": {
+    "SESSION_COOKIE_HTTPONLY=True": true,
+    "def validate_csrf()": true,
+    "PRICING INTEGRITY V126 READY": true,
+    "WHATSAPP INTEGRITY": true,
+    "WEB_GALLERY_ADMIN_PREVIEW_MAX_SIDE = 640": true
+  },
+  "profile_pdf": {
+    "found": true,
+    "pages": 11,
+    "contains_fatuma": false,
+    "team_names_in_document": [
+      "Jones Nalikungwi",
+      "Martha Nalikungwi",
+      "Sylvester Katopola",
+      "Christopher Ngalu",
+      "Amos Mngoli",
+      "Lewis Tambala",
+      "Kumbukani Mkandawire"
+    ],
+    "error": null,
+    "byte_size": 744308
+  },
+  "notices": [
+    "Embedded company profile PDF does not mention latest staff member Fatuma"
+  ]
+}
