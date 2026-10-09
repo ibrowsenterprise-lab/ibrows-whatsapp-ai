@@ -39,3 +39,5 @@ jobs:
           python tools/test_v134_business_email.py
       - name: Audit unified typography across web and app templates
         run: python tools/test_v135_typography.py
+      - name: Verify Fatuma staff profile, photograph and prior roster
+        run: python tools/test_v136_team.py
