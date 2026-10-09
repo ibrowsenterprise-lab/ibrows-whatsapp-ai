@@ -17,7 +17,10 @@ for node in tree.body:
     if isinstance(node,ast.FunctionDef):
         functions[node.name] = node
 
-assert ast.literal_eval(assignments["IBROWS_BUILD_VERSION"]) == "2026-10-09-fatuma-team-v136"
+assert ast.literal_eval(assignments["IBROWS_BUILD_VERSION"]) in {
+    "2026-10-09-fatuma-team-v136",
+    "2026-10-09-readmalawi-community-v137",
+}
 team=ast.literal_eval(assignments["PUBLIC_TEAM_MEMBERS"])
 assets=ast.literal_eval(assignments["PUBLIC_TEAM_IMAGE_B64"])
 assert len(team)==8
