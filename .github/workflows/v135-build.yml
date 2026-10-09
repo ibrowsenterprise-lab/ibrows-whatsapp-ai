@@ -1,0 +1,31 @@
+name: Generate verified V135 typography
+on:
+  push:
+    branches:
+      - feature/v135-unified-typography
+    paths:
+      - 'tools/apply_v135.py'
+      - '.github/workflows/v135-build.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout development branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Apply exact SHA typography patch
+        run: python tools/apply_v135.py
+      - name: Commit verified app.py
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          if git diff --cached --quiet; then
+            echo 'Already V135'
+            exit 0
+          fi
+          git commit -m 'Generate V135 unified typography app.py'
+          git push origin HEAD:feature/v135-unified-typography
