@@ -12,7 +12,7 @@ routes = [(f,d) for f in functions.values() for d in f.decorator_list
           if isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
           and d.func.attr == "route"]
 assert len(routes) == 168, len(routes)
-assert 'IBROWS_BUILD_VERSION = "2026-10-09-business-email-intake-v134"' in source
+assert 'BUSINESS EMAIL V134 READY' in source
 assert 'CLIENT PRIVACY V132 READY' in source
 assert 'PRICING INTEGRITY V126 READY' in source
 assert '"BUSINESS_EMAIL": "Business Email & Domain Setup"' in source
