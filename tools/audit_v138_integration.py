@@ -110,7 +110,7 @@ if isinstance(pdf_b64,str):
             preview.thumbnail((1050,1300))
             buf=io.BytesIO()
             preview.save(buf,"JPEG",quality=78,optimize=True)
-            (ROOT/"tools/reports/v138-existing-team-page.jpg.b64").write_text(
+            (ROOT/"tools/reports/v138-team-page-preview.jpg.b64").write_text(
                 base64.b64encode(buf.getvalue()).decode("ascii"), encoding="ascii")
             pdfmeta["team_page_preview"] = staffpages[0][0]+1
     except Exception as e:
