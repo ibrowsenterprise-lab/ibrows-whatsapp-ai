@@ -37,6 +37,10 @@ assert len(jpeg)>6000
 assert source.count('"slug":"fatuma-nyirenda"')==1
 assert 'TEAM V136 READY: Fatuma Nyirenda IT Specialist Lead, image=embedded' in source
 
+routes=[d for f in tree.body if isinstance(f,ast.FunctionDef)
+        for d in f.decorator_list if isinstance(d,ast.Call)
+        and isinstance(d.func,ast.Attribute) and d.func.attr=="route"]
+assert len(routes)==168
 fn=functions["public_team_photo"]
 fn.decorator_list=[]
 lookups=[]
@@ -57,10 +61,7 @@ home=ast.literal_eval(assignments["PUBLIC_WEBSITE_TEMPLATE"])
 team_html=ast.literal_eval(assignments["TEAM_PAGE_TEMPLATE"])
 assert "team_members" in home and 'member.slug' in home
 assert "team_members" in team_html and 'member.slug' in team_html
-routes=[d for f in tree.body if isinstance(f,ast.FunctionDef)
-        for d in f.decorator_list if isinstance(d,ast.Call)
-        and isinstance(d.func,ast.Attribute) and d.func.attr=="route"]
-assert len(routes)==168
+# Route count checked before isolated photo-handler decorator removal.
 for marker in ("BUSINESS EMAIL V134 READY","CLIENT PRIVACY V132 READY",
                "TYPOGRAPHY V135 READY", "PRICING INTEGRITY V126 READY"):
     assert marker in source
