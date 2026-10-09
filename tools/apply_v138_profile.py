@@ -78,13 +78,13 @@ def main():
     portrait=base64.b64decode(photos["fatuma-nyirenda"],validate=True)
     assert portrait.startswith(b"\xff\xd8") and portrait.endswith(b"\xff\xd9")
     page.insert_image(fitz.Rect(412,326,515,429),stream=portrait,keep_proportion=True,overlay=True)
-    insert_centered(page,"Fatuma Nyirenda", (384,433,544,446),
+    insert_centered(page,"Fatuma Nyirenda", (384,431,544,452),
                     "hebo",9.6,(0.10,0.18,0.16),"staff name")
-    insert_centered(page,"IT Specialist Lead",(384,448,544,460),
+    insert_centered(page,"IT Specialist Lead",(384,451,544,469),
                     "hebo",8.3,(0.13,0.40,0.32),"staff role")
     insert_centered(page,
-        "Leads IT support, systems coordination and technical delivery across IBROWS digital projects.",
-        (384,462,544,492),"helv",7.15,(0.29,0.32,0.32),"staff bio")
+        "Leads IT systems, support and technical delivery across IBROWS projects.",
+        (384,468,544,494),"helv",6.9,(0.29,0.32,0.32),"staff bio")
 
     finished=doc.tobytes(garbage=4,deflate=True)
     doc.close()
