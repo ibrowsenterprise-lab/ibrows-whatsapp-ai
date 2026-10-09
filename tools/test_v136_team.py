@@ -20,6 +20,7 @@ for node in tree.body:
 assert ast.literal_eval(assignments["IBROWS_BUILD_VERSION"]) in {
     "2026-10-09-fatuma-team-v136",
     "2026-10-09-readmalawi-community-v137",
+    "2026-10-09-profile-team-integration-v138",
 }
 team=ast.literal_eval(assignments["PUBLIC_TEAM_MEMBERS"])
 assets=ast.literal_eval(assignments["PUBLIC_TEAM_IMAGE_B64"])

@@ -35,7 +35,7 @@ jobs:
           node --check /tmp/ibrows-v132-admin.js
       - name: Test V134 Business Email & Domain Setup form and enquiry flow
         run: |
-          python -m pip install 'Jinja2>=3.1,<4'
+          python -m pip install 'Jinja2>=3.1,<4' 'pypdf>=5,<7'
           python tools/test_v134_business_email.py
       - name: Audit unified typography across web and app templates
         run: python tools/test_v135_typography.py
@@ -43,3 +43,5 @@ jobs:
         run: python tools/test_v136_team.py
       - name: Verify ReadMalawi links, legal status and live team count
         run: python tools/test_v137_readmalawi.py
+      - name: Verify company profile includes all eight team members
+        run: python tools/test_v138_profile.py

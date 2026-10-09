@@ -1,0 +1,45 @@
+name: Build V138 IBROWS final website profile integration
+on:
+  push:
+    branches:
+      - feature/ibrows-final-integration-audit-20261009
+    paths:
+      - tools/apply_v138_profile.py
+      - tools/test_v138_profile.py
+      - .github/workflows/v138-build.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PDF and test dependencies
+        run: python -m pip install 'PyMuPDF>=1.25,<2' 'pypdf>=5,<7' 'Jinja2>=3.1,<4'
+      - name: Transform only approved staff panel and public homepage navigation
+        run: python tools/apply_v138_profile.py
+      - name: Confirm syntax and established regression suite
+        run: |
+          python -m py_compile app.py
+          python tools/test_v132.py
+          node --check /tmp/ibrows-v132-admin.js
+          python tools/test_v134_business_email.py
+          python tools/test_v135_typography.py
+          python tools/test_v136_team.py
+          python tools/test_v137_readmalawi.py
+          python tools/test_v138_profile.py
+      - name: Commit audited output to review branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'Generate V138 company-profile eighth staff card and discovery link'
+            git push origin HEAD:feature/ibrows-final-integration-audit-20261009
+          fi
