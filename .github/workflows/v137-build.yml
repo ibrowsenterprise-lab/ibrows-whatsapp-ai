@@ -1,0 +1,40 @@
+name: Build V137 ReadMalawi community integration
+on:
+  push:
+    branches:
+      - feature/readmalawi-site-integration-20261009
+    paths:
+      - 'tools/apply_v137_readmalawi.py'
+      - 'tools/test_v137_readmalawi.py'
+      - '.github/workflows/v137-build.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout integration branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply safe, limited homepage edits
+        run: python tools/apply_v137_readmalawi.py
+      - name: Run syntax and integration regression tests
+        run: |
+          python -m py_compile app.py
+          python tools/test_v137_readmalawi.py
+      - name: Commit generated app.py
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          if git diff --cached --quiet; then
+            echo 'V137 already generated'
+            exit 0
+          fi
+          git commit -m 'Generate V137 ReadMalawi homepage integration'
+          git push origin HEAD:feature/readmalawi-site-integration-20261009
