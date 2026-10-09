@@ -87,11 +87,32 @@ if isinstance(pdf_b64,str):
         from pypdf import PdfReader
         pdfdata = base64.b64decode(pdf_b64, validate=True)
         reader = PdfReader(io.BytesIO(pdfdata))
-        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        pagetexts = [page.extract_text() or "" for page in reader.pages]
+        text = "\n".join(pagetexts)
         pdfmeta.update(pages=len(reader.pages),
             contains_fatuma=("fatuma" in text.casefold()),
             team_names_in_document=[m["name"] for m in team if m["name"].casefold() in text.casefold()],
-            byte_size=len(pdfdata))
+            byte_size=len(pdfdata),
+            page_summary=[{"page":i+1,
+              "size":[round(float(page.mediabox.width)),round(float(page.mediabox.height))],
+              "opening_text":pagetexts[i][:240],
+              "team_members":[m["name"] for m in team if m["name"].casefold() in pagetexts[i].casefold()]}
+              for i,page in enumerate(reader.pages)])
+        staffpages=[(i,sum(m["name"].casefold() in t.casefold() for m in team))
+                    for i,t in enumerate(pagetexts)]
+        staffpages.sort(key=lambda p:p[1],reverse=True)
+        if staffpages and staffpages[0][1]>=3:
+            import fitz
+            doc=fitz.open(stream=pdfdata,filetype="pdf")
+            img=doc[staffpages[0][0]].get_pixmap(matrix=fitz.Matrix(1.1,1.1),alpha=False)
+            from PIL import Image
+            preview=Image.open(io.BytesIO(img.tobytes("png"))).convert("RGB")
+            preview.thumbnail((1050,1300))
+            buf=io.BytesIO()
+            preview.save(buf,"JPEG",quality=78,optimize=True)
+            (ROOT/"tools/reports/v138-existing-team-page.jpg.b64").write_text(
+                base64.b64encode(buf.getvalue()).decode("ascii"), encoding="ascii")
+            pdfmeta["team_page_preview"] = staffpages[0][0]+1
     except Exception as e:
         pdfmeta["error"] = f"{type(e).__name__}: {str(e)[:150]}"
 report["profile_pdf"] = pdfmeta
