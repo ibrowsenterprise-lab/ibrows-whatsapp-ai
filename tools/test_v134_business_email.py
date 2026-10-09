@@ -19,7 +19,7 @@ assert '"BUSINESS_EMAIL": "Business Email & Domain Setup"' in source
 assert '"/business-email"' in source
 assert 'No website required.' in source
 assert 'quotation_only=on' in source
-assert 'f"{IBROWS_PUBLIC_BASE_URL}/business-email"' in source
+assert 'Start here: {IBROWS_PUBLIC_BASE_URL}/business-email' in source
 
 template = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign)
    and any(isinstance(t,ast.Name) and t.id=="SERVICE_REQUEST_TEMPLATE" for t in n.targets))
