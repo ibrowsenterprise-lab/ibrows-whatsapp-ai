@@ -1,0 +1,72 @@
+name: IBROWS V138 live public website verification
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/v138-live-smoke.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  live-website:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install read-only PDF validation tool
+        run: python -m pip install 'pypdf>=5,<7'
+      - name: Check public website forms team and current company-profile PDF
+        run: |
+          import io
+          import time
+          import urllib.request
+          from pypdf import PdfReader
+          
+          BASE = "https://ibrows-whatsapp-ai-1.onrender.com"
+          HEADERS = {"User-Agent":"IBROWS-Public-Site-ReadOnly-Check/1.0"}
+          
+          def fetch(path):
+              req = urllib.request.Request(BASE + path, headers=HEADERS, method="GET")
+              with urllib.request.urlopen(req, timeout=40) as res:
+                  status, kind = res.status, res.headers.get("Content-Type","")
+                  content = res.read(2_500_000)
+              if status != 200:
+                  raise AssertionError(f"{path}: HTTP {status}")
+              return content, kind
+          
+          for n in range(1,16):
+              try:
+                  home, _ = fetch("/")
+                  if b"Start a Project" not in home or b"ReadMalawi" not in home:
+                      raise AssertionError("Updated homepage content not yet live")
+                  team, _ = fetch("/team")
+                  if b"Fatuma Nyirenda" not in team:
+                      raise AssertionError("Fatuma team entry not yet live")
+                  pdf, kind = fetch("/company-profile.pdf")
+                  if not pdf.startswith(b"%PDF-"):
+                      raise AssertionError(f"Company profile is not a PDF: {kind}")
+                  reader = PdfReader(io.BytesIO(pdf))
+                  if len(reader.pages) != 11:
+                      raise AssertionError(f"Expected eleven profile pages, got {len(reader.pages)}")
+                  staff_page=reader.pages[9].extract_text() or ""
+                  if "Fatuma Nyirenda" not in staff_page or "IT Specialist Lead" not in staff_page:
+                      raise AssertionError("New company-profile team page not yet live")
+                  print(f"PASS: Live V138 homepage, Fatuma team entry, ReadMalawi, and updated eleven-page PDF (attempt {n})")
+                  break
+              except Exception as ex:
+                  print(f"Waiting for public V138 deployment: attempt {n}/15: {type(ex).__name__}: {str(ex)[:180]}", flush=True)
+                  if n == 15:
+                      raise
+                  time.sleep(20)
+          
+          for path in ("/company-profile","/project-discovery","/business-registration",
+                       "/design-branding","/photo-restoration","/landscaping",
+                       "/fumigation","/business-email","/pricing","/privacy"):
+              data, mime = fetch(path)
+              if not data:
+                  raise AssertionError(f"{path}: empty body")
+              print(f"PASS GET {path}: {mime}", flush=True)
+          
+          print("PASS: All selected public IBROWS pages returned HTTP 200 without posting or modifying data")
