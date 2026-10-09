@@ -1,5 +1,5 @@
 {
-  "build": "2026-10-09-readmalawi-community-v137",
+  "build": "2026-10-09-profile-team-integration-v138",
   "route_count": 168,
   "team": [
     {
@@ -54,7 +54,7 @@
   "homepage": {
     "href=\"/team\"": true,
     "href=\"/company-profile\"": true,
-    "href=\"/project-discovery\"": false,
+    "href=\"/project-discovery\"": true,
     "id=\"community-project\"": true,
     "readmalawi-library.onrender.com": true,
     "{{ team_members|length }} people": true
@@ -775,7 +775,7 @@
   "profile_pdf": {
     "found": true,
     "pages": 11,
-    "contains_fatuma": false,
+    "contains_fatuma": true,
     "team_names_in_document": [
       "Jones Nalikungwi",
       "Martha Nalikungwi",
@@ -783,10 +783,11 @@
       "Christopher Ngalu",
       "Amos Mngoli",
       "Lewis Tambala",
-      "Kumbukani Mkandawire"
+      "Kumbukani Mkandawire",
+      "Fatuma Nyirenda"
     ],
     "error": null,
-    "byte_size": 744308,
+    "byte_size": 760581,
     "page_summary": [
       {
         "page": 1,
@@ -886,7 +887,8 @@
           "Christopher Ngalu",
           "Amos Mngoli",
           "Lewis Tambala",
-          "Kumbukani Mkandawire"
+          "Kumbukani Mkandawire",
+          "Fatuma Nyirenda"
         ]
       },
       {
@@ -901,7 +903,5 @@
     ],
     "team_page_preview": 10
   },
-  "notices": [
-    "Embedded company profile PDF does not mention latest staff member Fatuma"
-  ]
+  "notices": []
 }
