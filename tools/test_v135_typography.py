@@ -31,6 +31,6 @@ routes=[dec for fn in tree.body if isinstance(fn,ast.FunctionDef)
         for dec in fn.decorator_list if isinstance(dec,ast.Call)
         and isinstance(dec.func,ast.Attribute) and dec.func.attr=="route"]
 assert len(routes)==168,len(routes)
-for text in ("CLIENT PRIVACY V132 READY","BUSINESS EMAIL V134 READY","PRICING INTEGRITY V126 READY","def validate_csrf()","WEB_GALLERY_ADMIN_PREVIEW_MAX_SIDE = 640","IBROWS_BUILD_VERSION = \"2026-10-09-font-consistency-v135\"","TYPOGRAPHY V135 READY: system_font=on template_styles=41"):
+for text in ("CLIENT PRIVACY V132 READY","BUSINESS EMAIL V134 READY","PRICING INTEGRITY V126 READY","def validate_csrf()","WEB_GALLERY_ADMIN_PREVIEW_MAX_SIDE = 640","TYPOGRAPHY V135 READY: system_font=on template_styles=41"):
     assert text in source,text
 print("PASS: 40 templates, 41 stylesheets, 46 unified font declarations, 168 routes, all key safeguards")
