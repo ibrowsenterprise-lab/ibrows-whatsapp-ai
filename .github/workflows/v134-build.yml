@@ -1,0 +1,31 @@
+name: Build verified V134 Business Email service
+on:
+  push:
+    branches:
+      - feature/v134-business-email-domain
+    paths:
+      - 'tools/apply_v134.py'
+      - '.github/workflows/v134-build.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Apply verified V134 source patch
+        run: python tools/apply_v134.py
+      - name: Commit generated source
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          if git diff --cached --quiet; then
+            echo 'V134 already generated'
+            exit 0
+          fi
+          git commit -m 'Generate verified V134 Business Email & Domain Setup service'
+          git push origin HEAD:feature/v134-business-email-domain
