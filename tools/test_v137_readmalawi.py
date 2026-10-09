@@ -3,7 +3,9 @@ from pathlib import Path
 import ast
 s=Path("app.py").read_text(encoding="utf-8")
 ast.parse(s, filename="app.py")
-assert 'IBROWS_BUILD_VERSION = "2026-10-09-readmalawi-community-v137"' in s
+assert any('IBROWS_BUILD_VERSION = "'+v+'"' in s for v in (
+    "2026-10-09-readmalawi-community-v137",
+    "2026-10-09-profile-team-integration-v138"))
 assert s.count('id="community-project"') == 1
 assert s.count('readmalawi-library.onrender.com') == 3
 assert 'ReadMalawi is a separate, digital-first reading community' in s
