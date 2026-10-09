@@ -76,7 +76,7 @@ def main():
     page.apply_redactions(images=0,graphics=0,text=0)
     page.draw_rect(right_panel,color=(0.19,0.39,0.32),fill=(1,1,1),width=0.7,overlay=True)
     portrait=base64.b64decode(photos["fatuma-nyirenda"],validate=True)
-    assert portrait.startswith(b"\\xff\\xd8") and portrait.endswith(b"\\xff\\xd9")
+    assert portrait.startswith(b"\xff\xd8") and portrait.endswith(b"\xff\xd9")
     page.insert_image(fitz.Rect(412,326,515,429),stream=portrait,keep_proportion=True,overlay=True)
     insert_centered(page,"Fatuma Nyirenda", (384,433,544,446),
                     "hebo",9.6,(0.10,0.18,0.16),"staff name")
@@ -106,11 +106,11 @@ def main():
         'IBROWS_BUILD_VERSION = "2026-10-09-readmalawi-community-v137"',
         f'IBROWS_BUILD_VERSION = "{BUILD}"')
     src=replace_one(src,
-        '<a href="/company-profile">Company Profile</a>\\n        <a href="#community-project">Community</a>',
-        '<a href="/company-profile">Company Profile</a>\\n        <a href="/project-discovery">Start a Project</a>\\n        <a href="#community-project">Community</a>')
+        '<a href="/company-profile">Company Profile</a>\n        <a href="#community-project">Community</a>',
+        '<a href="/company-profile">Company Profile</a>\n        <a href="/project-discovery">Start a Project</a>\n        <a href="#community-project">Community</a>')
     readiness='print("TEAM V136 READY: Fatuma Nyirenda IT Specialist Lead, image=embedded", flush=True)'
     src=replace_one(src,readiness,
-        readiness+'\\nprint("PROFILE V138 READY: all 8 staff in company PDF, project discovery navigation=on", flush=True)')
+        readiness+'\nprint("PROFILE V138 READY: all 8 staff in company PDF, project discovery navigation=on", flush=True)')
     compile(src,str(APP),"exec")
     assert src.count('href="/project-discovery"') >= 1
     APP.write_text(src,encoding="utf-8")
