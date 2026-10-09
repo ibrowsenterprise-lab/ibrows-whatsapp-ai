@@ -5,6 +5,7 @@ on:
       - feature/ibrows-final-integration-audit-20261009
     paths:
       - tools/audit_v138_integration.py
+      - app.py
       - .github/workflows/v138-integration-audit.yml
   workflow_dispatch:
 permissions:
@@ -39,7 +40,7 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add tools/reports/v138-integration-audit.json tools/reports/v138-existing-team-page.jpg.b64
+          git add tools/reports/v138-integration-audit.json tools/reports/v138-team-page-preview.jpg.b64
           if ! git diff --cached --quiet; then
             git commit -m 'Record V138 IBROWS website integration audit'
             git push origin HEAD:feature/ibrows-final-integration-audit-20261009
