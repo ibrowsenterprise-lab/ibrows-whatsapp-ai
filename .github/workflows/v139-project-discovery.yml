@@ -2,7 +2,7 @@ name: V139 six-step project discovery simulation
 on:
   push:
     branches: [feature/v139-customer-journey-audit-20261010]
-    paths: ['tools/test_v139_project_discovery.py','.github/workflows/v139-project-discovery.yml']
+    paths: ['tools/test_v139_project_discovery.py','tools/test_v139_extract_ui.py','tools/test_v139_project_discovery_ui.js','.github/workflows/v139-project-discovery.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -18,3 +18,6 @@ jobs:
         run: |
           python -m py_compile app.py
           python tools/test_v139_project_discovery.py
+          python tools/test_v139_extract_ui.py
+          node --check /tmp/ibrows_v139_discovery_ui.js
+          node tools/test_v139_project_discovery_ui.js
