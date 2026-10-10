@@ -1,8 +1,5 @@
 name: V139 official IBROWS customer-facing read-only verification
 on:
-  push:
-    branches: [feature/v139-customer-journey-audit-20261010]
-    paths: ['.github/workflows/v139-official-site-smoke.yml']
   workflow_dispatch:
 permissions:
   contents: read
