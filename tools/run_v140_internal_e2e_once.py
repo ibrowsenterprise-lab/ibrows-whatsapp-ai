@@ -2,7 +2,7 @@
 """Exactly ONE authorized IBROWS INTERNAL QA customer enquiry on the official site.
 
 A production record and a normal internal alert will be created.
-No payments, jobs, invoices, other integrations, WhatsApp, or customer emails.
+No payments, domain purchases, jobs, invoices, other integrations, WhatsApp, or customer emails.
 Use only the company-owned, publicly advertised test contact.
 Do not retry POST on failure. Does not import or modify app.py.
 """
@@ -12,13 +12,13 @@ import re
 import sys
 
 BASE="https://www.ibrowsenterprise.com"
-PATH="/business-registration"
+PATH="/business-email"
 QA_MARKER="IBROWS QA TEST - DO NOT SERVICE"
 QA_EMAIL="info@ibrowsenterprise.com"  # public company contact
 QA_PHONE="+265882242594"  # IBROWS's own WhatsApp Business number
 QA_BUSINESS="IBROWS INTERNAL WEBSITE QA (NOT A CUSTOMER)"
 TEST_DESCRIPTION=("INTERNAL IBROWS E2E TEST 2026-10-10. "
-                  "This is NOT a genuine customer, registration, PPDA or tax request. "
+                  "This is NOT a genuine customer or request for domain or mailbox creation. "
                   "Do not quote, invoice, contact or perform any work. "
                   "The sole purpose is to verify form save + admin notification; close as test.")
 
@@ -43,7 +43,7 @@ def inputs(name):return [x for x in p.fields if x.get("name")==name]
 csrf=inputs("csrf_token")
 assert len(csrf)==1 and len(csrf[0].get("value",""))>=20,"No valid CSRF input"
 assert inputs("consent") and inputs("full_name") and inputs("phone") and inputs("email")
-assert inputs("business_name") and inputs("support_needed")
+assert inputs("business_name") and inputs("mailbox_count") and inputs("domain_status")
 if inputs("package_choice"):
     print("STOP: This service includes paid package selection; did not submit any test",flush=True)
     sys.exit(3)
@@ -56,8 +56,9 @@ form={
     "csrf_token":csrf[0]["value"],"fax_number":"",
     "full_name":QA_MARKER,"phone":QA_PHONE,"email":QA_EMAIL,
     "business_name":QA_BUSINESS,
-    "support_needed":"GENERAL","has_valid_id":"NO",
-    "has_mra_tpin":"NOT_SURE","has_ppda":"NOT_SURE",
+    "domain_status":"NO","has_website":"NO",
+    "preferred_domain":"","mailbox_count":"1",
+    "provider":"UNSURE","mailbox_names":"qa-only (not for creation)",
     "notes":TEST_DESCRIPTION,
     "consent":"1",
 }
