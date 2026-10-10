@@ -45,3 +45,12 @@ jobs:
         run: python tools/test_v137_readmalawi.py
       - name: Verify company profile includes all eight team members
         run: python tools/test_v138_profile.py
+      - name: Simulate valid invalid and CSRF-guarded customer service submissions
+        run: python tools/test_v139_client_submission.py
+      - name: Simulate all six project discovery stages and completion safety
+        run: python tools/test_v139_project_discovery.py
+      - name: Verify dynamic project-discovery AI controls without reloading
+        run: |
+          python tools/test_v139_extract_ui.py
+          node --check /tmp/ibrows_v139_discovery_ui.js
+          node tools/test_v139_project_discovery_ui.js

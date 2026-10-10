@@ -1,0 +1,68 @@
+name: V139 official IBROWS customer-facing read-only verification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  public-pages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Check official customer pages without submitting requests
+        run: |
+          python - <<'PY'
+          import time, urllib.request, urllib.error
+          from html.parser import HTMLParser
+          BASE="https://www.ibrowsenterprise.com"
+          ENQUIRIES=[
+            "/career-jobs","/scholarships-opportunities","/cleaning",
+            "/design-branding/enquiry","/landscaping/enquiry",
+            "/construction/enquiry","/landscaping/preview",
+            "/construction/design-quote","/construction/tender-boq-support",
+            "/business-registration","/business-email","/photo-restoration",
+            "/fumigation","/agriculture"
+          ]
+          INFORMATION=[
+            "/","/team","/company-profile","/project-discovery",
+            "/construction","/design-branding","/landscaping",
+            "/fumigation/gallery","/pricing","/privacy"
+          ]
+          class Parser(HTMLParser):
+              def __init__(self):
+                  super().__init__();self.names=set();self.forms=0;self.viewport=False
+              def handle_starttag(self,tag,attrs):
+                  attrs=dict(attrs)
+                  if tag=="form":self.forms+=1
+                  if tag=="input" and attrs.get("name"):self.names.add(attrs["name"])
+                  if tag=="meta" and attrs.get("name")=="viewport":self.viewport=True
+          def fetch(path):
+              request=urllib.request.Request(BASE+path,headers={
+                  "User-Agent":"IBROWS-ReadOnly-Mobile-Final-Check/1.0"})
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(request,timeout=35) as res:
+                          assert res.status==200,(path,res.status)
+                          return res.read(1_000_000).decode("utf-8","replace")
+                  except (TimeoutError,urllib.error.URLError) as error:
+                      if attempt==2:raise
+                      time.sleep(5)
+          count=0
+          for path in ENQUIRIES+INFORMATION:
+              html=fetch(path)
+              parser=Parser();parser.feed(html)
+              assert parser.viewport,path+" missing mobile viewport"
+              if path in ENQUIRIES:
+                  assert parser.forms>0,path+" missing enquiry form"
+                  assert "csrf_token" in parser.names,path+" missing CSRF field"
+                  assert "consent" in parser.names,path+" missing consent field"
+                  assert "full_name" in parser.names,path+" missing full name"
+              if path=="/project-discovery":
+                  assert "contact_name" in parser.names and "project_components" in parser.names
+              if path=="/team":
+                  assert "Fatuma Nyirenda" in html
+              if path=="/":
+                  assert "Start a Project" in html and "ReadMalawi" in html
+              count+=1
+              print("PASS OFFICIAL",path,"forms",parser.forms,flush=True)
+          print("PASS",count,"official public GET routes;","14 client forms CSRF and consent checked; no POST requests sent",flush=True)
+          PY
