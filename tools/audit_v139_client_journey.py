@@ -90,7 +90,10 @@ for r in selected:
        "has_success_redirect":("redirect(" in raw),
        "has_validation":("error" in raw.lower() or "400" in raw),
     }
+ui_js=ast.literal_eval(assigns["PROJECT_DISCOVERY_UI_JS"])
+assert isinstance(ui_js,str)
 report={
+  "discovery_ui_js":ui_js[:24000],
   "build": ast.literal_eval(assigns["IBROWS_BUILD_VERSION"]),
   "route_count":len(routes),"relevant_routes":selected,
   "templates":templates,"handlers":handlers,
