@@ -1,0 +1,22 @@
+name: V139 IBROWS simulated customer submissions
+on:
+  push:
+    branches: [feature/v139-customer-journey-audit-20261010]
+    paths:
+      - 'tools/test_v139_client_submission.py'
+      - '.github/workflows/v139-customer-submission.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  simulated-submissions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile source and run isolated nonpersisting customer tests
+        run: |
+          python -m py_compile app.py
+          python tools/test_v139_client_submission.py
