@@ -83,7 +83,7 @@ for r in selected:
     # Public source snippets, not runtime values. Trim to only relevant code.
     handlers[r["function"]]={
        "route":r["path"],"methods":r["methods"],"line":r["line"],
-       "code_excerpt":raw[:6800],
+       "code_excerpt":raw[:28000] if r["function"]=="project_discovery_step" else raw[:6800],
        "has_csrf":("csrf" in raw.lower()),
        "has_database_write":any(q in raw for q in ("commit(", "_create_website_service_request","_create_project", "INSERT INTO")),
        "has_file_check":any(q in raw.lower() for q in ("upload","file","multipart")),
