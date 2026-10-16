@@ -71,10 +71,6 @@ one(
     'id="quantity" name="quantity" type="number" value="{{ old.get(\'quantity\',\'1\') }}" min="1" max="30" required'
 )
 one(
-    '<option value="{{ v }}">{{ v }}</option>{% endfor %}</select></div>',
-    '<option value="{{ v }}" {% if old.get(\'garment\')==v %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>'
-)
-one(
     '{% for v in sizes %}<option value="{{ v }}">{{ v }}</option>{% endfor %}</select></div></div>',
     '{% for v in sizes %}<option value="{{ v }}" {% if old.get(\'size\')==v %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div></div>'
 )
