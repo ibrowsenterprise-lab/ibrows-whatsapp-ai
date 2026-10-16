@@ -61,3 +61,4 @@ jobs:
           python tools/test_msj_store.py
           python tools/test_msj_image_import.py
           python tools/test_msj_bulk_publish.py
+          python tools/test_msj_catalogue_repair.py
