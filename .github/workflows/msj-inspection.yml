@@ -1,0 +1,24 @@
+name: MSJ source integration inspection
+on:
+  push:
+    branches: [feature/msj-merchandise-shop-v140]
+    paths: ['tools/msj_inspect.py','.github/workflows/msj-inspection.yml']
+permissions: {contents: write}
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python tools/msj_inspect.py
+      - name: Save inspection snapshot
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tools/msj_site_audit.json
+          git commit -m 'Review MSJ merchandise integration seams'
+          git push
