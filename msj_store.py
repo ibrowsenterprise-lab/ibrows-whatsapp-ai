@@ -72,6 +72,13 @@ footer{border-top:1px solid var(--line);padding:20px 0;color:var(--muted);font-s
 .bulk-panel .button{width:100%}
 }
 """
+SHOP_CSS += """
+/* Compact order page on mobile */
+.order-hero{padding:24px 0 20px}.order-hero h1{font-size:clamp(1.9rem,4vw,2.7rem);line-height:1.12;letter-spacing:-.02em;margin:6px 0 10px}.order-hero .lede{font-size:.94rem;margin:0}
+.order-section{padding:18px 0 42px}.order-layout{grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr);gap:17px}.order-product{align-self:start}.order-product img{aspect-ratio:1/1}.order-product .product-content{padding:12px 15px}.order-product .product-content p{margin:4px 0 8px}.order-pane{max-width:none;padding:20px}.order-pane h2{font-family:system-ui,sans-serif;font-size:1.25rem;font-weight:750}.order-pane label{margin-top:10px}.order-pane .two{gap:10px}.order-help{font-size:.8rem;color:var(--muted);line-height:1.4;margin:4px 0}.order-total{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#f5f6f2;border:1px solid #e2e8de;padding:10px 12px;margin:13px 0 6px;border-radius:4px}.order-total>strong{font-size:1.27rem;white-space:nowrap;color:var(--ink)}.order-consent{display:flex;align-items:flex-start;gap:10px;font-weight:500!important;font-size:.83rem}.order-consent input{width:18px;height:18px;min-height:0;flex:0 0 auto;margin-top:4px}.order-pane button[type=submit]{width:100%;min-height:48px}.order-pane summary{cursor:pointer;font-weight:700;padding:8px 0}.order-extras{margin-top:10px;border-top:1px solid var(--line)}
+@media(max-width:760px){.order-layout{grid-template-columns:1fr;gap:14px}.order-hero{padding:18px 0}.order-hero h1{font-size:2rem}.order-section{padding:14px 0 35px}.order-product{display:grid;grid-template-columns:120px minmax(0,1fr);align-items:center}.order-product img{width:120px;height:132px;object-fit:contain;aspect-ratio:auto}.order-product .product-content{padding:9px 12px}.order-product .product-content p{font-size:.81rem}.order-pane{padding:17px}.order-pane .two{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.order-pane [data-full-mobile]{grid-column:1/-1}}
+@media(max-width:360px){.order-product{grid-template-columns:95px minmax(0,1fr)}.order-product img{width:95px;height:120px}.order-pane .two{grid-template-columns:1fr}.order-pane [data-full-mobile]{grid-column:auto}}
+"""
 BASE_START = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{ title }} | Mulungu Si Jemusi · IBROWS Enterprise</title>
