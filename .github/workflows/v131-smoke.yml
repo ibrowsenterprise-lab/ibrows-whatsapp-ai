@@ -54,3 +54,9 @@ jobs:
           python tools/test_v139_extract_ui.py
           node --check /tmp/ibrows_v139_discovery_ui.js
           node tools/test_v139_project_discovery_ui.js
+      - name: Validate MSJ merch design catalog and safe order requests
+        run: |
+          python -m pip install -r requirements.txt
+          python -m py_compile msj_store.py
+          python tools/test_msj_store.py
+          python tools/test_msj_image_import.py
