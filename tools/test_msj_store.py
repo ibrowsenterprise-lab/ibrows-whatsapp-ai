@@ -18,9 +18,10 @@ for n in ast.walk(r):
 for path in ["/msj","/msj/design/<int:design_id>","/msj/design/<int:design_id>/image",
              "/msj/order/<uuid:token>","/admin/msj","/admin/msj/designs/add",
              "/admin/msj/designs/<int:design_id>/publish",
+             "/admin/msj/designs/<int:design_id>/update",
              "/admin/msj/orders/<int:order_id>/status"]:
  assert path in all_routes,path
-assert len(all_routes)==8,len(all_routes)
+assert len(all_routes)==9,len(all_routes)
 assert "secrets.compare_digest" in src
 assert "get_db()" in src and "CREATE TABLE IF NOT EXISTS msj_merch_orders" in src
 assert "published=TRUE" in src and "1<=quantity<=30" in src
@@ -35,4 +36,4 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import msj_store as module
 for name in ("CATALOG_TEMPLATE","ORDER_TEMPLATE","COMPLETE_TEMPLATE","ADMIN_TEMPLATE"):
  Environment(autoescape=True).parse(getattr(module,name))
-print("PASS MSJ: eight isolated routes, admin login and CSRF guards, no checkout, original-artwork upload and valid templates")
+print("PASS MSJ: nine isolated routes, admin login and CSRF guards, no checkout, original-artwork upload and valid templates")
