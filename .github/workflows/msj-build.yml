@@ -39,6 +39,7 @@ jobs:
           python tools/test_v139_extract_ui.py
           node tools/test_v139_project_discovery_ui.js
           python tools/test_msj_store.py
+          python tools/test_msj_image_import.py
       - name: Store generated app changes on review branch only
         run: |
           git config user.name 'github-actions[bot]'
