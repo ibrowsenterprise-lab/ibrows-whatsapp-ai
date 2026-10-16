@@ -72,6 +72,13 @@ footer{border-top:1px solid var(--line);padding:20px 0;color:var(--muted);font-s
 .bulk-panel .button{width:100%}
 }
 """
+SHOP_CSS += """
+/* Compact order page on mobile */
+.order-hero{padding:24px 0 20px}.order-hero h1{font-size:clamp(1.9rem,4vw,2.7rem);line-height:1.12;letter-spacing:-.02em;margin:6px 0 10px}.order-hero .lede{font-size:.94rem;margin:0}
+.order-section{padding:18px 0 42px}.order-layout{grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr);gap:17px}.order-product{align-self:start}.order-product img{aspect-ratio:1/1}.order-product .product-content{padding:12px 15px}.order-product .product-content p{margin:4px 0 8px}.order-pane{max-width:none;padding:20px}.order-pane h2{font-family:system-ui,sans-serif;font-size:1.25rem;font-weight:750}.order-pane label{margin-top:10px}.order-pane .two{gap:10px}.order-help{font-size:.8rem;color:var(--muted);line-height:1.4;margin:4px 0}.order-total{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#f5f6f2;border:1px solid #e2e8de;padding:10px 12px;margin:13px 0 6px;border-radius:4px}.order-total>strong{font-size:1.27rem;white-space:nowrap;color:var(--ink)}.order-consent{display:flex;align-items:flex-start;gap:10px;font-weight:500!important;font-size:.83rem}.order-consent input{width:18px;height:18px;min-height:0;flex:0 0 auto;margin-top:4px}.order-pane button[type=submit]{width:100%;min-height:48px}.order-pane summary{cursor:pointer;font-weight:700;padding:8px 0}.order-extras{margin-top:10px;border-top:1px solid var(--line)}
+@media(max-width:760px){.order-layout{grid-template-columns:1fr;gap:14px}.order-hero{padding:18px 0}.order-hero h1{font-size:2rem}.order-section{padding:14px 0 35px}.order-product{display:grid;grid-template-columns:120px minmax(0,1fr);align-items:center}.order-product img{width:120px;height:132px;object-fit:contain;aspect-ratio:auto}.order-product .product-content{padding:9px 12px}.order-product .product-content p{font-size:.81rem}.order-pane{padding:17px}.order-pane .two{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.order-pane [data-full-mobile]{grid-column:1/-1}}
+@media(max-width:360px){.order-product{grid-template-columns:95px minmax(0,1fr)}.order-product img{width:95px;height:120px}.order-pane .two{grid-template-columns:1fr}.order-pane [data-full-mobile]{grid-column:auto}}
+"""
 BASE_START = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{ title }} | Mulungu Si Jemusi · IBROWS Enterprise</title>
@@ -102,23 +109,22 @@ No payments or orders are being taken yet.</p></div>{% endif %}
 </div></main>""" + BASE_END
 
 ORDER_TEMPLATE=BASE_START+"""
-<section class="hero"><div class="wrap"><div class="eyebrow">Request MSJ Merchandise</div><h1>{{ design.title }}</h1>
-<p class="lede">Your artwork choice is reserved for this request only after IBROWS confirms availability. You will not be charged now.</p></div></section>
-<main class="section"><div class="wrap">
+<section class="hero order-hero"><div class="wrap"><div class="eyebrow">MSJ / Order request</div><h1>{{ design.title }}</h1>
+<p class="lede">Choose your size and preferred colour. We confirm availability before payment.</p></div></section>
+<main class="section order-section"><div class="wrap">
 <div class="order-layout">
-<div class="product"><img src="{{ url_for('msj.design_image',design_id=design.id, v=design.image_revision[:12]) }}" alt="Original {{ design.title }} artwork"><div class="product-content">
-<p>{{ design.description }}</p><strong>From MK {{ '{:,.0f}'.format(design.price_mwk) }} per item, depending on garment</strong>
-<p>Artwork preview is not necessarily a finished garment mock-up.</p>
-<p>Confirmed prices: T-shirts MK25,000 · Hoodies MK50,000 · Caps MK20,000.</p></div></div>
-<div class="pane">{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
-<h2>Place an order request</h2>
+<div class="product order-product"><img src="{{ url_for('msj.design_image',design_id=design.id, v=design.image_revision[:12]) }}" alt="Original {{ design.title }} artwork"><div class="product-content">
+<p><strong>{{ design.title }}</strong></p><strong class="price">{% if garments|length == 1 %}MK {{ '{:,.0f}'.format(garment_prices[garments[0]]) }}{% else %}From MK {{ '{:,.0f}'.format(design.price_mwk) }}{% endif %}</strong>
+<p>{{ garments|join(' / ') }} · Choose any colour.</p><a href="/msj" style="font-size:.82rem;font-weight:750">Change design</a></div></div>
+<div class="pane order-pane">{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<h2>Your order</h2>
 <form method="post" action="{{ url_for('msj.order_design',design_id=design.id) }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <input type="text" name="fax_number" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px" aria-hidden="true">
 <div class="two"><div><label for="garment">Clothing type *</label><select id="garment" name="garment" required>
 {% for v in garments %}<option value="{{ v }}">{{ v }}</option>{% endfor %}</select></div>
 <div><label for="size">Size *</label><select id="size" name="size" required>
-{% for v in sizes %}<option value="{{ v }}">{{ v }}</option>{% endfor %}</select></div></div>
+{% for v in sizes %}<option value="{{ v }}" {% if old.get('size')==v %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div></div>
 <script>
 (function () {
   function syncSize() {
@@ -143,20 +149,50 @@ ORDER_TEMPLATE=BASE_START+"""
 })();
 </script>
 <div class="two"><div><label for="colour">Preferred colour *</label>
-<input id="colour" name="colour" type="text" list="msj-colour-ideas" maxlength="50" placeholder="e.g. Forest green or wine red" required autocomplete="off">
+<input id="colour" name="colour" type="text" list="msj-colour-ideas" maxlength="50" value="{{ old.get('colour','') }}" placeholder="e.g. Forest green or wine red" required autocomplete="off">
 <datalist id="msj-colour-ideas">{% for v in colours %}<option value="{{ v }}">{% endfor %}</datalist>
-<small class="note">Type any colour you prefer. Listed colours are suggestions, not guaranteed stock. If we cannot supply your colour, we will notify you.</small></div>
-<div><label for="quantity">Quantity *</label><input id="quantity" name="quantity" type="number" value="1" min="1" max="30" required></div></div>
-<p class="note">T-shirt MK25,000 · Hoodie MK50,000 · Cap MK20,000. The order estimate uses the selected garment and quantity. Delivery cost and availability are confirmed separately before accepting payment.</p>
-<div class="two"><div><label for="buyer_name">Full name *</label><input id="buyer_name" name="buyer_name" maxlength="160" required></div>
-<div><label for="phone">Phone / WhatsApp *</label><input id="phone" name="phone" maxlength="50" inputmode="tel" required></div></div>
-<div class="two"><div><label for="email">Email (optional)</label><input id="email" type="email" name="email" maxlength="180"></div>
-<div><label for="location">Area / delivery town *</label><input id="location" name="location" maxlength="160" required></div></div>
-<label for="notes">Notes or custom instructions (optional)</label><textarea id="notes" name="notes" maxlength="1200" placeholder="Preferred fit, delivery details or questions"></textarea>
-<label><input type="checkbox" name="consent" value="1" required> I agree that IBROWS may use my details to respond to this merchandise request.</label>
-<p class="note">No payment is collected at this stage. IBROWS will verify your colour request and contact you before confirming an order. If the colour is unavailable, you will be notified by email when provided; otherwise, our team will contact you by telephone or WhatsApp.</p>
+<p class="order-help">Any colour is welcome. We will contact you if it is unavailable.</p></div>
+<div><label for="quantity">Quantity *</label><input id="quantity" name="quantity" type="number" value="{{ old.get('quantity','1') }}" min="1" max="30" required></div></div>
+<div class="order-total" aria-live="polite">
+<div><strong>Estimated subtotal</strong><p class="order-help">Excludes delivery · No payment now</p></div>
+<strong id="order-subtotal">MK {{ '{:,.0f}'.format(garment_prices[garments[0]]) }}</strong>
+</div>
+<div class="two"><div><label for="buyer_name">Full name *</label><input id="buyer_name" name="buyer_name" maxlength="160" required value="{{ old.get('buyer_name','') }}"></div>
+<div><label for="phone">Phone / WhatsApp *</label><input id="phone" name="phone" maxlength="50" inputmode="tel" required value="{{ old.get('phone','') }}"></div></div>
+<div class="two"><div><label for="email">Email (optional)</label><input id="email" type="email" name="email" maxlength="180" value="{{ old.get('email','') }}"></div>
+<div><label for="location">Area / delivery town *</label><input id="location" name="location" maxlength="160" required value="{{ old.get('location','') }}"></div></div>
+<details class="order-extras" {% if old.get('notes') %}open{% endif %}>
+<summary>Special instructions (optional)</summary>
+<label for="notes">Order notes</label>
+<textarea id="notes" name="notes" maxlength="1200" placeholder="Preferred fit, delivery questions or other details">{{ old.get('notes','') }}</textarea>
+</details>
+<label class="order-consent"><input type="checkbox" name="consent" value="1" required
+{% if old.get('consent')=='1' %}checked{% endif %}>
+<span>I agree that IBROWS may use my contact details to respond to this order request.</span></label>
+<p class="order-help">IBROWS checks size and colour before confirming production, delivery or payment.</p>
 <button class="button" type="submit">Send order request</button></form>
-</div></div></div></main>""" + BASE_END
+</div></div></div></main>
+<script>
+/* V143_SUBTOTAL_READY: price display mirrors backend's fixed garment pricing. */
+(function(){
+  var garment=document.getElementById('garment');
+  var quantity=document.getElementById('quantity');
+  var subtotal=document.getElementById('order-subtotal');
+  var prices={{ garment_prices|tojson }};
+  if(!garment || !quantity || !subtotal) return;
+  function updateTotal(){
+    var count=Number(quantity.value);
+    var unit=prices[garment.value];
+    if(!Number.isInteger(count) || count<1 || count>30 || !unit){
+      subtotal.textContent='Check selection';return;
+    }
+    subtotal.textContent='MK '+(unit*count).toLocaleString('en-US');
+  }
+  garment.addEventListener('change',updateTotal);
+  quantity.addEventListener('input',updateTotal);
+  updateTotal();
+})();
+</script>""" + BASE_END
 
 COMPLETE_TEMPLATE=BASE_START+"""
 <section class="hero"><div class="wrap"><div class="eyebrow">Request received</div><h1>Thank you.</h1>
@@ -403,7 +439,7 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         colour_choices=csv_choices(p["colours"])
         if request.method=="GET":
             return render(ORDER_TEMPLATE,title=p["title"],design=p,garments=garment_choices,
-                          sizes=size_choices,colours=colour_choices,csrf_token=public_csrf("MSJ_ORDER"),error="")
+                          sizes=size_choices,colours=colour_choices,csrf_token=public_csrf("MSJ_ORDER"),error="",garment_prices=MSJ_GARMENT_PRICES,old={})
         supplied=str(request.form.get("csrf_token") or "")
         if not supplied or not secrets.compare_digest(supplied,public_csrf("MSJ_ORDER")):abort(403)
         if request.form.get("fax_number"):abort(400)
@@ -455,7 +491,7 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         except (ValueError,TypeError):
             return render(ORDER_TEMPLATE,title=p["title"],design=p,garments=garment_choices,
                  sizes=size_choices,colours=colour_choices,csrf_token=public_csrf("MSJ_ORDER"),
-                 error="Please check your selected garment, contact details, quantity and consent."),400
+                 garment_prices=MSJ_GARMENT_PRICES,old=request.form,error="Please check your selected garment, contact details, quantity and consent."),400
 
     def send_notification(order_id,reference,p,garment,size,colour,quantity,buyer_name,phone,location):
         key=os.getenv("BREVO_API_KEY","").strip()
