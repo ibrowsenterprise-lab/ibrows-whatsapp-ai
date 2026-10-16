@@ -20,9 +20,12 @@ class Cursor:
                 self.value=(len(rows),)
         elif query.lstrip().upper().startswith(("SELECT PG_ADVISORY", "CREATE TABLE","CREATE INDEX","ALTER TABLE")):
             pass
+        elif query.lstrip().upper().startswith("SELECT CODE, MD5(IMAGE_BYTES) FROM MSJ_MERCH_DESIGNS"):
+            self.value=[]
         else:
             raise AssertionError(query[:100])
     def fetchone(self):return self.value
+    def fetchall(self):return self.value if isinstance(self.value,list) else []
 class Conn:
     def __enter__(self):return self
     def __exit__(self,*exc):pass

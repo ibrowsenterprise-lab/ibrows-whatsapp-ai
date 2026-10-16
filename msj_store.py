@@ -15,6 +15,7 @@ from functools import wraps
 import requests
 from flask import Blueprint, Response, abort, redirect, render_template_string, request, session, url_for
 from PIL import Image, ImageOps, UnidentifiedImageError
+from msj_catalogue_repair import repair_ms_j_misassigned_sheet_images
 
 # Confirmed MSJ prices and apparel sizes. Amounts are in Malawi kwacha.
 MSJ_GARMENT_PRICES = {"T-shirt": 25000, "Hoodie": 50000, "Cap": 20000}
@@ -89,11 +90,11 @@ Every order is reviewed by our team before payment, printing or delivery is arra
 <main class="section"><div class="wrap">
 {% if products %}<div class="grid">{% for p in products %}
 <article class="product"><a href="{{ url_for('msj.order_design', design_id=p.id) }}" aria-label="Choose {{ p.title }}">
-<img src="{{ url_for('msj.design_image', design_id=p.id) }}" alt="{{ p.title }} – official Mulungu Si Jemusi artwork" loading="lazy"></a>
+<img src="{{ url_for('msj.design_image', design_id=p.id, v=p.image_revision[:12]) }}" alt="{{ p.title }} – official Mulungu Si Jemusi artwork" loading="lazy"></a>
 <div class="product-content"><div class="eyebrow">{{ p.code }}</div><h2>{{ p.title }}</h2>
 <p>{{ p.description or 'Original MSJ clothing artwork.' }}</p>
 <div class="price">From MK {{ '{:,.0f}'.format(p.price_mwk) }}</div>
-<p>Choose garment, size, colour and quantity on the order page.</p>
+<p>Available: {{ p.garments }}. Choose size, preferred colour and quantity when ordering.</p>
 <a class="button" href="{{ url_for('msj.order_design', design_id=p.id) }}">Select design</a></div></article>{% endfor %}</div>
 {% else %}<div class="notice"><h2>Collection being prepared</h2>
 <p>The original MSJ artwork is being prepared for ordering. Prices and garment availability will appear here once confirmed.
@@ -105,7 +106,7 @@ ORDER_TEMPLATE=BASE_START+"""
 <p class="lede">Your artwork choice is reserved for this request only after IBROWS confirms availability. You will not be charged now.</p></div></section>
 <main class="section"><div class="wrap">
 <div class="order-layout">
-<div class="product"><img src="{{ url_for('msj.design_image',design_id=design.id) }}" alt="Original {{ design.title }} artwork"><div class="product-content">
+<div class="product"><img src="{{ url_for('msj.design_image',design_id=design.id, v=design.image_revision[:12]) }}" alt="Original {{ design.title }} artwork"><div class="product-content">
 <p>{{ design.description }}</p><strong>From MK {{ '{:,.0f}'.format(design.price_mwk) }} per item, depending on garment</strong>
 <p>Artwork preview is not necessarily a finished garment mock-up.</p>
 <p>Confirmed prices: T-shirts MK25,000 · Hoodies MK50,000 · Caps MK20,000.</p></div></div>
@@ -217,7 +218,7 @@ onsubmit="return window.confirm('Publish all {{ draft_count }} MSJ drafts? Only 
 {% endif %}
 </div>
 {% if products %}<div class="table-wrap"><table class="catalog-table"><thead><tr><th>Design</th><th>Price</th><th>Status</th><th>Update</th></tr></thead><tbody>
-{% for p in products %}<tr><td data-label="Design"><img src="{{ url_for('msj.design_image',design_id=p.id) }}" width="110" alt=""><div><strong>{{ p.title }}</strong><br>{{ p.code }}</div></td>
+{% for p in products %}<tr><td data-label="Design"><img src="{{ url_for('msj.design_image',design_id=p.id, v=p.image_revision[:12]) }}" width="110" alt=""><div><strong>{{ p.title }}</strong><br>{{ p.code }}</div></td>
 <td data-label="Price">MK {{ '{:,.0f}'.format(p.price_mwk) }}</td><td data-label="Status">{{ 'Published' if p.published else 'Draft' }}</td>
 <td data-label="Update"><form method="post" action="{{ url_for('msj.admin_toggle',design_id=p.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <button class="button secondary" type="submit">{{ 'Unpublish' if p.published else 'Publish' }}</button></form>
@@ -313,6 +314,11 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                 cur.execute("ALTER TABLE msj_merch_orders ADD COLUMN IF NOT EXISTS colour_alert_error VARCHAR(160)")
                 cur.execute("ALTER TABLE msj_merch_orders ADD COLUMN IF NOT EXISTS colour_alert_sent_at TIMESTAMPTZ")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_msj_orders_time ON msj_merch_orders (created_at DESC)")
+                repair_result=repair_ms_j_misassigned_sheet_images(cur)
+                if repair_result=="repaired":
+                    app.logger.info("MSJ artwork alignment fixed for eight original 4-shirt designs.")
+                elif repair_result=="changed_skip":
+                    app.logger.warning("MSJ artwork differs from known originals; guarded correction skipped.")
             conn.commit()
         initialized=True
 
@@ -325,9 +331,9 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
 
     def product_rows(published_only=True):
         connect_setup()
-        sql="SELECT id,code,title,description,price_mwk,garments,sizes,colours,published FROM msj_merch_designs"
+        sql="SELECT id,code,title,description,price_mwk,garments,sizes,colours,published,md5(image_bytes) AS image_revision FROM msj_merch_designs"
         if published_only:sql+=" WHERE published=TRUE"
-        sql+=" ORDER BY id DESC"
+        sql+=" ORDER BY id ASC"
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql)
@@ -338,8 +344,8 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         connect_setup()
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""SELECT id,code,title,description,price_mwk,garments,sizes,colours,published
-                    FROM msj_merch_designs WHERE id=%s"""+(" AND published=TRUE" if public else ""), (ident,))
+                cur.execute("""SELECT id,code,title,description,price_mwk,garments,sizes,colours,published,
+                    md5(image_bytes) AS image_revision FROM msj_merch_designs WHERE id=%s"""+(" AND published=TRUE" if public else ""), (ident,))
                 row=cur.fetchone()
                 if not row:return None
                 return dict(zip([x.name for x in cur.description],row))
@@ -384,7 +390,7 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         if row is None or (not row[2] and not session.get("admin_authenticated")):abort(404)
         response=Response(bytes(row[0]),content_type=row[1])
         response.headers["X-Content-Type-Options"]="nosniff"
-        response.headers["Cache-Control"]="public, max-age=3600" if row[2] else "private, no-store"
+        response.headers["Cache-Control"]="public, max-age=600" if row[2] else "private, no-store"
         return response
 
     @bp.route("/msj/design/<int:design_id>",methods=["GET","POST"])
