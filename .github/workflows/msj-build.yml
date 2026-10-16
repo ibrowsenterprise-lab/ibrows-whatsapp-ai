@@ -1,0 +1,50 @@
+name: MSJ merch integration build and regression
+on:
+  push:
+    branches: [feature/msj-merchandise-shop-v140]
+    paths:
+      - msj_store.py
+      - tools/msj_integrate.py
+      - tools/test_msj_store.py
+      - .github/workflows/msj-build.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install app and regression dependencies
+        run: python -m pip install -r requirements.txt 'pypdf>=5,<7'
+      - name: Inject MSJ shop into live Branding template
+        run: python tools/msj_integrate.py
+      - name: Compile MSJ and verify all previous integrations
+        run: |
+          python -m py_compile app.py msj_store.py
+          python tools/test_v132.py
+          node --check /tmp/ibrows-v132-admin.js
+          python tools/test_v134_business_email.py
+          python tools/test_v135_typography.py
+          python tools/test_v136_team.py
+          python tools/test_v137_readmalawi.py
+          python tools/test_v138_profile.py
+          python tools/test_v139_client_submission.py
+          python tools/test_v139_project_discovery.py
+          python tools/test_v139_extract_ui.py
+          node tools/test_v139_project_discovery_ui.js
+          python tools/test_msj_store.py
+      - name: Store generated app changes on review branch only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'Integrate MSJ merchandise collection into IBROWS Branding'
+            git push origin HEAD:feature/msj-merchandise-shop-v140
+          fi
