@@ -1,0 +1,31 @@
+name: Verify MSJ V142 live images and customer page
+on:
+  push:
+    branches: [audit/msj-v142-live-20261016]
+    paths: [".github/workflows/msj-live-v142.yml"]
+permissions: {contents: read}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check IBROWS official MSJ catalogue without placing any orders
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --retry 3 --retry-delay 4 --max-time 60 -fLsS https://www.ibrowsenterprise.com/msj > /tmp/msj.html
+          python - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          text=Path('/tmp/msj.html').read_text()
+          expected=['Classic','Script','Modern','Circle','Handwritten','Label','Retro Flow','Varsity','Stencil','Motion','Vertical']
+          for name in expected:
+              assert ('MSJ '+name) in text, name
+          assert 'image_revision' not in text, 'Raw internals should not leak'
+          assert text.count('v=')>=11,'Product images should use cache busting'
+          assert 'MK 25,000' in text
+          assert text.index('MSJ Classic') < text.index('MSJ Vertical'),'Catalogue should be Classic first'
+          print('PASS: public MSJ site displays all 11 design titles, prices and versioned images')
+          PY
+          curl --retry 3 --retry-delay 4 --max-time 60 -fLsS https://www.ibrowsenterprise.com/design-branding > /tmp/branding.html
+          grep -q 'href="/msj"' /tmp/branding.html
+          echo "PASS: Branding page links to live MSJ store"
