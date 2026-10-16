@@ -21,6 +21,9 @@ class Cursor:
         calls.append(query)
         if query.startswith("select pg_advisory_xact_lock"):self.rows=[];return
         if query.startswith(("create table if not exists","create index if not exists","alter table msj_merch_orders")):self.rows=[];return
+        if query.startswith("select code, md5(image_bytes) from msj_merch_designs"):
+            self.rows=[]
+            return
         if query.startswith("select count(*) from msj_merch_designs where published=false"):
             self.rows=[(sum(1 for x in products if not x["published"]),)]
             return
