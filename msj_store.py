@@ -68,7 +68,7 @@ BASE_END = """<footer><div class="wrap">Mulungu Si Jemusi (MSJ) · An IBROWS Ent
 CATALOG_TEMPLATE=BASE_START+"""
 <section class="hero"><div class="wrap"><div class="eyebrow">The MSJ Collection</div>
 <h1>Mulungu Si Jemusi.</h1><p class="lede">Wear the message. Explore original MSJ artwork and request the clothing design you want.
-Every order is reviewed by our team before payment, printing or delivery is arranged.</p></div></section>
+Every order is reviewed by our team before payment, printing or delivery is arranged. Request any colour you like; IBROWS will notify you if your preferred colour is unavailable.</p></div></section>
 <main class="section"><div class="wrap">
 {% if products %}<div class="grid">{% for p in products %}
 <article class="product"><a href="{{ url_for('msj.order_design', design_id=p.id) }}" aria-label="Choose {{ p.title }}">
@@ -124,8 +124,10 @@ ORDER_TEMPLATE=BASE_START+"""
   if (garment) { garment.addEventListener("change", syncSize); syncSize(); }
 })();
 </script>
-<div class="two"><div><label for="colour">Colour *</label><select id="colour" name="colour" required>
-{% for v in colours %}<option value="{{ v }}">{{ v }}</option>{% endfor %}</select></div>
+<div class="two"><div><label for="colour">Preferred colour *</label>
+<input id="colour" name="colour" type="text" list="msj-colour-ideas" maxlength="50" placeholder="e.g. Forest green or wine red" required autocomplete="off">
+<datalist id="msj-colour-ideas">{% for v in colours %}<option value="{{ v }}">{% endfor %}</datalist>
+<small class="note">Type any colour you prefer. Listed colours are suggestions, not guaranteed stock. If we cannot supply your colour, we will notify you.</small></div>
 <div><label for="quantity">Quantity *</label><input id="quantity" name="quantity" type="number" value="1" min="1" max="30" required></div></div>
 <p class="note">T-shirt MK25,000 · Hoodie MK50,000 · Cap MK20,000. The order estimate uses the selected garment and quantity. Delivery cost and availability are confirmed separately before accepting payment.</p>
 <div class="two"><div><label for="buyer_name">Full name *</label><input id="buyer_name" name="buyer_name" maxlength="160" required></div>
@@ -134,7 +136,7 @@ ORDER_TEMPLATE=BASE_START+"""
 <div><label for="location">Area / delivery town *</label><input id="location" name="location" maxlength="160" required></div></div>
 <label for="notes">Notes or custom instructions (optional)</label><textarea id="notes" name="notes" maxlength="1200" placeholder="Preferred fit, delivery details or questions"></textarea>
 <label><input type="checkbox" name="consent" value="1" required> I agree that IBROWS may use my details to respond to this merchandise request.</label>
-<p class="note">No payment is collected at this stage. IBROWS will contact you to confirm the final order and payment instructions.</p>
+<p class="note">No payment is collected at this stage. IBROWS will verify your colour request and contact you before confirming an order. If the colour is unavailable, you will be notified by email when provided; otherwise, our team will contact you by telephone or WhatsApp.</p>
 <button class="button" type="submit">Send order request</button></form>
 </div></div></div></main>""" + BASE_END
 
@@ -144,7 +146,9 @@ COMPLETE_TEMPLATE=BASE_START+"""
 <main class="section"><div class="wrap"><div class="pane">
 <h2>Your order reference</h2><p style="font-size:1.4rem;font-weight:850">{{ reference }}</p>
 <p>{{ design_title }} · {{ garment }} · {{ colour }} · {{ size }} · quantity {{ quantity }}</p>
-<p><strong>Status:</strong> Pending IBROWS confirmation. No payment has been received or requested by this form.</p>
+<p><strong>Status:</strong> {{ order_status.replace('_',' ').title() }}. No payment has been received or requested by this form.</p>
+{% if order_status=='COLOUR_UNAVAILABLE' %}<p class="error" role="status">Your requested colour {{ colour }} is currently unavailable. IBROWS will contact you about an alternative. No payment or production will go ahead without your approval.</p>
+{% else %}<p>Your requested colour will be checked before the order is confirmed.</p>{% endif %}
 <a class="button secondary" href="/msj">Back to MSJ Collection</a>
 </div></div></main>""" + BASE_END
 
@@ -164,7 +168,8 @@ ADMIN_TEMPLATE=BASE_START+"""
 <p class="note">Confirmed MSJ prices: T-shirt MK25,000 · Hoodie MK50,000 · Cap MK20,000. Pricing is calculated automatically for each order.</p>
 <label>Available garment types (comma-separated) *</label><input name="garments" placeholder="T-shirt, Hoodie, Cap" required>
 <div class="two"><div><label>Sizes (comma-separated) *</label><input name="sizes" value="S,M,L,XL,XXL,One Size" required></div>
-<div><label>Available colours (comma-separated) *</label><input name="colours" placeholder="Black, White" required></div></div>
+<div><label>Suggested colours (optional)</label><input name="colours" placeholder="Black, White, Green"></div></div>
+<p class="note">These colours are suggestions. Customers can request any colour, and IBROWS confirms availability individually.</p>
 <button class="button" type="submit">Save unpublished design</button></form></div>
 <h2 style="margin-top:38px">Catalogue</h2>
 {% if products %}<div class="table-wrap"><table><thead><tr><th>Design</th><th>Price</th><th>Status</th><th>Update</th></tr></thead><tbody>
@@ -177,7 +182,8 @@ ADMIN_TEMPLATE=BASE_START+"""
 <label>Description</label><input name="description" maxlength="300" value="{{ p.description }}">
 <label>Garments</label><input name="garments" value="{{ p.garments }}" required>
 <label>Sizes</label><input name="sizes" value="{{ p.sizes }}" required>
-<label>Colours</label><input name="colours" value="{{ p.colours }}" required>
+<label>Suggested colours (optional)</label><input name="colours" value="{{ p.colours }}">
+<p class="note">Customers may request any colour even if it is not listed above.</p>
 <label>Replace artwork (optional)</label><input type="file" name="image" accept="image/png,image/jpeg,image/webp">
 <button class="button secondary" type="submit" style="margin-top:8px">Save changes</button></form></details>
 </td></tr>{% endfor %}
@@ -187,13 +193,28 @@ ADMIN_TEMPLATE=BASE_START+"""
 {% for o in orders %}<tr><td><strong>{{ o.reference }}</strong><br><small>{{ o.created_at }}</small></td>
 <td>{{ o.buyer_name }}<br>{{ o.phone }}<br>{{ o.email or '' }}<br>{{ o.location }}</td>
 <td>{{ o.title }}<br>{{ o.garment }} · {{ o.size }} · {{ o.colour }}<br>Qty {{ o.quantity }}<br>{{ o.notes }}</td>
-<td>MK {{ '{:,.0f}'.format(o.estimated_total) }}<br><small>Email: {{ o.notification_status }}</small></td>
+<td>MK {{ '{:,.0f}'.format(o.estimated_total) }}<br><small>Admin email: {{ o.notification_status }}</small>
+{% if o.status == 'COLOUR_UNAVAILABLE' %}<br><small><strong>Buyer alert:</strong> {{ o.colour_alert_status }}</small>{% endif %}</td>
 <td><form method="post" action="{{ url_for('msj.admin_status',order_id=o.id) }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <select name="status" aria-label="Update order status">
-{% for status in ['NEW','CONTACTED','QUOTED','CONFIRMED','IN_PRODUCTION','FULFILLED','CANCELLED'] %}
+{% for status in ['NEW','CONTACTED','COLOUR_UNAVAILABLE','QUOTED','CONFIRMED','IN_PRODUCTION','FULFILLED','CANCELLED'] %}
 <option value="{{ status }}" {% if o.status == status %}selected{% endif %}>{{ status.replace('_',' ').title() }}</option>{% endfor %}
-</select><button class="button secondary" type="submit">Save</button></form></td></tr>{% endfor %}
+</select><button class="button secondary" type="submit">Save status</button></form>
+{% if o.status == 'COLOUR_UNAVAILABLE' %}
+{% if o.colour_alert_status in ['MANUAL_REQUIRED','FAILED'] %}
+<p class="note">{% if o.email %}Email notice failed. Please retry or contact the buyer directly.{% else %}No email provided: please notify the buyer by phone or WhatsApp.{% endif %}</p>
+<a class="button secondary" href="tel:{{ o.phone }}" style="margin:4px 0">Call customer</a>
+<form method="post" action="{{ url_for('msj.admin_colour_contacted',order_id=o.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<button class="button secondary" type="submit">Mark manually notified</button></form>
+{% endif %}
+{% if o.colour_alert_status == 'FAILED' and o.email %}
+<form method="post" action="{{ url_for('msj.admin_retry_colour_notice',order_id=o.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<button class="button secondary" type="submit">Retry buyer email</button></form>
+{% endif %}
+{% endif %}</td></tr>{% endfor %}
 </tbody></table></div>{% else %}<p>No orders have been placed.</p>{% endif %}
 </div></main>""" + BASE_END
 
@@ -239,8 +260,14 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                     status VARCHAR(24) NOT NULL DEFAULT 'NEW',
                     notification_status VARCHAR(24) NOT NULL DEFAULT 'PENDING',
                     notification_error VARCHAR(120),
+                    colour_alert_status VARCHAR(24) NOT NULL DEFAULT 'PENDING',
+                    colour_alert_error VARCHAR(160),
+                    colour_alert_sent_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+                cur.execute("ALTER TABLE msj_merch_orders ADD COLUMN IF NOT EXISTS colour_alert_status VARCHAR(24) NOT NULL DEFAULT 'PENDING'")
+                cur.execute("ALTER TABLE msj_merch_orders ADD COLUMN IF NOT EXISTS colour_alert_error VARCHAR(160)")
+                cur.execute("ALTER TABLE msj_merch_orders ADD COLUMN IF NOT EXISTS colour_alert_sent_at TIMESTAMPTZ")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_msj_orders_time ON msj_merch_orders (created_at DESC)")
             conn.commit()
         initialized=True
@@ -333,12 +360,14 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         try:
             garment=request.form.get("garment","")[:50]
             size=request.form.get("size","")[:24]
-            colour=request.form.get("colour","")[:50]
+            colour=" ".join((request.form.get("colour") or "").replace(chr(0),"").split())[:50]
             if garment not in garment_choices or garment not in MSJ_GARMENT_PRICES:
                 raise ValueError("Select a valid garment.")
             valid_sizes = (MSJ_CAP_SIZE,) if garment == "Cap" else MSJ_APPAREL_SIZES
-            if size not in size_choices or size not in valid_sizes or colour not in colour_choices:
-                raise ValueError("Select an available garment size and colour.")
+            if size not in size_choices or size not in valid_sizes:
+                raise ValueError("Select an available garment size.")
+            if len(colour)<2 or not any(c.isalpha() for c in colour):
+                raise ValueError("Enter the colour you prefer.")
             quantity=int(request.form.get("quantity","0"))
             if not 1<=quantity<=30:raise ValueError("Order quantity must be between 1 and 30.")
             buyer_name=str(request.form.get("buyer_name","")).strip()[:160]
@@ -408,13 +437,13 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         connect_setup()
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""SELECT o.reference,d.title,o.garment,o.colour,o.size,o.quantity
+                cur.execute("""SELECT o.reference,d.title,o.garment,o.colour,o.size,o.quantity,o.status
                     FROM msj_merch_orders o JOIN msj_merch_designs d ON d.id=o.design_id
                     WHERE o.token=%s""",(str(token),))
                 r=cur.fetchone()
         if not r:abort(404)
         return render(COMPLETE_TEMPLATE,title="Order request received",reference=r[0],
-                      design_title=r[1],garment=r[2],colour=r[3],size=r[4],quantity=r[5])
+                      design_title=r[1],garment=r[2],colour=r[3],size=r[4],quantity=r[5],order_status=r[6])
 
     @bp.route("/admin/msj",methods=["GET"])
     @admin_required
@@ -424,7 +453,7 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
             with conn.cursor() as cur:
                 cur.execute("""SELECT o.id,o.reference,o.created_at,o.buyer_name,o.phone,o.email,o.location,
                     o.garment,o.size,o.colour,o.quantity,o.notes,o.estimated_total,o.status,
-                    o.notification_status,d.title FROM msj_merch_orders o
+                    o.notification_status,o.colour_alert_status,d.title FROM msj_merch_orders o
                     JOIN msj_merch_designs d ON d.id=o.design_id
                     ORDER BY o.id DESC LIMIT 200""")
                 keys=[x.name for x in cur.description]
@@ -448,8 +477,8 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                 raise ValueError("Enter a design title and unique code.")
             price=msj_product_options(garments)
             allowed_sizes=set(MSJ_APPAREL_SIZES)|{MSJ_CAP_SIZE}
-            if not sizes or not colours or any(x not in allowed_sizes for x in csv_choices(sizes)):
-                raise ValueError("Set confirmed sizes (S, M, L, XL, XXL or One Size) and colours.")
+            if not sizes or any(x not in allowed_sizes for x in csv_choices(sizes)):
+                raise ValueError("Set confirmed sizes (S, M, L, XL, XXL or One Size).")
             image_bytes,mime=image_sanitize(request.files.get("image"))
             connect_setup()
             with get_db() as conn:
@@ -490,8 +519,8 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
             colours=",".join(csv_choices(request.form.get("colours","")))
             price=msj_product_options(garments)
             allowed_sizes=set(MSJ_APPAREL_SIZES)|{MSJ_CAP_SIZE}
-            if not sizes or not colours or any(x not in allowed_sizes for x in csv_choices(sizes)):
-                raise ValueError("Set confirmed sizes (S, M, L, XL, XXL or One Size) and colours.")
+            if not sizes or any(x not in allowed_sizes for x in csv_choices(sizes)):
+                raise ValueError("Set confirmed sizes (S, M, L, XL, XXL or One Size).")
             upload=request.files.get("image")
             new_artwork=image_sanitize(upload) if upload and upload.filename else None
             with get_db() as conn:
@@ -513,11 +542,100 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
             msg=str(exc)
         return redirect(url_for("msj.admin_index",message=msg))
 
+    def send_customer_colour_unavailable(order_id):
+        """On admin stock review, email buyer if available, otherwise require manual contact."""
+        connect_setup()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT reference,email,buyer_name,colour,status,colour_alert_status
+                    FROM msj_merch_orders WHERE id=%s""",(order_id,))
+                row=cur.fetchone()
+        if not row or row[4] != "COLOUR_UNAVAILABLE":
+            return "Order is not awaiting a colour-availability notice."
+        reference,email,buyer_name,colour,_,previous=row
+        if previous in {"SENT","CONTACTED_MANUALLY","SENDING"}:
+            return "A colour notice was already sent or is being processed."
+        if not email:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""UPDATE msj_merch_orders
+                        SET colour_alert_status='MANUAL_REQUIRED',
+                        colour_alert_error='No buyer email. Phone or WhatsApp follow-up required.',
+                        updated_at=NOW()
+                        WHERE id=%s AND colour_alert_status NOT IN ('SENT','CONTACTED_MANUALLY')""",(order_id,))
+                conn.commit()
+            return "No email supplied: call or WhatsApp the buyer before continuing."
+        # Claim this notification atomically so simultaneous admin actions cannot duplicate it.
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""UPDATE msj_merch_orders SET colour_alert_status='SENDING',updated_at=NOW()
+                    WHERE id=%s AND status='COLOUR_UNAVAILABLE'
+                    AND colour_alert_status IN ('PENDING','FAILED','MANUAL_REQUIRED') RETURNING id""",(order_id,))
+                claimed=cur.fetchone() is not None
+            conn.commit()
+        if not claimed:return "A colour notice was already sent or is being processed."
+        key=os.getenv("BREVO_API_KEY","").strip()
+        sender=os.getenv("BREVO_SENDER_EMAIL","").strip() or "info@ibrowsenterprise.com"
+        sent=False
+        error="Brevo not configured"
+        if key:
+            try:
+                response=requests.post("https://api.brevo.com/v3/smtp/email",
+                    headers={"api-key":key,"Content-Type":"application/json"},
+                    json={"sender":{"email":sender,"name":"IBROWS Enterprise / MSJ"},
+                          "to":[{"email":email}],
+                          "subject":f"MSJ order {reference}: Preferred colour unavailable",
+                          "textContent":(
+                              f"Hello {buyer_name},\n\n"
+                              f"We have checked your Mulungu Si Jemusi (MSJ) order {reference}.\n"
+                              f"Unfortunately, your chosen colour ({colour}) is not currently available.\n"
+                              "Please reply to discuss another colour or cancel the request. "
+                              "No payment or production will be arranged until we agree on an alternative.\n\n"
+                              "IBROWS Enterprise | info@ibrowsenterprise.com"
+                          )},timeout=8)
+                sent=200<=response.status_code<300
+                error="" if sent else f"Brevo HTTP {response.status_code}"
+            except Exception as exc:
+                error=type(exc).__name__
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""UPDATE msj_merch_orders SET colour_alert_status=%s,
+                    colour_alert_error=%s,
+                    colour_alert_sent_at=CASE WHEN %s THEN NOW() ELSE colour_alert_sent_at END,
+                    updated_at=NOW() WHERE id=%s AND colour_alert_status='SENDING'""",
+                    ("SENT" if sent else "FAILED",None if sent else error,sent,order_id))
+            conn.commit()
+        if sent:return "Colour-unavailable email accepted by Brevo (recipient delivery not independently confirmed)."
+        return "Email notice failed. Please contact buyer directly or retry."
+
+    @bp.route("/admin/msj/orders/<int:order_id>/colour-contacted",methods=["POST"])
+    @admin_required
+    def admin_colour_contacted(order_id):
+        validate_admin_csrf()
+        connect_setup()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""UPDATE msj_merch_orders SET colour_alert_status='CONTACTED_MANUALLY',
+                    colour_alert_error=NULL, updated_at=NOW()
+                    WHERE id=%s AND status='COLOUR_UNAVAILABLE'
+                    AND colour_alert_status IN ('MANUAL_REQUIRED','FAILED') RETURNING id""",(order_id,))
+                updated=cur.fetchone()
+            conn.commit()
+        if not updated:abort(400)
+        return redirect(url_for("msj.admin_index",message="Manual customer colour notification recorded."))
+
+    @bp.route("/admin/msj/orders/<int:order_id>/colour-email-retry",methods=["POST"])
+    @admin_required
+    def admin_retry_colour_notice(order_id):
+        validate_admin_csrf()
+        msg=send_customer_colour_unavailable(order_id)
+        return redirect(url_for("msj.admin_index",message=msg))
+
     @bp.route("/admin/msj/orders/<int:order_id>/status",methods=["POST"])
     @admin_required
     def admin_status(order_id):
         validate_admin_csrf()
-        allowed={"NEW","CONTACTED","QUOTED","CONFIRMED","IN_PRODUCTION","FULFILLED","CANCELLED"}
+        allowed={"NEW","CONTACTED","COLOUR_UNAVAILABLE","QUOTED","CONFIRMED","IN_PRODUCTION","FULFILLED","CANCELLED"}
         status=request.form.get("status","").upper()
         if status not in allowed:abort(400)
         connect_setup()
@@ -528,6 +646,8 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                 row=cur.fetchone()
             conn.commit()
         if not row:abort(404)
-        return redirect(url_for("msj.admin_index",message="Order status saved. Verify payments separately."))
+        message=("Order status saved. Verify payments separately."
+                 if status!="COLOUR_UNAVAILABLE" else send_customer_colour_unavailable(order_id))
+        return redirect(url_for("msj.admin_index",message=message))
 
     app.register_blueprint(bp)
