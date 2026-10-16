@@ -1,0 +1,36 @@
+name: MSJ V144 production visitor check
+on:
+  push:
+    branches: [audit/msj-v144-live-20261016]
+    paths: [.github/workflows/msj-v144-visitor.yml]
+permissions: {contents: read}
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Smoke-test official MSJ catalogue and category pages read-only
+        run: |
+          set -euo pipefail
+          for item in "" "?garment=T-shirt" "?garment=Hoodie" "?garment=Cap"; do
+            curl --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 80 --fail --silent --show-error --location "https://www.ibrowsenterprise.com/msj$item" -o "/tmp/msj-${item//[^a-zA-Z]/_}.html"
+          done
+          python - <<'PY'
+          from pathlib import Path
+          pages=list(Path('/tmp').glob('msj-*html'))
+          assert len(pages)==4,pages
+          for p in pages:
+            txt=p.read_text()
+            assert 'Mulungu Si Jemusi' in txt,p
+            assert 'shop-filters' in txt,p
+            assert 'garment=Hoodie' in txt and 'garment=Cap' in txt,p
+          tee=Path('/tmp/msj-_garment_T_shirt.html').read_text()
+          assert 'MSJ Classic' in tee
+          cap=Path('/tmp/msj-_garment_Cap.html').read_text()
+          hoodie=Path('/tmp/msj-_garment_Hoodie.html').read_text()
+          assert 'Collection being prepared' in cap and 'Collection being prepared' in hoodie
+          print('PASS: all live garment categories load, unpublished cap/hoodie drafts do not leak')
+          PY
+          curl --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 80 --fail --silent --show-error --location https://www.ibrowsenterprise.com/msj/design/1 -o /tmp/order.html
+          grep -q 'Estimated subtotal' /tmp/order.html
+          grep -q 'MK 25,000' /tmp/order.html
+          echo 'PASS: MSJ original T-shirt orders still available'
