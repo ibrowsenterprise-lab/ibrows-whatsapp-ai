@@ -171,6 +171,18 @@ ADMIN_TEMPLATE=BASE_START+"""
 <div><label>Suggested colours (optional)</label><input name="colours" placeholder="Black, White, Green"></div></div>
 <p class="note">These colours are suggestions. Customers can request any colour, and IBROWS confirms availability individually.</p>
 <button class="button" type="submit">Save unpublished design</button></form></div>
+<div class="pane" style="margin-top:28px"><h2>Import your 11 MSJ T-shirt designs</h2>
+<p class="note">Upload the three original MSJ mock-up sheets you shared earlier. We will crop each design directly from your originals—no replacement logos or invented graphics. Imported items start as private drafts for your approval.</p>
+<form method="post" action="{{ url_for('msj.admin_import_sheets') }}" enctype="multipart/form-data">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label>Classic / Script / Modern (3-shirt image)</label>
+<input type="file" name="three" accept="image/png,image/jpeg,image/webp">
+<label>Circle / Handwritten / Label / Retro Flow (4-shirt image)</label>
+<input type="file" name="four_a" accept="image/png,image/jpeg,image/webp">
+<label>Varsity / Stencil / Motion / Vertical (4-shirt image)</label>
+<input type="file" name="four_b" accept="image/png,image/jpeg,image/webp">
+<p class="note">Use the originals, not cropped screenshots. At least one sheet is required. Already imported designs are skipped safely.</p>
+<button class="button" type="submit">Import MSJ original designs as drafts</button></form></div>
 <h2 style="margin-top:38px">Catalogue</h2>
 {% if products %}<div class="table-wrap"><table><thead><tr><th>Design</th><th>Price</th><th>Status</th><th>Update</th></tr></thead><tbody>
 {% for p in products %}<tr><td><img src="{{ url_for('msj.design_image',design_id=p.id) }}" width="110" alt=""><div><strong>{{ p.title }}</strong><br>{{ p.code }}</div></td>
@@ -461,6 +473,75 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         return render(ADMIN_TEMPLATE,title="MSJ Admin",products=product_rows(False),
                       orders=orders,csrf_token=admin_csrf(),
                       message=request.args.get("message","")[:180])
+
+    @bp.route("/admin/msj/designs/import-sheets",methods=["POST"])
+    @admin_required
+    def admin_import_sheets():
+        """Crop exactly the user's original 3-shirt and 2x2 mockup sheets.
+
+        The source image is never redrawn. Admin reviews each result before
+        clicking Publish, and duplicate design codes are safely ignored.
+        """
+        validate_admin_csrf()
+        sheet_names={
+            "three":("Classic","Script","Modern"),
+            "four_a":("Circle","Handwritten","Label","Retro Flow"),
+            "four_b":("Varsity","Stencil","Motion","Vertical"),
+        }
+        processed=[]
+        try:
+            for field,names in sheet_names.items():
+                upload=request.files.get(field)
+                if not upload or not upload.filename:continue
+                raw=upload.stream.read(8*1024*1024+1)
+                if len(raw)>8*1024*1024:raise ValueError("A design sheet must be 8 MB or smaller.")
+                with Image.open(io.BytesIO(raw)) as im:
+                    if im.format not in ("PNG","JPEG","WEBP"):
+                        raise ValueError("Please use an original PNG, JPEG or WebP design sheet.")
+                    if im.width*im.height>20_000_000:raise ValueError("Design sheet dimensions are too large.")
+                    im=ImageOps.exif_transpose(im).convert("RGB")
+                    w,h=im.size
+                    if field=="three":
+                        if w/h<1.3 or w/h>1.9:raise ValueError("The 3-shirt design sheet must be the wide 3-column image.")
+                        crop_boxes=[(round(w*j/3),0,round(w*(j+1)/3),round(h*.85)) for j in range(3)]
+                    else:
+                        if w/h<.9 or w/h>1.3:raise ValueError("The 4-shirt sheet must be the 2x2 image.")
+                        crop_boxes=[]
+                        for row in range(2):
+                            for col in range(2):
+                                x0=round(w*col/2); x1=round(w*(col+1)/2)
+                                y0=round(h*row/2); y1=round(h*(row+1)/2)
+                                crop_boxes.append((x0,y0,x1,round(y0+(y1-y0)*.89)))
+                    for label,box in zip(names,crop_boxes):
+                        thumbnail=im.crop(box)
+                        thumbnail.thumbnail((960,960),Image.Resampling.LANCZOS)
+                        out=io.BytesIO()
+                        thumbnail.save(out,format="JPEG",quality=88,optimize=True)
+                        processed.append((label,out.getvalue()))
+            if not processed:raise ValueError("Choose at least one original MSJ design sheet.")
+            connect_setup()
+            inserted=skipped=0
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    for label,asset in processed:
+                        code="MSJ-"+label.upper().replace(" ","-")
+                        cur.execute("""INSERT INTO msj_merch_designs
+                            (code,title,description,price_mwk,garments,sizes,colours,image_bytes,image_mime,published)
+                            VALUES(%s,%s,%s,%s,'T-shirt','S,M,L,XL,XXL',%s,%s,'image/jpeg',FALSE)
+                            ON CONFLICT (code) DO NOTHING RETURNING id""",
+                            (code,"MSJ "+label,
+                             "Mulungu Si Jemusi "+label+" T-shirt from approved original artwork sheet.",
+                             MSJ_GARMENT_PRICES["T-shirt"],
+                             "Black,White,Cream,Green,Grey,Navy,Burgundy",asset))
+                        if cur.fetchone():inserted+=1
+                        else:skipped+=1
+                conn.commit()
+            message=(f"Imported {inserted} original MSJ designs as unpublished drafts."
+                     + (f" Skipped {skipped} designs already on record." if skipped else "")
+                     + " Review every crop and publish designs you approve.")
+        except (ValueError,UnidentifiedImageError,OSError) as exc:
+            message="Import error: "+str(exc)[:160]
+        return redirect(url_for("msj.admin_index",message=message))
 
     @bp.route("/admin/msj/designs/add",methods=["POST"])
     @admin_required
