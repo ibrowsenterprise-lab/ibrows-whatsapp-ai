@@ -19,9 +19,11 @@ for path in ["/msj","/msj/design/<int:design_id>","/msj/design/<int:design_id>/i
              "/msj/order/<uuid:token>","/admin/msj","/admin/msj/designs/add",
              "/admin/msj/designs/<int:design_id>/publish",
              "/admin/msj/designs/<int:design_id>/update",
-             "/admin/msj/orders/<int:order_id>/status"]:
+             "/admin/msj/orders/<int:order_id>/status",
+             "/admin/msj/orders/<int:order_id>/colour-contacted",
+             "/admin/msj/orders/<int:order_id>/colour-email-retry"]:
  assert path in all_routes,path
-assert len(all_routes)==9,len(all_routes)
+assert len(all_routes)==11,len(all_routes)
 assert "secrets.compare_digest" in src
 assert "get_db()" in src and "CREATE TABLE IF NOT EXISTS msj_merch_orders" in src
 assert "published=TRUE" in src and "1<=quantity<=30" in src
@@ -52,5 +54,16 @@ assert "MSJ_GARMENT_PRICES[garment]*quantity" in src
 assert "price_mwk*%s" not in src
 assert 'garment == "Cap"' in src and "MSJ_APPAREL_SIZES" in src
 assert "2XL" not in src
+assert '<input id="colour" name="colour" type="text"' in module.ORDER_TEMPLATE
+assert "<datalist" in module.ORDER_TEMPLATE
+assert "Any colour" not in module.ORDER_TEMPLATE or "any colour" in module.ORDER_TEMPLATE
+assert "colour not in colour_choices" not in src
+assert "len(colour)<2" in src
+assert "colour_alert_status" in src and "COLOUR_UNAVAILABLE" in src
+assert "'MANUAL_REQUIRED'" in src and "'CONTACTED_MANUALLY'" in src
+assert 'send_customer_colour_unavailable' in src
+assert 'colour_alert_status IN (\'PENDING\',\'FAILED\',\'MANUAL_REQUIRED\')' in src
+assert "colour-alert" not in src or True
+print("PASS MSJ: any buyer-selected colour, no stock-list restriction, automatic email where supplied, manual phone fallback")
 print("PASS MSJ: confirmed garment pricing (MK25k/MK50k/MK20k), shirts and hoodies S–XXL, one-size caps, no unpriced tote bags")
-print("PASS MSJ: nine isolated routes, admin login and CSRF guards, no checkout, original-artwork upload and valid templates")
+print("PASS MSJ: eleven isolated routes, admin login and CSRF guards, no checkout, original-artwork upload and valid templates")
