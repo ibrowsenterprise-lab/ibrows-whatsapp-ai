@@ -51,6 +51,9 @@ assert r.status_code==200,(r.status_code,r.data[:600])
 html=r.data.decode("utf-8")
 assert html.index("<strong>MSJ Wordmark Hoodie</strong>") < html.index("<strong>MSJ Block Cap</strong>") < html.index("<strong>MSJ Classic</strong>")
 assert "2 drafts" in html and "1 published" in html
+assert "1 T-shirt designs" in html and "1 hoodie designs" in html and "1 cap designs" in html
+assert 'href="#merch-import-title"' in html, "Mobile hoodie/cap import shortcut missing"
+assert "Choose at least one original MSJ design sheet before importing." in html
 assert "Publish All Drafts (2)" in html
 assert html.count("Draft — needs approval")==2
 assert "Review each image, garment type, sizes and price" in html
