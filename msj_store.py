@@ -506,7 +506,12 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                     ref=f"MSJ-{datetime.utcnow().year}-{oid:05d}"
                     cur.execute("UPDATE msj_merch_orders SET reference=%s WHERE id=%s",(ref,oid))
                 conn.commit()
-            send_notification(oid,ref,p,garment,size,colour,quantity,buyer_name,phone,location)
+            try:
+                send_notification(oid,ref,p,garment,size,colour,quantity,buyer_name,phone,location)
+            except Exception:
+                # Order was already committed. Do not tell the customer it failed or
+                # invite a duplicate submission just because an alert failed.
+                app.logger.exception("MSJ order %s saved but staff notification failed",ref)
             return redirect(url_for("msj.complete",token=token),code=303)
         except (ValueError,TypeError):
             return render(ORDER_TEMPLATE,title=p["title"],design=p,garments=garment_choices,
