@@ -109,16 +109,16 @@ No payments or orders are being taken yet.</p></div>{% endif %}
 </div></main>""" + BASE_END
 
 ORDER_TEMPLATE=BASE_START+"""
-<section class="hero"><div class="wrap"><div class="eyebrow">Request MSJ Merchandise</div><h1>{{ design.title }}</h1>
+<section class="hero order-hero"><div class="wrap"><div class="eyebrow">MSJ / Order request</div><h1>{{ design.title }}</h1>
 <p class="lede">Your artwork choice is reserved for this request only after IBROWS confirms availability. You will not be charged now.</p></div></section>
-<main class="section"><div class="wrap">
+<main class="section order-section"><div class="wrap">
 <div class="order-layout">
-<div class="product"><img src="{{ url_for('msj.design_image',design_id=design.id, v=design.image_revision[:12]) }}" alt="Original {{ design.title }} artwork"><div class="product-content">
+<div class="product order-product"><img src="{{ url_for('msj.design_image',design_id=design.id, v=design.image_revision[:12]) }}" alt="Original {{ design.title }} artwork"><div class="product-content">
 <p>{{ design.description }}</p><strong>From MK {{ '{:,.0f}'.format(design.price_mwk) }} per item, depending on garment</strong>
 <p>Artwork preview is not necessarily a finished garment mock-up.</p>
 <p>Confirmed prices: T-shirts MK25,000 · Hoodies MK50,000 · Caps MK20,000.</p></div></div>
-<div class="pane">{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
-<h2>Place an order request</h2>
+<div class="pane order-pane">{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<h2>Your order</h2>
 <form method="post" action="{{ url_for('msj.order_design',design_id=design.id) }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <input type="text" name="fax_number" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px" aria-hidden="true">
