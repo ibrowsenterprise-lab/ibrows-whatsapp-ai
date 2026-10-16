@@ -49,7 +49,7 @@ client=app.test_client()
 r=client.get("/admin/msj")
 assert r.status_code==200,(r.status_code,r.data[:600])
 html=r.data.decode("utf-8")
-assert html.index("MSJ Wordmark Hoodie") < html.index("MSJ Block Cap") < html.index("MSJ Classic")
+assert html.index("<strong>MSJ Wordmark Hoodie</strong>") < html.index("<strong>MSJ Block Cap</strong>") < html.index("<strong>MSJ Classic</strong>")
 assert "2 drafts" in html and "1 published" in html
 assert "Publish All Drafts (2)" in html
 assert html.count("Draft — needs approval")==2
