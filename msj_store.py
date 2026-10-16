@@ -16,6 +16,19 @@ import requests
 from flask import Blueprint, Response, abort, redirect, render_template_string, request, session, url_for
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+# Confirmed MSJ prices and apparel sizes. Amounts are in Malawi kwacha.
+MSJ_GARMENT_PRICES = {"T-shirt": 25000, "Hoodie": 50000, "Cap": 20000}
+MSJ_APPAREL_SIZES = ("S", "M", "L", "XL", "XXL")
+MSJ_CAP_SIZE = "One Size"
+
+def msj_product_options(garments):
+    """Calculate the advertised price strictly from approved garment prices."""
+    choices = [g.strip() for g in (garments or "").split(",") if g.strip()]
+    if not choices or any(g not in MSJ_GARMENT_PRICES for g in choices):
+        raise ValueError("Available merchandise must be T-shirt, Hoodie or Cap.")
+    return min(MSJ_GARMENT_PRICES[g] for g in choices)
+
+
 SHOP_CSS = """
 :root{--ink:#17392b;--cream:#f6f0e5;--wine:#671b2c;--line:#ded8cc;--muted:#5d655f}
 *{box-sizing:border-box}body{margin:0;background:#fcfaf6;color:#202820;font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;line-height:1.55}
@@ -62,7 +75,7 @@ Every order is reviewed by our team before payment, printing or delivery is arra
 <img src="{{ url_for('msj.design_image', design_id=p.id) }}" alt="{{ p.title }} – official Mulungu Si Jemusi artwork" loading="lazy"></a>
 <div class="product-content"><div class="eyebrow">{{ p.code }}</div><h2>{{ p.title }}</h2>
 <p>{{ p.description or 'Original MSJ clothing artwork.' }}</p>
-<div class="price">MK {{ '{:,.0f}'.format(p.price_mwk) }} / item</div>
+<div class="price">From MK {{ '{:,.0f}'.format(p.price_mwk) }}</div>
 <p>Choose garment, size, colour and quantity on the order page.</p>
 <a class="button" href="{{ url_for('msj.order_design', design_id=p.id) }}">Select design</a></div></article>{% endfor %}</div>
 {% else %}<div class="notice"><h2>Collection being prepared</h2>
@@ -77,7 +90,8 @@ ORDER_TEMPLATE=BASE_START+"""
 <div class="order-layout">
 <div class="product"><img src="{{ url_for('msj.design_image',design_id=design.id) }}" alt="Original {{ design.title }} artwork"><div class="product-content">
 <p>{{ design.description }}</p><strong>MK {{ '{:,.0f}'.format(design.price_mwk) }} per item</strong>
-<p>Artwork preview is not necessarily a finished garment mock-up.</p></div></div>
+<p>Artwork preview is not necessarily a finished garment mock-up.</p>
+<p>Confirmed prices: T-shirts MK25,000 · Hoodies MK50,000 · Caps MK20,000.</p></div></div>
 <div class="pane">{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
 <h2>Place an order request</h2>
 <form method="post" action="{{ url_for('msj.order_design',design_id=design.id) }}">
@@ -87,10 +101,33 @@ ORDER_TEMPLATE=BASE_START+"""
 {% for v in garments %}<option value="{{ v }}">{{ v }}</option>{% endfor %}</select></div>
 <div><label for="size">Size *</label><select id="size" name="size" required>
 {% for v in sizes %}<option value="{{ v }}">{{ v }}</option>{% endfor %}</select></div></div>
+<script>
+(function () {
+  function syncSize() {
+    var garment = document.getElementById("garment");
+    var size = document.getElementById("size");
+    if (!garment || !size) return;
+    var cap = garment.value === "Cap";
+    for (var i = 0; i < size.options.length; i++) {
+      var option = size.options[i];
+      var allowed = cap ? option.value === "One Size" : option.value !== "One Size";
+      option.disabled = !allowed;
+      option.hidden = !allowed;
+    }
+    if (!size.options[size.selectedIndex] || size.options[size.selectedIndex].disabled) {
+      for (var j = 0; j < size.options.length; j++) {
+        if (!size.options[j].disabled) { size.selectedIndex = j; break; }
+      }
+    }
+  }
+  var garment = document.getElementById("garment");
+  if (garment) { garment.addEventListener("change", syncSize); syncSize(); }
+})();
+</script>
 <div class="two"><div><label for="colour">Colour *</label><select id="colour" name="colour" required>
 {% for v in colours %}<option value="{{ v }}">{{ v }}</option>{% endfor %}</select></div>
 <div><label for="quantity">Quantity *</label><input id="quantity" name="quantity" type="number" value="1" min="1" max="30" required></div></div>
-<p class="note">The listed amount is an estimate for the selected quantity. IBROWS confirms stock, garment options and final delivery costs before accepting payment.</p>
+<p class="note">T-shirt MK25,000 · Hoodie MK50,000 · Cap MK20,000. The order estimate uses the selected garment and quantity. Delivery cost and availability are confirmed separately before accepting payment.</p>
 <div class="two"><div><label for="buyer_name">Full name *</label><input id="buyer_name" name="buyer_name" maxlength="160" required></div>
 <div><label for="phone">Phone / WhatsApp *</label><input id="phone" name="phone" maxlength="50" inputmode="tel" required></div></div>
 <div class="two"><div><label for="email">Email (optional)</label><input id="email" type="email" name="email" maxlength="180"></div>
@@ -124,9 +161,9 @@ ADMIN_TEMPLATE=BASE_START+"""
 <label>Description</label><input name="description" maxlength="300" placeholder="Official cream artwork on deep green">
 <label>Original artwork image (PNG, JPEG or WebP) *</label><input type="file" name="image" accept="image/png,image/jpeg,image/webp" required>
 <p class="note">Upload only your authentic artwork or approved product photograph. Maximum 5 MB. We resize for the web without redesigning the artwork.</p>
-<div class="two"><div><label>Price per item in MWK *</label><input name="price_mwk" type="number" min="1" max="10000000" required>
-</div><div><label>Available garment types (comma-separated) *</label><input name="garments" placeholder="T-shirt, Hoodie" required></div></div>
-<div class="two"><div><label>Sizes (comma-separated) *</label><input name="sizes" placeholder="S, M, L, XL, 2XL" required></div>
+<p class="note">Confirmed MSJ prices: T-shirt MK25,000 · Hoodie MK50,000 · Cap MK20,000. Pricing is calculated automatically for each order.</p>
+<label>Available garment types (comma-separated) *</label><input name="garments" placeholder="T-shirt, Hoodie, Cap" required>
+<div class="two"><div><label>Sizes (comma-separated) *</label><input name="sizes" value="S,M,L,XL,XXL,One Size" required></div>
 <div><label>Available colours (comma-separated) *</label><input name="colours" placeholder="Black, White" required></div></div>
 <button class="button" type="submit">Save unpublished design</button></form></div>
 <h2 style="margin-top:38px">Catalogue</h2>
@@ -135,9 +172,8 @@ ADMIN_TEMPLATE=BASE_START+"""
 <td>MK {{ '{:,.0f}'.format(p.price_mwk) }}</td><td>{{ 'Published' if p.published else 'Draft' }}</td>
 <td><form method="post" action="{{ url_for('msj.admin_toggle',design_id=p.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <button class="button secondary" type="submit">{{ 'Unpublish' if p.published else 'Publish' }}</button></form>
-<details style="margin-top:10px"><summary>Edit options / price</summary><form method="post" action="{{ url_for('msj.admin_update',design_id=p.id) }}" enctype="multipart/form-data">
+<details style="margin-top:10px"><summary>Edit sizes, colours or artwork</summary><form method="post" action="{{ url_for('msj.admin_update',design_id=p.id) }}" enctype="multipart/form-data">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<label>Price MWK</label><input type="number" name="price_mwk" value="{{ p.price_mwk }}" min="1" required>
 <label>Description</label><input name="description" maxlength="300" value="{{ p.description }}">
 <label>Garments</label><input name="garments" value="{{ p.garments }}" required>
 <label>Sizes</label><input name="sizes" value="{{ p.sizes }}" required>
@@ -285,7 +321,8 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         p=product_by_id(design_id)
         if not p:abort(404)
         garment_choices=csv_choices(p["garments"])
-        size_choices=csv_choices(p["sizes"])
+        size_choices=[s for s in MSJ_APPAREL_SIZES if s in csv_choices(p["sizes"])]
+        if "Cap" in garment_choices: size_choices.append(MSJ_CAP_SIZE)
         colour_choices=csv_choices(p["colours"])
         if request.method=="GET":
             return render(ORDER_TEMPLATE,title=p["title"],design=p,garments=garment_choices,
@@ -297,8 +334,11 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
             garment=request.form.get("garment","")[:50]
             size=request.form.get("size","")[:24]
             colour=request.form.get("colour","")[:50]
-            if garment not in garment_choices or size not in size_choices or colour not in colour_choices:
-                raise ValueError("Select a valid garment, colour and size.")
+            if garment not in garment_choices or garment not in MSJ_GARMENT_PRICES:
+                raise ValueError("Select a valid garment.")
+            valid_sizes = (MSJ_CAP_SIZE,) if garment == "Cap" else MSJ_APPAREL_SIZES
+            if size not in size_choices or size not in valid_sizes or colour not in colour_choices:
+                raise ValueError("Select an available garment size and colour.")
             quantity=int(request.form.get("quantity","0"))
             if not 1<=quantity<=30:raise ValueError("Order quantity must be between 1 and 30.")
             buyer_name=str(request.form.get("buyer_name","")).strip()[:160]
@@ -321,10 +361,10 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                         raise ValueError("You've sent several requests recently. Please contact IBROWS to follow up.")
                     cur.execute("""INSERT INTO msj_merch_orders(token,design_id,buyer_name,phone,email,location,
                          garment,size,colour,quantity,notes,estimated_total)
-                         SELECT %s,id,%s,%s,%s,%s,%s,%s,%s,%s,%s,price_mwk*%s
+                         SELECT %s,id,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
                          FROM msj_merch_designs WHERE id=%s AND published=TRUE
                          RETURNING id""", (str(token),buyer_name,phone,email or None,location,
-                                garment,size,colour,quantity,notes,quantity,design_id))
+                                garment,size,colour,quantity,notes,MSJ_GARMENT_PRICES[garment]*quantity,design_id))
                     inserted=cur.fetchone()
                     if not inserted:raise ValueError("That design is currently unavailable.")
                     oid=inserted[0]
@@ -401,13 +441,15 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
             title=str(request.form.get("title","")).strip()[:120]
             code=str(request.form.get("code","")).strip().upper()[:30]
             desc=str(request.form.get("description","")).strip()[:300]
-            price=int(request.form.get("price_mwk","0"))
             garments=",".join(csv_choices(request.form.get("garments","")))
             sizes=",".join(csv_choices(request.form.get("sizes","")))
             colours=",".join(csv_choices(request.form.get("colours","")))
-            if not title or not re.fullmatch(r"[A-Z0-9_-]{3,30}",code) or not 1<=price<=10_000_000:
-                raise ValueError("Enter a design title, unique code and positive price.")
-            if not garments or not sizes or not colours:raise ValueError("Set the available garment types, sizes and colours.")
+            if not title or not re.fullmatch(r"[A-Z0-9_-]{3,30}",code):
+                raise ValueError("Enter a design title and unique code.")
+            price=msj_product_options(garments)
+            allowed_sizes=set(MSJ_APPAREL_SIZES)|{MSJ_CAP_SIZE}
+            if not sizes or not colours or any(x not in allowed_sizes for x in csv_choices(sizes)):
+                raise ValueError("Set confirmed sizes (S, M, L, XL, XXL or One Size) and colours.")
             image_bytes,mime=image_sanitize(request.files.get("image"))
             connect_setup()
             with get_db() as conn:
@@ -442,13 +484,14 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         p=product_by_id(design_id,public=False)
         if not p:abort(404)
         try:
-            price=int(request.form.get("price_mwk","0"))
             description=str(request.form.get("description","")).strip()[:300]
             garments=",".join(csv_choices(request.form.get("garments","")))
             sizes=",".join(csv_choices(request.form.get("sizes","")))
             colours=",".join(csv_choices(request.form.get("colours","")))
-            if not 1<=price<=10_000_000 or not all((garments,sizes,colours)):
-                raise ValueError("Set a valid price and all available garment options.")
+            price=msj_product_options(garments)
+            allowed_sizes=set(MSJ_APPAREL_SIZES)|{MSJ_CAP_SIZE}
+            if not sizes or not colours or any(x not in allowed_sizes for x in csv_choices(sizes)):
+                raise ValueError("Set confirmed sizes (S, M, L, XL, XXL or One Size) and colours.")
             upload=request.files.get("image")
             new_artwork=image_sanitize(upload) if upload and upload.filename else None
             with get_db() as conn:
