@@ -9,7 +9,7 @@ shop_segment="""{% if service_key=='DESIGN_BRANDING' %}
 <section class="msj-merch" aria-labelledby="msj-title" style="background:#f8f3e9;padding:55px 0;border-top:1px solid #eadfd0;border-bottom:1px solid #eadfd0">
 <div class="wrap" style="display:grid;grid-template-columns:1fr;gap:15px">
 <span class="eyebrow">IBROWS Enterprise · Clothing label</span>
-<h2 id="msj-title" style="font-family:Georgia,serif;font-size:clamp(30px,5vw,48px);line-height:1.1;color:#193b2c">Mulungu Si Jemusi <span style="color:#6c2436">(MSJ)</span></h2>
+<h2 id="msj-title" style="font-size:clamp(30px,5vw,48px);line-height:1.1;color:#193b2c">Mulungu Si Jemusi <span style="color:#6c2436">(MSJ)</span></h2>
 <p style="max-width:720px;color:#4a5c53;font-size:1.05rem">Wear the message. Explore our genuine MSJ clothing-artwork collection, choose a design and request the garment, colour, size and quantity you want.</p>
 <p style="margin:0;display:flex;gap:12px;flex-wrap:wrap"><a class="btn primary" href="/msj">Explore MSJ Collection &amp; Order</a>
 {% if session.get('admin_authenticated') %}<a class="btn" href="/admin/msj">Manage MSJ Merch</a>{% endif %}</p>
