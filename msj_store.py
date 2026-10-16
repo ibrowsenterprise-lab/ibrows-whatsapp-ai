@@ -33,13 +33,13 @@ h2{font-family:Georgia,serif;font-size:1.85rem;font-weight:500;margin:0 0 10px}.
 .price{font-weight:800}.button{display:inline-flex;align-items:center;justify-content:center;min-height:45px;border-radius:3px;padding:0 19px;
 background:var(--ink);border:1px solid var(--ink);font-weight:800;color:white;text-decoration:none;cursor:pointer;font-size:.95rem}
 .button.secondary{color:var(--ink);background:transparent}.notice{border:1px solid var(--line);background:white;padding:20px}
-.pane{background:white;padding:25px;border:1px solid var(--line);border-radius:5px;max-width:800px}
+.pane{background:white;padding:25px;border:1px solid var(--line);border-radius:5px;max-width:800px}.order-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr);align-items:start;gap:20px}
 label{display:block;margin:15px 0 5px;font-weight:750;font-size:.88rem}input,select,textarea{padding:11px 12px;min-height:42px;width:100%;border:1px solid #b9c5bc;border-radius:3px;font:inherit;background:white;color:#1a2921}
 input[type=checkbox]{min-height:0;width:auto}textarea{min-height:100px;resize:vertical}.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
 .note{color:var(--muted);font-size:.87rem}.error{background:#fff2ef;border:1px solid #bc5b43;padding:12px;color:#752818}
 .table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:.88rem}td,th{text-align:left;border-bottom:1px solid var(--line);padding:12px 8px;vertical-align:top}
 select.small{min-width:140px}footer{border-top:1px solid var(--line);padding:20px 0;color:var(--muted);font-size:.85rem}
-@media(max-width:640px){.two{grid-template-columns:1fr}.hero{padding:38px 0}.pane{padding:18px}}
+@media(max-width:640px){.two,.order-layout{grid-template-columns:1fr}.hero{padding:38px 0}.pane{padding:18px}}
 """
 BASE_START = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -74,7 +74,7 @@ ORDER_TEMPLATE=BASE_START+"""
 <section class="hero"><div class="wrap"><div class="eyebrow">Request MSJ Merchandise</div><h1>{{ design.title }}</h1>
 <p class="lede">Your artwork choice is reserved for this request only after IBROWS confirms availability. You will not be charged now.</p></div></section>
 <main class="section"><div class="wrap">
-<div class="two" style="grid-template-columns:minmax(0,1fr) minmax(0,1.35fr);align-items:start">
+<div class="order-layout">
 <div class="product"><img src="{{ url_for('msj.design_image',design_id=design.id) }}" alt="Original {{ design.title }} artwork"><div class="product-content">
 <p>{{ design.description }}</p><strong>MK {{ '{:,.0f}'.format(design.price_mwk) }} per item</strong>
 <p>Artwork preview is not necessarily a finished garment mock-up.</p></div></div>
@@ -134,7 +134,17 @@ ADMIN_TEMPLATE=BASE_START+"""
 {% for p in products %}<tr><td><img src="{{ url_for('msj.design_image',design_id=p.id) }}" width="110" alt=""><div><strong>{{ p.title }}</strong><br>{{ p.code }}</div></td>
 <td>MK {{ '{:,.0f}'.format(p.price_mwk) }}</td><td>{{ 'Published' if p.published else 'Draft' }}</td>
 <td><form method="post" action="{{ url_for('msj.admin_toggle',design_id=p.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<button class="button secondary" type="submit">{{ 'Unpublish' if p.published else 'Publish' }}</button></form></td></tr>{% endfor %}
+<button class="button secondary" type="submit">{{ 'Unpublish' if p.published else 'Publish' }}</button></form>
+<details style="margin-top:10px"><summary>Edit options / price</summary><form method="post" action="{{ url_for('msj.admin_update',design_id=p.id) }}" enctype="multipart/form-data">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label>Price MWK</label><input type="number" name="price_mwk" value="{{ p.price_mwk }}" min="1" required>
+<label>Description</label><input name="description" maxlength="300" value="{{ p.description }}">
+<label>Garments</label><input name="garments" value="{{ p.garments }}" required>
+<label>Sizes</label><input name="sizes" value="{{ p.sizes }}" required>
+<label>Colours</label><input name="colours" value="{{ p.colours }}" required>
+<label>Replace artwork (optional)</label><input type="file" name="image" accept="image/png,image/jpeg,image/webp">
+<button class="button secondary" type="submit" style="margin-top:8px">Save changes</button></form></details>
+</td></tr>{% endfor %}
 </tbody></table></div>{% else %}<p>No designs yet. Add the real MSJ Classic and Varsity artwork above.</p>{% endif %}
 <h2 style="margin-top:38px">Customer orders</h2>
 {% if orders %}<div class="table-wrap"><table><thead><tr><th>Reference</th><th>Customer</th><th>Selection</th><th>Estimated</th><th>Status</th></tr></thead><tbody>
@@ -424,6 +434,41 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
             conn.commit()
         if not row:abort(404)
         return redirect(url_for("msj.admin_index",message="Design publication updated."))
+
+    @bp.route("/admin/msj/designs/<int:design_id>/update",methods=["POST"])
+    @admin_required
+    def admin_update(design_id):
+        validate_admin_csrf()
+        p=product_by_id(design_id,public=False)
+        if not p:abort(404)
+        try:
+            price=int(request.form.get("price_mwk","0"))
+            description=str(request.form.get("description","")).strip()[:300]
+            garments=",".join(csv_choices(request.form.get("garments","")))
+            sizes=",".join(csv_choices(request.form.get("sizes","")))
+            colours=",".join(csv_choices(request.form.get("colours","")))
+            if not 1<=price<=10_000_000 or not all((garments,sizes,colours)):
+                raise ValueError("Set a valid price and all available garment options.")
+            upload=request.files.get("image")
+            new_artwork=image_sanitize(upload) if upload and upload.filename else None
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    if new_artwork:
+                        cur.execute("""UPDATE msj_merch_designs
+                            SET price_mwk=%s,description=%s,garments=%s,sizes=%s,colours=%s,
+                            image_bytes=%s,image_mime=%s,published=FALSE WHERE id=%s""",
+                            (price,description,garments,sizes,colours,
+                             new_artwork[0],new_artwork[1],design_id))
+                    else:
+                        cur.execute("""UPDATE msj_merch_designs
+                            SET price_mwk=%s,description=%s,garments=%s,sizes=%s,colours=%s
+                            WHERE id=%s""",
+                            (price,description,garments,sizes,colours,design_id))
+                conn.commit()
+            msg="Design updated. Replaced artwork is unpublished until you reapprove it." if new_artwork else "Price and options updated."
+        except (ValueError,TypeError) as exc:
+            msg=str(exc)
+        return redirect(url_for("msj.admin_index",message=msg))
 
     @bp.route("/admin/msj/orders/<int:order_id>/status",methods=["POST"])
     @admin_required
