@@ -128,7 +128,7 @@ ORDER_TEMPLATE=BASE_START+"""
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <input type="text" name="fax_number" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px" aria-hidden="true">
 <div class="two"><div><label for="garment">Clothing type *</label><select id="garment" name="garment" required>
-{% for v in garments %}<option value="{{ v }}">{{ v }}</option>{% endfor %}</select></div>
+{% for v in garments %}<option value="{{ v }}" {% if old.get('garment')==v %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
 <div><label for="size">Size *</label><select id="size" name="size" required>
 {% for v in sizes %}<option value="{{ v }}" {% if old.get('size')==v %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div></div>
 <script>
