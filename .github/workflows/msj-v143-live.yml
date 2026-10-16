@@ -1,0 +1,35 @@
+name: MSJ V143 live order-page read-only smoke
+on:
+  push:
+    branches: [audit/msj-v143-live-order]
+    paths: [".github/workflows/msj-v143-live.yml"]
+permissions: {contents: read}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check official page and product listing without creating orders
+        run: |
+          set -euo pipefail
+          curl --retry 3 --retry-delay 5 --connect-timeout 15 --max-time 80 --silent --show-error --fail --location https://www.ibrowsenterprise.com/msj/design/1 -o /tmp/msj-order.html
+          python - <<'PY'
+          from pathlib import Path
+          html=Path('/tmp/msj-order.html').read_text()
+          required=[
+            'MSJ Classic','order-hero','order-product','Your order',
+            'id="order-subtotal"','Estimated subtotal','MK 25,000',
+            'T-shirt','id="quantity"','id="size"','id="colour"',
+            'V143_SUBTOTAL_READY','IBROWS checks size and colour',
+            'name="csrf_token"','name="consent"'
+          ]
+          for item in required:
+            assert item in html,('Missing page element:',item)
+          assert 'From MK 25,000 per item, depending on garment' not in html
+          assert html.index('Your order')<html.index('Phone / WhatsApp')
+          assert 'Hoodie</option>' not in html
+          assert 'Cap</option>' not in html
+          print('PASS production customer MSJ page: mobile UI, price, quantity calculator, fields and safeguards')
+          PY
+          curl --retry 3 --retry-delay 5 --connect-timeout 15 --max-time 80 --silent --show-error --fail --location https://www.ibrowsenterprise.com/msj -o /tmp/msj-list.html
+          grep -q "MSJ Classic" /tmp/msj-list.html
+          echo 'PASS: live catalogue still accessible'
