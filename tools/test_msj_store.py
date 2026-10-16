@@ -36,4 +36,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import msj_store as module
 for name in ("CATALOG_TEMPLATE","ORDER_TEMPLATE","COMPLETE_TEMPLATE","ADMIN_TEMPLATE"):
  Environment(autoescape=True).parse(getattr(module,name))
+assert module.MSJ_GARMENT_PRICES == {"T-shirt":25000, "Hoodie":50000, "Cap":20000}
+assert module.MSJ_APPAREL_SIZES == ("S", "M", "L", "XL", "XXL")
+assert module.MSJ_CAP_SIZE == "One Size"
+assert module.msj_product_options("T-shirt,Hoodie") == 25000
+assert module.msj_product_options("Hoodie") == 50000
+assert module.msj_product_options("Cap,Hoodie") == 20000
+try:
+ module.msj_product_options("Tote bag")
+except ValueError:
+ pass
+else:
+ raise AssertionError("Tote bag should not be sold before a confirmed price")
+assert "MSJ_GARMENT_PRICES[garment]*quantity" in src
+assert "price_mwk*%s" not in src
+assert 'garment == "Cap"' in src and "MSJ_APPAREL_SIZES" in src
+assert "2XL" not in src
+print("PASS MSJ: confirmed garment pricing (MK25k/MK50k/MK20k), shirts and hoodies S–XXL, one-size caps, no unpriced tote bags")
 print("PASS MSJ: nine isolated routes, admin login and CSRF guards, no checkout, original-artwork upload and valid templates")
