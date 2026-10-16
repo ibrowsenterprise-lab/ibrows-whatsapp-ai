@@ -114,7 +114,7 @@ ORDER_TEMPLATE=BASE_START+"""
 <main class="section order-section"><div class="wrap">
 <div class="order-layout">
 <div class="product order-product"><img src="{{ url_for('msj.design_image',design_id=design.id, v=design.image_revision[:12]) }}" alt="Original {{ design.title }} artwork"><div class="product-content">
-<p>{{ design.description }}</p><strong>From MK {{ '{:,.0f}'.format(design.price_mwk) }} per item, depending on garment</strong>
+<p><strong>{{ design.title }}</strong></p><strong class="price">{% if garments|length == 1 %}MK {{ '{:,.0f}'.format(garment_prices[garments[0]]) }}{% else %}From MK {{ '{:,.0f}'.format(design.price_mwk) }}{% endif %}</strong>
 <p>{{ garments|join(' / ') }} · Choose any colour.</p><a href="/msj" style="font-size:.82rem;font-weight:750">Change design</a></div></div>
 <div class="pane order-pane">{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
 <h2>Your order</h2>
