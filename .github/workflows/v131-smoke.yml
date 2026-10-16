@@ -60,3 +60,4 @@ jobs:
           python -m py_compile msj_store.py
           python tools/test_msj_store.py
           python tools/test_msj_image_import.py
+          python tools/test_msj_bulk_publish.py
