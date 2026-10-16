@@ -30,6 +30,8 @@ assert "IBROWS" in src
 assert "register_msj_store(app, get_db" in app
 assert 'href="/msj"' in app
 assert 'Mulungu Si Jemusi' in app
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import msj_store as module
 for name in ("CATALOG_TEMPLATE","ORDER_TEMPLATE","COMPLETE_TEMPLATE","ADMIN_TEMPLATE"):
  Environment(autoescape=True).parse(getattr(module,name))
