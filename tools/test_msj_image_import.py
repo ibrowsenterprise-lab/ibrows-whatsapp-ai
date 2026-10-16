@@ -2,6 +2,9 @@
 import io
 from flask import Flask
 from PIL import Image
+import sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
 import msj_store
 
 rows = {}
