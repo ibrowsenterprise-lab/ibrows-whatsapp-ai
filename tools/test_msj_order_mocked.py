@@ -101,5 +101,17 @@ assert len(order_rows)==2
 assert order_rows[2]["total"]==60000
 assert client.get(r.location).status_code==200
 assert len(state["mail"])==2
+# After a validation error, retain the customer's chosen garment and size.
+# Otherwise a hoodie order can silently turn into a T-shirt on resubmission.
+product.update(garments="T-shirt,Hoodie,Cap", sizes="S,M,L,XL,XXL,One Size", price_mwk=20000)
+r=submit(garment="Hoodie", size="M", phone="bad", quantity="2")
+assert r.status_code == 400, r.status_code
+html=r.data.decode("utf-8")
+assert '<option value="Hoodie" selected>' in html, "Customer garment selection was lost"
+assert '<option value="M" selected>' in html, "Customer size selection was lost"
+assert 'name="quantity" type="number" value="2"' in html, "Customer quantity was lost"
+assert len(order_rows)==2, "Invalid retry must not create an order"
+print("PASS: invalid mixed-garment request keeps Hoodie, M and quantity for safe correction")
+
 print("PASS end-to-end mocked MSJ request: size/colour/price/consent validation, order saved, admin alert, receipt")
 print("PASS post-commit notification failure does not cause duplicate-order encouragement")
