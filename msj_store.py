@@ -89,7 +89,7 @@ ORDER_TEMPLATE=BASE_START+"""
 <main class="section"><div class="wrap">
 <div class="order-layout">
 <div class="product"><img src="{{ url_for('msj.design_image',design_id=design.id) }}" alt="Original {{ design.title }} artwork"><div class="product-content">
-<p>{{ design.description }}</p><strong>MK {{ '{:,.0f}'.format(design.price_mwk) }} per item</strong>
+<p>{{ design.description }}</p><strong>From MK {{ '{:,.0f}'.format(design.price_mwk) }} per item, depending on garment</strong>
 <p>Artwork preview is not necessarily a finished garment mock-up.</p>
 <p>Confirmed prices: T-shirts MK25,000 · Hoodies MK50,000 · Caps MK20,000.</p></div></div>
 <div class="pane">{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
