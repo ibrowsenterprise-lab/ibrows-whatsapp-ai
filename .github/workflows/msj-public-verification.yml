@@ -1,0 +1,28 @@
+name: MSJ public-site release verification
+on:
+  push:
+    branches: [feature/msj-merchandise-shop-v140]
+    paths:
+      - .github/workflows/msj-public-verification.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify official MSJ and parent branding pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in "https://www.ibrowsenterprise.com/msj" "https://ibrows-whatsapp-ai-1.onrender.com/msj"; do
+            echo "Checking $target"
+            curl --retry 3 --retry-delay 5 --connect-timeout 15 --max-time 60 --location --fail --silent --show-error "$target" -o /tmp/msj-live.html
+            grep -q 'Mulungu Si Jemusi' /tmp/msj-live.html
+            grep -q 'MSJ Clothing Collection' /tmp/msj-live.html
+            echo "PASS: Live MSJ catalogue accessible"
+          done
+          curl --retry 3 --retry-delay 5 --connect-timeout 15 --max-time 60 --location --fail --silent --show-error "https://www.ibrowsenterprise.com/design-branding" -o /tmp/branding-live.html
+          grep -q 'href="/msj"' /tmp/branding-live.html
+          echo "PASS: Branding page shows MSJ shop link"
+          # Do not place paid transactions or simulated customer orders on production.
