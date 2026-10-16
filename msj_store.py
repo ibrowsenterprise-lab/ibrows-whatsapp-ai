@@ -255,8 +255,9 @@ ADMIN_TEMPLATE=BASE_START+"""
 </form></section>
 <h2 style="margin-top:38px">Catalogue</h2>
 <div class="bulk-panel" aria-label="MSJ catalogue publication controls">
-<h3>Publish all designs</h3>
+<h3>Catalogue review &amp; publishing</h3>
 <p><strong>{{ published_count }} published</strong> · <strong>{{ draft_count }} drafts</strong> · {{ products|length }} total.</p>
+{% if draft_count > 0 %}<p>New drafts appear first in the catalogue below. Review each image, garment type, sizes and price before publishing. You can publish each design individually or publish all after reviewing.</p>{% endif %}
 {% if draft_count > 0 %}
 <form method="post" action="{{ url_for('msj.admin_bulk_publish') }}"
 onsubmit="return window.confirm('Publish all {{ draft_count }} MSJ drafts? Only do this after reviewing the artwork, design names, sizes and prices. Published items immediately become visible and orderable by visitors.');">
@@ -271,7 +272,7 @@ onsubmit="return window.confirm('Publish all {{ draft_count }} MSJ drafts? Only 
 </div>
 {% if products %}<div class="table-wrap"><table class="catalog-table"><thead><tr><th>Design</th><th>Price</th><th>Status</th><th>Update</th></tr></thead><tbody>
 {% for p in products %}<tr><td data-label="Design"><img src="{{ url_for('msj.design_image',design_id=p.id, v=p.image_revision[:12]) }}" width="110" alt=""><div><strong>{{ p.title }}</strong><br>{{ p.code }}</div></td>
-<td data-label="Price">MK {{ '{:,.0f}'.format(p.price_mwk) }}</td><td data-label="Status">{{ 'Published' if p.published else 'Draft' }}</td>
+<td data-label="Price">MK {{ '{:,.0f}'.format(p.price_mwk) }}</td><td data-label="Status"><strong>{{ 'Published' if p.published else 'Draft — needs approval' }}</strong></td>
 <td data-label="Update"><form method="post" action="{{ url_for('msj.admin_toggle',design_id=p.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <button class="button secondary" type="submit">{{ 'Unpublish' if p.published else 'Publish' }}</button></form>
 <details style="margin-top:10px"><summary>Edit sizes, colours or artwork</summary><form method="post" action="{{ url_for('msj.admin_update',design_id=p.id) }}" enctype="multipart/form-data">
@@ -570,6 +571,8 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                 keys=[x.name for x in cur.description]
                 orders=[dict(zip(keys,r)) for r in cur.fetchall()]
         products=product_rows(False)
+        # Review unapproved uploads first, especially on narrow mobile screens.
+        products.sort(key=lambda p:(bool(p["published"]),-int(p["id"])))
         published_count=sum(1 for p in products if p["published"])
         return render(ADMIN_TEMPLATE,title="MSJ Admin",products=products,
                       published_count=published_count,draft_count=len(products)-published_count,

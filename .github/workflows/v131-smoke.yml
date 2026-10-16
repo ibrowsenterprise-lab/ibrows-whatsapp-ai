@@ -67,3 +67,4 @@ jobs:
           python tools/test_msj_merch_zip.py
           python tools/test_msj_garments.py
           python tools/test_msj_order_mocked.py
+          python tools/test_msj_review_admin.py
