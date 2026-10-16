@@ -64,3 +64,6 @@ jobs:
           python tools/test_msj_catalogue_repair.py
           python tools/test_msj_mobile_order.py
           node tools/test_msj_subtotal.js
+          python tools/test_msj_merch_zip.py
+          python tools/test_msj_garments.py
+          python tools/test_msj_order_mocked.py

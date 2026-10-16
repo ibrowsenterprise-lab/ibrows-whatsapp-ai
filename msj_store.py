@@ -58,6 +58,7 @@ select.small{min-width:140px}
 .bulk-panel p{margin:0 0 12px;color:var(--muted)}
 .bulk-panel form{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 .bulk-panel button:disabled{opacity:.55;cursor:not-allowed}
+.shop-filters{display:flex;flex-wrap:wrap;gap:9px;margin:0 0 22px}.shop-filter{border:1px solid #c7d6ca;border-radius:30px;padding:7px 17px;text-decoration:none;font-weight:700;font-size:.87rem;background:#fff}.shop-filter[aria-current="page"]{background:var(--ink);color:#fff;border-color:var(--ink)}.shop-empty{border:1px solid var(--line);padding:24px;background:#fff}.shop-product-type{font-size:.83rem;color:var(--muted);font-weight:730;margin:4px 0}.admin-merch-import{margin-top:22px;border:1px solid #cddacc;background:#f7faf4;border-radius:6px;padding:20px}.admin-merch-import input{max-width:520px}
 footer{border-top:1px solid var(--line);padding:20px 0;color:var(--muted);font-size:.85rem}
 @media(max-width:640px){
 .two,.order-layout{grid-template-columns:1fr}.hero{padding:38px 0}.pane{padding:18px}
@@ -95,17 +96,22 @@ CATALOG_TEMPLATE=BASE_START+"""
 <h1>Mulungu Si Jemusi.</h1><p class="lede">Wear the message. Explore original MSJ artwork and request the clothing design you want.
 Every order is reviewed by our team before payment, printing or delivery is arranged. Request any colour you like; IBROWS will notify you if your preferred colour is unavailable.</p></div></section>
 <main class="section"><div class="wrap">
+<nav class="shop-filters" aria-label="Shop by merchandise type">
+<a class="shop-filter" href="{{ url_for('msj.catalog') }}" {% if not garment_filter %}aria-current="page"{% endif %}>All designs</a>
+{% for category in ['T-shirt','Hoodie','Cap'] %}
+<a class="shop-filter" href="{{ url_for('msj.catalog', garment=category) }}" {% if garment_filter==category %}aria-current="page"{% endif %}>{{ {'T-shirt':'T-shirts','Hoodie':'Hoodies','Cap':'Caps'}[category] }}</a>
+{% endfor %}
+</nav>
 {% if products %}<div class="grid">{% for p in products %}
 <article class="product"><a href="{{ url_for('msj.order_design', design_id=p.id) }}" aria-label="Choose {{ p.title }}">
 <img src="{{ url_for('msj.design_image', design_id=p.id, v=p.image_revision[:12]) }}" alt="{{ p.title }} – official Mulungu Si Jemusi artwork" loading="lazy"></a>
 <div class="product-content"><div class="eyebrow">{{ p.code }}</div><h2>{{ p.title }}</h2>
 <p>{{ p.description or 'Original MSJ clothing artwork.' }}</p>
-<div class="price">From MK {{ '{:,.0f}'.format(p.price_mwk) }}</div>
+<div class="price">{% if ',' not in p.garments %}MK {{ '{:,.0f}'.format(p.price_mwk) }}{% else %}From MK {{ '{:,.0f}'.format(p.price_mwk) }}{% endif %}</div>
 <p>Available: {{ p.garments }}. Choose size, preferred colour and quantity when ordering.</p>
 <a class="button" href="{{ url_for('msj.order_design', design_id=p.id) }}">Select design</a></div></article>{% endfor %}</div>
 {% else %}<div class="notice"><h2>Collection being prepared</h2>
-<p>The original MSJ artwork is being prepared for ordering. Prices and garment availability will appear here once confirmed.
-No payments or orders are being taken yet.</p></div>{% endif %}
+<p>{% if garment_filter %}We're preparing more MSJ {{ {'T-shirt':'T-shirts','Hoodie':'hoodies','Cap':'caps'}[garment_filter] }} for the collection. Check back after new designs are approved.{% else %}New MSJ designs are being prepared. Only approved products are available to request.{% endif %}</p></div>{% endif %}
 </div></main>""" + BASE_END
 
 ORDER_TEMPLATE=BASE_START+"""
@@ -237,6 +243,16 @@ ADMIN_TEMPLATE=BASE_START+"""
 <input type="file" name="four_b" accept="image/png,image/jpeg,image/webp">
 <p class="note">Use the originals, not cropped screenshots. At least one sheet is required. Already imported designs are skipped safely.</p>
 <button class="button" type="submit">Import MSJ original designs as drafts</button></form></div>
+<section class="admin-merch-import" aria-labelledby="merch-import-title">
+<h2 id="merch-import-title">Import MSJ hoodies &amp; caps</h2>
+<p>Upload your <strong>MSJ Original Merchandise Images ZIP</strong> to add the existing wordmark hoodie, block hoodie, wordmark cap, block cap and block T-shirt as <strong>unpublished drafts</strong>. Original artwork is retained; no duplicate products are created.</p>
+<form method="post" action="{{ url_for('msj.admin_import_merch_zip') }}" enctype="multipart/form-data">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label for="msj-merch-zip">Original merchandise images (.zip, max 8 MB)</label>
+<input id="msj-merch-zip" type="file" name="merch_zip" accept=".zip,application/zip" required>
+<p class="note">Review each photo and its matching price and size before publishing. The lifestyle hoodie image includes other merchandise in the scene.</p>
+<button class="button" type="submit">Import hoodie &amp; cap drafts</button>
+</form></section>
 <h2 style="margin-top:38px">Catalogue</h2>
 <div class="bulk-panel" aria-label="MSJ catalogue publication controls">
 <h3>Publish all designs</h3>
@@ -414,7 +430,11 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
 
     @bp.route("/msj",methods=["GET"])
     def catalog():
-        return render(CATALOG_TEMPLATE,title="MSJ Clothing Collection",products=product_rows())
+        garment_filter=(request.args.get("garment") or "").strip()
+        if garment_filter not in ("T-shirt","Hoodie","Cap"): garment_filter=""
+        all_products=product_rows()
+        products=[p for p in all_products if garment_filter in csv_choices(p["garments"])] if garment_filter else all_products
+        return render(CATALOG_TEMPLATE,title="MSJ Clothing Collection",products=products,garment_filter=garment_filter)
 
     @bp.route("/msj/design/<int:design_id>/image",methods=["GET"])
     def design_image(design_id):
@@ -486,7 +506,12 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                     ref=f"MSJ-{datetime.utcnow().year}-{oid:05d}"
                     cur.execute("UPDATE msj_merch_orders SET reference=%s WHERE id=%s",(ref,oid))
                 conn.commit()
-            send_notification(oid,ref,p,garment,size,colour,quantity,buyer_name,phone,location)
+            try:
+                send_notification(oid,ref,p,garment,size,colour,quantity,buyer_name,phone,location)
+            except Exception:
+                # Order was already committed. Do not tell the customer it failed or
+                # invite a duplicate submission just because an alert failed.
+                app.logger.exception("MSJ order %s saved but staff notification failed",ref)
             return redirect(url_for("msj.complete",token=token),code=303)
         except (ValueError,TypeError):
             return render(ORDER_TEMPLATE,title=p["title"],design=p,garments=garment_choices,
@@ -550,6 +575,72 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                       published_count=published_count,draft_count=len(products)-published_count,
                       orders=orders,csrf_token=admin_csrf(),
                       message=request.args.get("message","")[:180])
+
+    @bp.route("/admin/msj/designs/import-merch-zip",methods=["POST"])
+    @admin_required
+    def admin_import_merch_zip():
+        """Use only the user's known uploaded original mockup filenames; never unpack ZIP paths."""
+        from zipfile import ZipFile, BadZipFile
+        from types import SimpleNamespace
+        validate_admin_csrf()
+        specs={
+            "MSJ_Wordmark_Hoodie_Lifestyle.jpg":
+                ("MSJ-WORDMARK-HOODIE","MSJ Wordmark Hoodie","Hoodie","Forest green",
+                 "Original MSJ wordmark green hoodie shown in a collection lifestyle mockup. Other accessories in photo are not included."),
+            "MSJ_Block_Hoodie.jpg":
+                ("MSJ-BLOCK-HOODIE","MSJ Block Hoodie","Hoodie","Black",
+                 "Original black hoodie mockup with the bold MSJ block logo."),
+            "MSJ_Wordmark_Cap.jpg":
+                ("MSJ-WORDMARK-CAP","MSJ Wordmark Cap","Cap","Black",
+                 "Original black cap with white MSJ wordmark patch, cropped from the original collection mockup."),
+            "MSJ_Block_Cap.jpg":
+                ("MSJ-BLOCK-CAP","MSJ Block Cap","Cap","Black",
+                 "Original black cap mockup with embroidered MSJ block logo."),
+            "MSJ_Block_Tshirt.jpg":
+                ("MSJ-BLOCK-TSHIRT","MSJ Block T-shirt","T-shirt","Black",
+                 "Original black T-shirt mockup with the bold MSJ block logo.")
+        }
+        try:
+            uploaded=request.files.get("merch_zip")
+            if not uploaded or not uploaded.filename or not uploaded.filename.lower().endswith(".zip"):
+                raise ValueError("Select your original MSJ merchandise ZIP file.")
+            raw=uploaded.stream.read(8*1024*1024+1)
+            if len(raw)>8*1024*1024:
+                raise ValueError("The ZIP file must not exceed 8 MB.")
+            chosen=[]
+            with ZipFile(io.BytesIO(raw)) as archive:
+                infos=archive.infolist()
+                if len(infos)>30:raise ValueError("The ZIP has too many files.")
+                for info in infos:
+                    if info.filename not in specs:continue
+                    if info.file_size>5*1024*1024 or info.file_size<1000:
+                        raise ValueError("A merchandise photo has an invalid size.")
+                    asset=archive.read(info)
+                    if len(asset)>5*1024*1024:
+                        raise ValueError("A merchandise photo exceeds the 5 MB limit.")
+                    image,mime=image_sanitize(SimpleNamespace(filename=info.filename,stream=io.BytesIO(asset)))
+                    chosen.append((specs[info.filename],image,mime))
+            if not chosen:raise ValueError("No recognized original MSJ merchandise images found in ZIP.")
+            inserted=skipped=0
+            connect_setup()
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    for (code,title,garment,colour,description),image,mime in chosen:
+                        sizes="One Size" if garment=="Cap" else ",".join(MSJ_APPAREL_SIZES)
+                        price=MSJ_GARMENT_PRICES[garment]
+                        cur.execute("""INSERT INTO msj_merch_designs
+                            (code,title,description,price_mwk,garments,sizes,colours,
+                             image_bytes,image_mime,published)
+                            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE)
+                            ON CONFLICT (code) DO NOTHING RETURNING id""",
+                            (code,title,description,price,garment,sizes,colour,image,mime))
+                        if cur.fetchone():inserted+=1
+                        else:skipped+=1
+                conn.commit()
+            msg=f"Imported {inserted} original MSJ merchandise designs as drafts; {skipped} already existed. Review before publishing."
+        except (BadZipFile,ValueError,TypeError,UnidentifiedImageError,OSError) as exc:
+            msg="Import error: "+str(exc)[:160]
+        return redirect(url_for("msj.admin_index",message=msg))
 
     @bp.route("/admin/msj/designs/import-sheets",methods=["POST"])
     @admin_required
