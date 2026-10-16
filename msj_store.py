@@ -215,8 +215,9 @@ COMPLETE_TEMPLATE=BASE_START+"""
 ADMIN_TEMPLATE=BASE_START+"""
 <section class="hero"><div class="wrap"><div class="eyebrow">IBROWS ADMIN / MSJ</div>
 <h1>Merchandise management</h1><p>Upload real MSJ artwork, publish confirmed products and review orders. Payments must be verified separately in the IBROWS ledger.</p>
-<p><a class="button secondary" href="/admin">Back to admin</a></p></div></section>
+<p><a class="button secondary" href="/admin">Back to admin</a> <a class="button" href="#merch-import-title">Import hoodies &amp; caps</a></p></div></section>
 <main class="section"><div class="wrap">
+<p class="note" role="status">Catalogue: {{ garment_counts["T-shirt"] }} T-shirt designs · {{ garment_counts["Hoodie"] }} hoodie designs · {{ garment_counts["Cap"] }} cap designs. Only published designs are orderable.</p>
 {% if message %}<div class="notice" role="status">{{ message }}</div>{% endif %}
 <div class="pane"><h2>Add MSJ design</h2><form method="post" action="{{ url_for('msj.admin_add') }}" enctype="multipart/form-data">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -233,7 +234,8 @@ ADMIN_TEMPLATE=BASE_START+"""
 <button class="button" type="submit">Save unpublished design</button></form></div>
 <div class="pane" style="margin-top:28px"><h2>Import your 11 MSJ T-shirt designs</h2>
 <p class="note">Upload the three original MSJ mock-up sheets you shared earlier. We will crop each design directly from your originals—no replacement logos or invented graphics. Imported items start as private drafts for your approval.</p>
-<form method="post" action="{{ url_for('msj.admin_import_sheets') }}" enctype="multipart/form-data">
+<form method="post" action="{{ url_for('msj.admin_import_sheets') }}" enctype="multipart/form-data"
+onsubmit="if (!this.querySelector('input[name=three]').files.length &amp;&amp; !this.querySelector('input[name=four_a]').files.length &amp;&amp; !this.querySelector('input[name=four_b]').files.length) { window.alert('Choose at least one original MSJ design sheet before importing.'); return false; }">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <label>Classic / Script / Modern (3-shirt image)</label>
 <input type="file" name="three" accept="image/png,image/jpeg,image/webp">
@@ -574,7 +576,8 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         # Review unapproved uploads first, especially on narrow mobile screens.
         products.sort(key=lambda p:(bool(p["published"]),-int(p["id"])))
         published_count=sum(1 for p in products if p["published"])
-        return render(ADMIN_TEMPLATE,title="MSJ Admin",products=products,
+        garment_counts={g:sum(g in csv_choices(p["garments"]) for p in products) for g in MSJ_GARMENT_PRICES}
+        return render(ADMIN_TEMPLATE,title="MSJ Admin",products=products,garment_counts=garment_counts,
                       published_count=published_count,draft_count=len(products)-published_count,
                       orders=orders,csrf_token=admin_csrf(),
                       message=request.args.get("message","")[:180])
