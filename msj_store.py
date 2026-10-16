@@ -51,8 +51,25 @@ label{display:block;margin:15px 0 5px;font-weight:750;font-size:.88rem}input,sel
 input[type=checkbox]{min-height:0;width:auto}textarea{min-height:100px;resize:vertical}.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
 .note{color:var(--muted);font-size:.87rem}.error{background:#fff2ef;border:1px solid #bc5b43;padding:12px;color:#752818}
 .table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:.88rem}td,th{text-align:left;border-bottom:1px solid var(--line);padding:12px 8px;vertical-align:top}
-select.small{min-width:140px}footer{border-top:1px solid var(--line);padding:20px 0;color:var(--muted);font-size:.85rem}
-@media(max-width:640px){.two,.order-layout{grid-template-columns:1fr}.hero{padding:38px 0}.pane{padding:18px}}
+select.small{min-width:140px}
+.bulk-panel{border:1px solid #ccd9cd;border-radius:6px;background:#eff5ee;padding:18px 20px;margin:15px 0 20px}
+.bulk-panel h3{margin:0 0 8px;font-size:1.18rem}
+.bulk-panel p{margin:0 0 12px;color:var(--muted)}
+.bulk-panel form{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.bulk-panel button:disabled{opacity:.55;cursor:not-allowed}
+footer{border-top:1px solid var(--line);padding:20px 0;color:var(--muted);font-size:.85rem}
+@media(max-width:640px){
+.two,.order-layout{grid-template-columns:1fr}.hero{padding:38px 0}.pane{padding:18px}
+.catalog-table,.catalog-table tbody,.catalog-table tr,.catalog-table td{display:block;width:100%}
+.catalog-table thead{display:none}
+.catalog-table tr{padding:14px;border:1px solid var(--line);border-radius:6px;background:white;margin-bottom:12px}
+.catalog-table td{padding:8px 0;border:0;white-space:normal}
+.catalog-table td[data-label]::before{content:attr(data-label);display:block;font-size:.7rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:3px}
+.catalog-table td img{max-width:180px;height:auto}
+.catalog-table td .button{min-height:44px}
+.bulk-panel{padding:15px}
+.bulk-panel .button{width:100%}
+}
 """
 BASE_START = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -184,10 +201,25 @@ ADMIN_TEMPLATE=BASE_START+"""
 <p class="note">Use the originals, not cropped screenshots. At least one sheet is required. Already imported designs are skipped safely.</p>
 <button class="button" type="submit">Import MSJ original designs as drafts</button></form></div>
 <h2 style="margin-top:38px">Catalogue</h2>
-{% if products %}<div class="table-wrap"><table><thead><tr><th>Design</th><th>Price</th><th>Status</th><th>Update</th></tr></thead><tbody>
-{% for p in products %}<tr><td><img src="{{ url_for('msj.design_image',design_id=p.id) }}" width="110" alt=""><div><strong>{{ p.title }}</strong><br>{{ p.code }}</div></td>
-<td>MK {{ '{:,.0f}'.format(p.price_mwk) }}</td><td>{{ 'Published' if p.published else 'Draft' }}</td>
-<td><form method="post" action="{{ url_for('msj.admin_toggle',design_id=p.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<div class="bulk-panel" aria-label="MSJ catalogue publication controls">
+<h3>Publish all designs</h3>
+<p><strong>{{ published_count }} published</strong> · <strong>{{ draft_count }} drafts</strong> · {{ products|length }} total.</p>
+{% if draft_count > 0 %}
+<form method="post" action="{{ url_for('msj.admin_bulk_publish') }}"
+onsubmit="return window.confirm('Publish all {{ draft_count }} MSJ drafts? Only do this after reviewing the artwork, design names, sizes and prices. Published items immediately become visible and orderable by visitors.');">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<button class="button" type="submit">Publish All Drafts ({{ draft_count }})</button>
+<span class="note">One confirmation publishes eligible unpublished designs only. Existing published designs remain unchanged.</span>
+</form>
+{% else %}
+<p role="status">All {{ published_count }} designs are currently published. New imported artwork can be published in one action here.</p>
+<button class="button" type="button" disabled aria-disabled="true">Publish All — No Drafts</button>
+{% endif %}
+</div>
+{% if products %}<div class="table-wrap"><table class="catalog-table"><thead><tr><th>Design</th><th>Price</th><th>Status</th><th>Update</th></tr></thead><tbody>
+{% for p in products %}<tr><td data-label="Design"><img src="{{ url_for('msj.design_image',design_id=p.id) }}" width="110" alt=""><div><strong>{{ p.title }}</strong><br>{{ p.code }}</div></td>
+<td data-label="Price">MK {{ '{:,.0f}'.format(p.price_mwk) }}</td><td data-label="Status">{{ 'Published' if p.published else 'Draft' }}</td>
+<td data-label="Update"><form method="post" action="{{ url_for('msj.admin_toggle',design_id=p.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <button class="button secondary" type="submit">{{ 'Unpublish' if p.published else 'Publish' }}</button></form>
 <details style="margin-top:10px"><summary>Edit sizes, colours or artwork</summary><form method="post" action="{{ url_for('msj.admin_update',design_id=p.id) }}" enctype="multipart/form-data">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -470,7 +502,10 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                     ORDER BY o.id DESC LIMIT 200""")
                 keys=[x.name for x in cur.description]
                 orders=[dict(zip(keys,r)) for r in cur.fetchall()]
-        return render(ADMIN_TEMPLATE,title="MSJ Admin",products=product_rows(False),
+        products=product_rows(False)
+        published_count=sum(1 for p in products if p["published"])
+        return render(ADMIN_TEMPLATE,title="MSJ Admin",products=products,
+                      published_count=published_count,draft_count=len(products)-published_count,
                       orders=orders,csrf_token=admin_csrf(),
                       message=request.args.get("message","")[:180])
 
@@ -572,6 +607,33 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
             msg="Design saved as draft. Publish only after confirming available stock and pricing."
         except (ValueError,TypeError) as exc:
             msg=str(exc)
+        return redirect(url_for("msj.admin_index",message=msg))
+
+    @bp.route("/admin/msj/designs/publish-all",methods=["POST"])
+    @admin_required
+    def admin_bulk_publish():
+        """Publish eligible draft products with explicit admin confirmation and CSRF."""
+        validate_admin_csrf()
+        connect_setup()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM msj_merch_designs WHERE published=FALSE")
+                total_drafts=int(cur.fetchone()[0] or 0)
+                cur.execute("""UPDATE msj_merch_designs
+                    SET published=TRUE WHERE published=FALSE
+                      AND price_mwk>0 AND octet_length(image_bytes)>0
+                      AND btrim(title)<>'' AND btrim(garments)<>''
+                      AND btrim(sizes)<>''
+                    RETURNING id""")
+                count=len(cur.fetchall())
+            conn.commit()
+        if total_drafts==0:
+            msg="All MSJ designs were already published. No changes made."
+        elif count==total_drafts:
+            msg=f"Published {count} MSJ designs. All drafts are now visible to visitors."
+        else:
+            msg=(f"Published {count} of {total_drafts} MSJ drafts. "
+                 f"{total_drafts-count} still need complete artwork, pricing or garment details.")
         return redirect(url_for("msj.admin_index",message=msg))
 
     @bp.route("/admin/msj/designs/<int:design_id>/publish",methods=["POST"])
