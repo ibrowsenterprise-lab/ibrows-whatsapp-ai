@@ -20,7 +20,7 @@ shop_segment="""{% if service_key=='DESIGN_BRANDING' %}
 if 'register_msj_store(app, get_db' in s:
     print("MSJ integration already applied")
     raise SystemExit(0)
-marker="{% if service_key=='LANDSCAPING' %}"
+marker=r'''{% if service_key=='LANDSCAPING' %}<section class="preview-promo">'''
 assert s.count(marker)==1,("Branding template insertion marker count",s.count(marker))
 s=s.replace(marker,shop_segment+marker,1)
 tree=ast.parse(s)
