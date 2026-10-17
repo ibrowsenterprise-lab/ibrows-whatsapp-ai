@@ -1,5 +1,6 @@
 """Read-only, live IBROWS production audit. GET only: never submits customer data."""
 import time
+import os
 from html.parser import HTMLParser
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
@@ -61,6 +62,21 @@ def fetch(path):
    if i<2:time.sleep(4)
  raise RuntimeError(last)
 
+# A PR audit tests the currently deployed website. New headers are required
+# on main only, after waiting for Render auto-deploy to finish.
+require_nosniff = os.getenv("GITHUB_REF") == "refs/heads/main"
+if require_nosniff:
+ for attempt in range(24):
+  try:
+   _, _, probe_headers = fetch("/")
+   if probe_headers.get("X-Content-Type-Options", "").lower()=="nosniff":
+    print("PASS production security header ready",flush=True)
+    break
+  except Exception:
+   pass
+  print("Waiting for production deployment to serve security headers",attempt+1,flush=True)
+  time.sleep(6)
+
 errors=[];warnings=[];checked=0
 def check(condition,msg):
  if not condition:errors.append(msg)
@@ -99,8 +115,10 @@ for path in PAGES:
   if path=="/":
    check("ReadMalawi" in body and "Start a Project" in body,
          "Home missing community or project discovery")
-  check(headers.get("X-Content-Type-Options","").lower()=="nosniff",
-        f"{path}: X-Content-Type-Options nosniff missing")
+  if headers.get("X-Content-Type-Options","").lower()!="nosniff":
+   msg=f"{path}: X-Content-Type-Options nosniff missing"
+   if require_nosniff: errors.append(msg)
+   else: warnings.append(msg)
   checked+=1
   print("PASS",path,"HTTP",status,"forms",p.forms,flush=True)
  except Exception as exc:
