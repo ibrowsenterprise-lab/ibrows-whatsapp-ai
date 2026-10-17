@@ -22,11 +22,12 @@ for path in ["/msj","/msj/design/<int:design_id>","/msj/design/<int:design_id>/i
              "/admin/msj/orders/<int:order_id>/status",
              "/admin/msj/orders/<int:order_id>/colour-contacted",
              "/admin/msj/orders/<int:order_id>/colour-email-retry",
+             "/admin/msj/orders/<int:order_id>/notification-retry",
              "/admin/msj/designs/import-sheets",
              "/admin/msj/designs/import-merch-zip",
              "/admin/msj/designs/publish-all"]:
  assert path in all_routes,path
-assert len(all_routes)==14,len(all_routes)
+assert len(all_routes)==15,len(all_routes)
 assert "secrets.compare_digest" in src
 assert "get_db()" in src and "CREATE TABLE IF NOT EXISTS msj_merch_orders" in src
 assert "published=TRUE" in src and "1<=quantity<=30" in src
@@ -80,4 +81,7 @@ assert "Publish All Drafts" in module.ADMIN_TEMPLATE
 assert 'action="{{ url_for(\'msj.admin_bulk_publish\') }}"' in module.ADMIN_TEMPLATE
 assert "window.confirm" in module.ADMIN_TEMPLATE
 assert "catalog-table" in module.ADMIN_TEMPLATE
-print("PASS MSJ: fourteen isolated routes, admin login and CSRF guards, no checkout, original-artwork upload and valid templates")
+assert "Retry internal order email" in module.ADMIN_TEMPLATE
+assert "notification_status='FAILED'" in src and "notification_status='SENDING'" in src
+assert "REVIEW_REQUIRED" in src
+print("PASS MSJ: fifteen isolated routes, admin login and CSRF guards, no checkout, original-artwork upload and valid templates")
