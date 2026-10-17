@@ -1,0 +1,84 @@
+name: IBROWS public website and MSJ read-only check
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/ibrows-public-website-smoke.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  public-readonly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Check essential public pages without creating customer data
+        shell: bash
+        run: |
+          python - <<'PY'
+          from html.parser import HTMLParser
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          import time
+
+          BASE = "https://www.ibrowsenterprise.com"
+          PATHS = [
+              "/", "/design-branding", "/msj", "/msj?garment=T-shirt",
+              "/msj?garment=Hoodie", "/msj?garment=Cap",
+              "/project-discovery", "/business-registration",
+              "/team", "/company-profile", "/pricing", "/privacy",
+          ]
+
+          class PageParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.title = False
+                  self.viewport = False
+                  self.forms = 0
+                  self.links = set()
+              def handle_starttag(self, tag, attrs):
+                  a = dict(attrs)
+                  if tag == "meta" and a.get("name") == "viewport":
+                      self.viewport = True
+                  if tag == "form":
+                      self.forms += 1
+                  if tag == "a" and a.get("href"):
+                      self.links.add(a["href"])
+
+          def fetch(path):
+              error = None
+              for attempt in range(3):
+                  try:
+                      req = Request(BASE + path, headers={
+                          "User-Agent": "IBROWS-public-readonly-audit/1.0",
+                          "Accept": "text/html",
+                      })
+                      with urlopen(req, timeout=28) as resp:
+                          body = resp.read(1_500_000).decode("utf-8", "replace")
+                          return resp.status, body
+                  except (HTTPError, URLError, TimeoutError) as exc:
+                      error = exc
+                      if attempt < 2:
+                          time.sleep(4)
+              raise AssertionError(f"{path} inaccessible after retries: {error}")
+
+          for path in PATHS:
+              status, body = fetch(path)
+              if status != 200:
+                  raise AssertionError(f"{path} returned HTTP {status}")
+              page = PageParser()
+              page.feed(body)
+              if not page.viewport:
+                  raise AssertionError(f"{path} lacks a mobile viewport")
+              if path.startswith("/msj"):
+                  if "Mulungu Si Jemusi" not in body:
+                      raise AssertionError(f"{path}: MSJ identity missing")
+                  if path == "/msj" and "/msj/design/" not in body:
+                      raise AssertionError("MSJ catalogue has no visible design links")
+              if path == "/design-branding" and "/msj" not in body:
+                  raise AssertionError("Branding page does not link to the MSJ store")
+              if path == "/project-discovery" and page.forms == 0:
+                  raise AssertionError("Project Discovery has no enquiry form")
+              print(f"PASS {path}: HTTP {status}, viewport present, forms={page.forms}", flush=True)
+          print(f"PASS: {len(PATHS)} visitor routes checked; zero POST requests, zero test orders.", flush=True)
+          PY
