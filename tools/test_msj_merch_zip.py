@@ -81,3 +81,45 @@ assert len(records)==5
 assert "/admin/msj/designs/import-merch-zip" in [r.rule for r in app.url_map.iter_rules()]
 print("PASS: 5 real-artwork ZIP import slots; correct MK prices and cap/apparel sizes")
 print("PASS: all entries unpublished, repeat upload idempotent, path traversal ignored, invalid uploads rejected")
+
+# V149: photo-gallery uploads need no ZIP, allow partial selection, keep stock private.
+records.clear()
+def direct_photos(**photos):
+    payload={field:(io.BytesIO(blob), name) for field,(blob,name) in photos.items()}
+    return client.post("/admin/msj/designs/import-merch-images",
+                       data=payload,content_type="multipart/form-data")
+empty=direct_photos()
+assert empty.status_code==302
+assert "Choose+at+least+one" in empty.location
+assert not records
+invalid=direct_photos(wordmark_cap=(b"this is not an image","fake.png"))
+assert invalid.status_code==302
+assert "Image+import+error" in invalid.location
+assert not records
+cap=direct_photos(wordmark_cap=(image_blob("Wordmark Cap"),"camera-image.jpg"))
+assert cap.status_code==302
+assert "MSJ-WORDMARK-CAP" in records and len(records)==1
+assert records["MSJ-WORDMARK-CAP"]["sizes"]=="One Size"
+assert not records["MSJ-WORDMARK-CAP"]["published"]
+hoodies=direct_photos(
+   wordmark_hoodie=(image_blob("Wordmark Hoodie"),"upload-1.jpg"),
+   block_hoodie=(image_blob("Block Hoodie"),"upload-2.jpg"),
+   block_cap=(image_blob("Block Cap"),"upload-3.jpg"),
+   block_tshirt=(image_blob("Block Tee"),"upload-4.jpg"))
+assert hoodies.status_code==302 and len(records)==5
+assert records["MSJ-BLOCK-HOODIE"]["price"]==50000
+assert records["MSJ-BLOCK-CAP"]["price"]==20000
+assert records["MSJ-BLOCK-TSHIRT"]["price"]==25000
+assert all(not row["published"] for row in records.values())
+repeat=direct_photos(block_hoodie=(image_blob("new but duplicate"),"another.jpg"))
+assert repeat.status_code==302 and len(records)==5
+# Invalid second image must reject the whole request before creating the first product.
+records.clear()
+partly_invalid=direct_photos(
+  block_hoodie=(image_blob("Valid Hoodie"),"good.jpg"),
+  block_cap=(b"invalid","bad.webp"))
+assert partly_invalid.status_code==302
+assert not records, "Partial bad uploads must not persist earlier photos"
+assert "/admin/msj/designs/import-merch-images" in [r.rule for r in app.url_map.iter_rules()]
+print("PASS: individual Android-style photo uploads, correctly assigned prices, no ZIP required")
+print("PASS: empty/invalid/partly-invalid uploads rejected; duplicate drafts skipped; published state unchanged")

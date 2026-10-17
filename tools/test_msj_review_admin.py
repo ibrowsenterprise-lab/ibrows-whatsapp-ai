@@ -53,6 +53,11 @@ assert html.index("<strong>MSJ Wordmark Hoodie</strong>") < html.index("<strong>
 assert "2 drafts" in html and "1 published" in html
 assert "1 T-shirt designs" in html and "1 hoodie designs" in html and "1 cap designs" in html
 assert 'href="#merch-import-title"' in html, "Mobile hoodie/cap import shortcut missing"
+assert "No ZIP needed." in html
+assert "Import selected photos as drafts" in html
+assert html.count('type="file" name="wordmark_cap"') == 1
+assert html.count('type="file" name="block_hoodie"') == 1
+assert "Or upload an original merchandise ZIP" in html
 assert "Choose at least one original MSJ design sheet before importing." in html
 assert "Publish All Drafts (2)" in html
 assert html.count("Draft — needs approval")==2

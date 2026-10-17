@@ -22,6 +22,32 @@ MSJ_GARMENT_PRICES = {"T-shirt": 25000, "Hoodie": 50000, "Cap": 20000}
 MSJ_APPAREL_SIZES = ("S", "M", "L", "XL", "XXL")
 MSJ_CAP_SIZE = "One Size"
 
+MSJ_MERCH_SPECS = {
+            "MSJ_Wordmark_Hoodie_Lifestyle.jpg":
+                ("MSJ-WORDMARK-HOODIE","MSJ Wordmark Hoodie","Hoodie","Forest green",
+                 "Original MSJ wordmark green hoodie shown in a collection lifestyle mockup. Other accessories in photo are not included."),
+            "MSJ_Block_Hoodie.jpg":
+                ("MSJ-BLOCK-HOODIE","MSJ Block Hoodie","Hoodie","Black",
+                 "Original black hoodie mockup with the bold MSJ block logo."),
+            "MSJ_Wordmark_Cap.jpg":
+                ("MSJ-WORDMARK-CAP","MSJ Wordmark Cap","Cap","Black",
+                 "Original black cap with white MSJ wordmark patch, cropped from the original collection mockup."),
+            "MSJ_Block_Cap.jpg":
+                ("MSJ-BLOCK-CAP","MSJ Block Cap","Cap","Black",
+                 "Original black cap mockup with embroidered MSJ block logo."),
+            "MSJ_Block_Tshirt.jpg":
+                ("MSJ-BLOCK-TSHIRT","MSJ Block T-shirt","T-shirt","Black",
+                 "Original black T-shirt mockup with the bold MSJ block logo.")
+        }
+MSJ_MERCH_PHOTO_FIELDS = (
+    ("wordmark_hoodie", "Wordmark hoodie (green lifestyle photo)", "MSJ_Wordmark_Hoodie_Lifestyle.jpg"),
+    ("block_hoodie", "Block logo hoodie (black)", "MSJ_Block_Hoodie.jpg"),
+    ("wordmark_cap", "Wordmark cap (black with white patch)", "MSJ_Wordmark_Cap.jpg"),
+    ("block_cap", "Block logo cap (black)", "MSJ_Block_Cap.jpg"),
+    ("block_tshirt", "Block logo T-shirt (black)", "MSJ_Block_Tshirt.jpg"),
+)
+
+
 def msj_product_options(garments):
     """Calculate the advertised price strictly from approved garment prices."""
     choices = [g.strip() for g in (garments or "").split(",") if g.strip()]
@@ -246,15 +272,27 @@ onsubmit="if (!this.querySelector('input[name=three]').files.length &amp;&amp; !
 <p class="note">Use the originals, not cropped screenshots. At least one sheet is required. Already imported designs are skipped safely.</p>
 <button class="button" type="submit">Import MSJ original designs as drafts</button></form></div>
 <section class="admin-merch-import" aria-labelledby="merch-import-title">
-<h2 id="merch-import-title">Import MSJ hoodies &amp; caps</h2>
-<p>Upload your <strong>MSJ Original Merchandise Images ZIP</strong> to add the existing wordmark hoodie, block hoodie, wordmark cap, block cap and block T-shirt as <strong>unpublished drafts</strong>. Original artwork is retained; no duplicate products are created.</p>
+<h2 id="merch-import-title">Add MSJ hoodies &amp; caps from your phone</h2>
+<p>Choose one or more original MSJ photos directly from your phone gallery. <strong>No ZIP needed.</strong> Match each photo to its labelled item below. Unselected items are skipped, and duplicates are not created.</p>
+<form method="post" action="{{ url_for('msj.admin_import_merch_images') }}" enctype="multipart/form-data"
+onsubmit="if(!Array.from(this.querySelectorAll('input[type=file]')).some(function(el){return el.files.length>0;})){window.alert('Choose at least one merchandise photo.');return false;}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+{% for field,label,filename in merch_photo_fields %}
+<label for="msj-photo-{{ field }}">{{ label }}</label>
+<input id="msj-photo-{{ field }}" type="file" name="{{ field }}" accept="image/png,image/jpeg,image/webp">
+{% endfor %}
+<p class="note">PNG, JPG or WebP · up to 5 MB per image. Every photo is saved as a <strong>private draft</strong> with the confirmed price and sizes. Verify the photo matches its label before publishing.</p>
+<button class="button" type="submit">Import selected photos as drafts</button>
+</form>
+<details style="margin-top:20px">
+<summary style="cursor:pointer;font-weight:750;padding:8px 0">Or upload an original merchandise ZIP</summary>
+<p class="note">Optional bulk import for your original five named mockup files. Use ZIP only if you already have one.</p>
 <form method="post" action="{{ url_for('msj.admin_import_merch_zip') }}" enctype="multipart/form-data">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<label for="msj-merch-zip">Original merchandise images (.zip, max 8 MB)</label>
+<label for="msj-merch-zip">Original merchandise ZIP (.zip, max 8 MB)</label>
 <input id="msj-merch-zip" type="file" name="merch_zip" accept=".zip,application/zip" required>
-<p class="note">Review each photo and its matching price and size before publishing. The lifestyle hoodie image includes other merchandise in the scene.</p>
-<button class="button" type="submit">Import hoodie &amp; cap drafts</button>
-</form></section>
+<button class="button secondary" type="submit" style="margin-top:12px">Import ZIP as drafts</button>
+</form></details></section>
 <h2 style="margin-top:38px">Catalogue</h2>
 <div class="bulk-panel" aria-label="MSJ catalogue publication controls">
 <h3>Catalogue review &amp; publishing</h3>
@@ -584,8 +622,49 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         garment_counts={g:sum(g in csv_choices(p["garments"]) for p in products) for g in MSJ_GARMENT_PRICES}
         return render(ADMIN_TEMPLATE,title="MSJ Admin",products=products,garment_counts=garment_counts,
                       published_count=published_count,draft_count=len(products)-published_count,
-                      orders=orders,csrf_token=admin_csrf(),
+                      orders=orders,merch_photo_fields=MSJ_MERCH_PHOTO_FIELDS,csrf_token=admin_csrf(),
                       message=request.args.get("message","")[:180])
+
+    def insert_merch_drafts(chosen):
+        """Create unpublished, conflict-safe MSJ drafts; never overwrite existing artwork."""
+        inserted=skipped=0
+        connect_setup()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                for (code,title,garment,colour,description),image,mime in chosen:
+                    sizes="One Size" if garment=="Cap" else ",".join(MSJ_APPAREL_SIZES)
+                    price=MSJ_GARMENT_PRICES[garment]
+                    cur.execute("""INSERT INTO msj_merch_designs
+                        (code,title,description,price_mwk,garments,sizes,colours,
+                         image_bytes,image_mime,published)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE)
+                        ON CONFLICT (code) DO NOTHING RETURNING id""",
+                        (code,title,description,price,garment,sizes,colour,image,mime))
+                    if cur.fetchone():inserted+=1
+                    else:skipped+=1
+            conn.commit()
+        return inserted,skipped
+
+    @bp.route("/admin/msj/designs/import-merch-images",methods=["POST"])
+    @admin_required
+    def admin_import_merch_images():
+        """Accept one or several phone-gallery images, assigned to explicit product slots."""
+        validate_admin_csrf()
+        try:
+            chosen=[]
+            for field,label,filename in MSJ_MERCH_PHOTO_FIELDS:
+                uploaded=request.files.get(field)
+                if not uploaded or not uploaded.filename:continue
+                image,mime=image_sanitize(uploaded)
+                chosen.append((MSJ_MERCH_SPECS[filename],image,mime))
+            if not chosen:
+                raise ValueError("Choose at least one original merchandise photo (PNG, JPG or WebP).")
+            inserted,skipped=insert_merch_drafts(chosen)
+            msg=(f"Imported {inserted} MSJ photos as private drafts; "
+                 f"{skipped} already existed. Review your pictures before publishing.")
+        except (ValueError,TypeError,UnidentifiedImageError,OSError) as exc:
+            msg="Image import error: "+str(exc)[:150]
+        return redirect(url_for("msj.admin_index",message=msg))
 
     @bp.route("/admin/msj/designs/import-merch-zip",methods=["POST"])
     @admin_required
@@ -594,23 +673,6 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         from zipfile import ZipFile, BadZipFile
         from types import SimpleNamespace
         validate_admin_csrf()
-        specs={
-            "MSJ_Wordmark_Hoodie_Lifestyle.jpg":
-                ("MSJ-WORDMARK-HOODIE","MSJ Wordmark Hoodie","Hoodie","Forest green",
-                 "Original MSJ wordmark green hoodie shown in a collection lifestyle mockup. Other accessories in photo are not included."),
-            "MSJ_Block_Hoodie.jpg":
-                ("MSJ-BLOCK-HOODIE","MSJ Block Hoodie","Hoodie","Black",
-                 "Original black hoodie mockup with the bold MSJ block logo."),
-            "MSJ_Wordmark_Cap.jpg":
-                ("MSJ-WORDMARK-CAP","MSJ Wordmark Cap","Cap","Black",
-                 "Original black cap with white MSJ wordmark patch, cropped from the original collection mockup."),
-            "MSJ_Block_Cap.jpg":
-                ("MSJ-BLOCK-CAP","MSJ Block Cap","Cap","Black",
-                 "Original black cap mockup with embroidered MSJ block logo."),
-            "MSJ_Block_Tshirt.jpg":
-                ("MSJ-BLOCK-TSHIRT","MSJ Block T-shirt","T-shirt","Black",
-                 "Original black T-shirt mockup with the bold MSJ block logo.")
-        }
         try:
             uploaded=request.files.get("merch_zip")
             if not uploaded or not uploaded.filename or not uploaded.filename.lower().endswith(".zip"):
@@ -623,31 +685,16 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                 infos=archive.infolist()
                 if len(infos)>30:raise ValueError("The ZIP has too many files.")
                 for info in infos:
-                    if info.filename not in specs:continue
+                    if info.filename not in MSJ_MERCH_SPECS:continue
                     if info.file_size>5*1024*1024 or info.file_size<1000:
                         raise ValueError("A merchandise photo has an invalid size.")
                     asset=archive.read(info)
                     if len(asset)>5*1024*1024:
                         raise ValueError("A merchandise photo exceeds the 5 MB limit.")
                     image,mime=image_sanitize(SimpleNamespace(filename=info.filename,stream=io.BytesIO(asset)))
-                    chosen.append((specs[info.filename],image,mime))
+                    chosen.append((MSJ_MERCH_SPECS[info.filename],image,mime))
             if not chosen:raise ValueError("No recognized original MSJ merchandise images found in ZIP.")
-            inserted=skipped=0
-            connect_setup()
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    for (code,title,garment,colour,description),image,mime in chosen:
-                        sizes="One Size" if garment=="Cap" else ",".join(MSJ_APPAREL_SIZES)
-                        price=MSJ_GARMENT_PRICES[garment]
-                        cur.execute("""INSERT INTO msj_merch_designs
-                            (code,title,description,price_mwk,garments,sizes,colours,
-                             image_bytes,image_mime,published)
-                            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE)
-                            ON CONFLICT (code) DO NOTHING RETURNING id""",
-                            (code,title,description,price,garment,sizes,colour,image,mime))
-                        if cur.fetchone():inserted+=1
-                        else:skipped+=1
-                conn.commit()
+            inserted,skipped=insert_merch_drafts(chosen)
             msg=f"Imported {inserted} original MSJ merchandise designs as drafts; {skipped} already existed. Review before publishing."
         except (BadZipFile,ValueError,TypeError,UnidentifiedImageError,OSError) as exc:
             msg="Import error: "+str(exc)[:160]
