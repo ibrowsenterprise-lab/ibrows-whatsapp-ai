@@ -1,0 +1,19 @@
+name: V151 IBROWS visitor and administrator read-only audit
+on:
+  push:
+    branches:
+      - feature/ibrows-audit-v151
+    paths:
+      - tools/audit_v151_public.py
+      - .github/workflows/ibrows-audit-v151.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit 31 public pages, MSJ stock, anonymous admin access and request forms
+        run: python tools/audit_v151_public.py
