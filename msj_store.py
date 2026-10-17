@@ -1042,4 +1042,11 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
                  if status!="COLOUR_UNAVAILABLE" else send_customer_colour_unavailable(order_id))
         return redirect(url_for("msj.admin_index",message=message))
 
+    # Security header for every IBROWS route, including admin and error responses.
+    # This is safe for first-party images, forms, PDFs and the WhatsApp webhook.
+    @app.after_request
+    def ibrows_nosniff_response_header(response):
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        return response
+
     app.register_blueprint(bp)
