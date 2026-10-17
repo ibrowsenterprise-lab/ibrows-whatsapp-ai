@@ -54,9 +54,9 @@ def fetch(path):
   try:
    req=Request(url,headers={"User-Agent":"IBROWS-V151-Visitor-ReadOnly/1.0","Accept":"text/html"})
    with opener.open(req,timeout=30) as resp:
-    return resp.status,resp.read(1_600_000).decode("utf-8","replace"),dict(resp.headers)
+    return resp.status,resp.read(1_600_000).decode("utf-8","replace"),{k.lower():v for k,v in resp.headers.items()}
   except HTTPError as exc:
-   return exc.code,exc.read(10_000).decode("utf-8","replace"),dict(exc.headers)
+   return exc.code,exc.read(10_000).decode("utf-8","replace"),{k.lower():v for k,v in exc.headers.items()}
   except (URLError,TimeoutError,OSError) as exc:
    last=str(exc)
    if i<2:time.sleep(4)
@@ -69,7 +69,7 @@ if require_nosniff:
  for attempt in range(24):
   try:
    _, _, probe_headers = fetch("/")
-   if probe_headers.get("X-Content-Type-Options", "").lower()=="nosniff":
+   if probe_headers.get("x-content-type-options", "").lower()=="nosniff":
     print("PASS production security header ready",flush=True)
     break
   except Exception:
@@ -77,6 +77,8 @@ if require_nosniff:
   print("Waiting for production deployment to serve security headers",attempt+1,flush=True)
   time.sleep(6)
 
+# HTTP header field names are case-insensitive.
+assert {k.lower():v for k,v in {"X-Content-Type-Options":"nosniff"}.items()}["x-content-type-options"] == "nosniff"
 errors=[];warnings=[];checked=0
 def check(condition,msg):
  if not condition:errors.append(msg)
@@ -115,7 +117,7 @@ for path in PAGES:
   if path=="/":
    check("ReadMalawi" in body and "Start a Project" in body,
          "Home missing community or project discovery")
-  if headers.get("X-Content-Type-Options","").lower()!="nosniff":
+  if headers.get("x-content-type-options","").lower()!="nosniff":
    msg=f"{path}: X-Content-Type-Options nosniff missing"
    if require_nosniff: errors.append(msg)
    else: warnings.append(msg)
