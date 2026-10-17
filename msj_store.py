@@ -125,7 +125,7 @@ Every order is reviewed by our team before payment, printing or delivery is arra
 <nav class="shop-filters" aria-label="Shop by merchandise type">
 <a class="shop-filter" href="{{ url_for('msj.catalog') }}" {% if not garment_filter %}aria-current="page"{% endif %}>All designs</a>
 {% for category in ['T-shirt','Hoodie','Cap'] %}
-<a class="shop-filter" href="{{ url_for('msj.catalog', garment=category) }}" {% if garment_filter==category %}aria-current="page"{% endif %}>{{ {'T-shirt':'T-shirts','Hoodie':'Hoodies','Cap':'Caps'}[category] }}</a>
+<a class="shop-filter" href="{{ url_for('msj.catalog', garment=category) }}" {% if garment_filter==category %}aria-current="page"{% endif %}>{{ {'T-shirt':'T-shirts','Hoodie':'Hoodies','Cap':'Caps'}[category] }}{% if category == 'Hoodie' and not hoodies_listed %} (Out of stock){% endif %}</a>
 {% endfor %}
 </nav>
 {% if products %}<div class="grid">{% for p in products %}
@@ -136,8 +136,15 @@ Every order is reviewed by our team before payment, printing or delivery is arra
 <div class="price">{% if ',' not in p.garments %}MK {{ '{:,.0f}'.format(p.price_mwk) }}{% else %}From MK {{ '{:,.0f}'.format(p.price_mwk) }}{% endif %}</div>
 <p>Available: {{ p.garments }}. Choose size, preferred colour and quantity when ordering.</p>
 <a class="button" href="{{ url_for('msj.order_design', design_id=p.id) }}">Select design</a></div></article>{% endfor %}</div>
-{% else %}<div class="notice"><h2>Collection being prepared</h2>
-<p>{% if garment_filter %}We're preparing more MSJ {{ {'T-shirt':'T-shirts','Hoodie':'hoodies','Cap':'caps'}[garment_filter] }} for the collection. Check back after new designs are approved.{% else %}New MSJ designs are being prepared. Only approved products are available to request.{% endif %}</p></div>{% endif %}
+{% else %}<div class="notice">
+{% if garment_filter == 'Hoodie' %}
+<h2>Hoodies temporarily out of stock</h2>
+<p>MSJ hoodies are not currently available for ordering. Please check back once stock has been confirmed.</p>
+{% else %}
+<h2>Collection being prepared</h2>
+<p>{% if garment_filter %}We're preparing more MSJ {{ {'T-shirt':'T-shirts','Cap':'caps'}[garment_filter] }} for the collection. Check back after new designs are approved.{% else %}New MSJ designs are being prepared. Only approved products are available to request.{% endif %}</p>
+{% endif %}
+</div>{% endif %}
 </div></main>""" + BASE_END
 
 ORDER_TEMPLATE=BASE_START+"""
@@ -480,7 +487,9 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
         if garment_filter not in ("T-shirt","Hoodie","Cap"): garment_filter=""
         all_products=product_rows()
         products=[p for p in all_products if garment_filter in csv_choices(p["garments"])] if garment_filter else all_products
-        return render(CATALOG_TEMPLATE,title="MSJ Clothing Collection",products=products,garment_filter=garment_filter)
+        return render(CATALOG_TEMPLATE,title="MSJ Clothing Collection",products=products,
+                      garment_filter=garment_filter,
+                      hoodies_listed=any("Hoodie" in csv_choices(p["garments"]) for p in all_products))
 
     @bp.route("/msj/design/<int:design_id>/image",methods=["GET"])
     def design_image(design_id):

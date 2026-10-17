@@ -75,5 +75,19 @@ assert 'value="One Size"' not in hoodieorder
 assert "MK 50,000" in hoodieorder
 shirtorder=get("/msj/design/1")
 assert "MK 25,000" in shirtorder
+# If no hoodie design is published, customers must see the true stock situation.
+products[1]["published"]=False
+empty_hoodie=get("/msj?garment=Hoodie")
+assert "Hoodies temporarily out of stock" in empty_hoodie
+assert "not currently available for ordering" in empty_hoodie
+assert "Select design" not in empty_hoodie
+index_without_hoodies=get("/msj")
+assert "Hoodies (Out of stock)" in index_without_hoodies
+assert "MSJ Block Hoodie" not in index_without_hoodies
+assert "MSJ Classic" in index_without_hoodies and "MSJ Block Cap" in index_without_hoodies
+assert client.get("/msj/design/2").status_code==404, "Unpublished hoodie should not be orderable"
+products[1]["published"]=True
+assert "Hoodies (Out of stock)" not in get("/msj"), "Restocked catalogue should clear old message"
+print("PASS: empty hoodie catalogue clearly says out of stock; no hoodie order link")
 print("PASS garment filters show exactly the right original MSJ products")
 print("PASS cap orders are One Size; hoodie S-XXL; garment-specific prices match")
