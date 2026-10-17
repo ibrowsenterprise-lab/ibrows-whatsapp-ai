@@ -9,6 +9,7 @@ on:
       - .github/workflows/ibrows-audit-v151.yml
       - msj_store.py
       - tools/test_msj_garments.py
+      - tools/diagnose_v151_headers.py
   workflow_dispatch:
 permissions:
   contents: read
@@ -20,3 +21,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Audit 31 public pages, MSJ stock, anonymous admin access and request forms
         run: python tools/audit_v151_public.py
+      - name: Diagnose custom-domain versus Render security headers
+        run: python tools/diagnose_v151_headers.py
