@@ -91,3 +91,10 @@ assert "Hoodies (Out of stock)" not in get("/msj"), "Restocked catalogue should 
 print("PASS: empty hoodie catalogue clearly says out of stock; no hoodie order link")
 print("PASS garment filters show exactly the right original MSJ products")
 print("PASS cap orders are One Size; hoodie S-XXL; garment-specific prices match")
+
+# Global security header must also protect ordinary HTML and 404 responses.
+assert client.get("/msj").headers.get("X-Content-Type-Options") == "nosniff"
+missing=client.get("/msj/design/99999")
+assert missing.status_code == 404
+assert missing.headers.get("X-Content-Type-Options") == "nosniff"
+print("PASS global no-sniff header protects MSJ HTML and invalid product routes")
