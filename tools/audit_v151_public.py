@@ -99,8 +99,8 @@ for path in PAGES:
   if path=="/":
    check("ReadMalawi" in body and "Start a Project" in body,
          "Home missing community or project discovery")
-  if "X-Content-Type-Options" not in headers:
-   warnings.append(f"{path}: no X-Content-Type-Options response header")
+  check(headers.get("X-Content-Type-Options","").lower()=="nosniff",
+        f"{path}: X-Content-Type-Options nosniff missing")
   checked+=1
   print("PASS",path,"HTTP",status,"forms",p.forms,flush=True)
  except Exception as exc:
