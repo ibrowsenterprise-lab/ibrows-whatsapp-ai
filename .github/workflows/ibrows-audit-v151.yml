@@ -2,10 +2,13 @@ name: V151 IBROWS visitor and administrator read-only audit
 on:
   push:
     branches:
+      - main
       - feature/ibrows-audit-v151
     paths:
       - tools/audit_v151_public.py
       - .github/workflows/ibrows-audit-v151.yml
+      - msj_store.py
+      - tools/test_msj_garments.py
   workflow_dispatch:
 permissions:
   contents: read
