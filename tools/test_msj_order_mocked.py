@@ -37,6 +37,19 @@ class Cur:
    self.rows=[(ident,)];return
   if q.startswith("update msj_merch_orders set reference="):
    ref,ident=params;order_rows[ident]["ref"]=ref;return
+  if q.startswith("select o.reference,d.title,o.garment,o.size,o.colour"):
+   ident=params[0]
+   o=order_rows.get(ident)
+   self.rows=[(o["ref"],product["title"],o["garment"],o["size"],o["colour"],
+               o["quantity"],o["name"],o["phone"],o["location"])] if o else []
+   return
+  if q.startswith("update msj_merch_orders set notification_status='sending'"):
+   ident=params[0]
+   if order_rows.get(ident,{}).get("alert")=="FAILED":
+    order_rows[ident]["alert"]="SENDING";self.rows=[(ident,)]
+   return
+  if q.startswith("select notification_status from msj_merch_orders"):
+   ident=params[0];self.rows=[(order_rows[ident]["alert"],)];return
   if q.startswith("update msj_merch_orders set notification_status="):
    if state["fail_notification_db"]:raise RuntimeError("Simulated alert DB failure")
    status,error,ident=params;order_rows[ident]["alert"]=status;return
@@ -61,7 +74,7 @@ os.environ["NOTIFICATION_EMAIL"]="internal@example.invalid"
 def mock_post(url,headers,json,timeout):
  assert "brevo" in url and json["to"][0]["email"]=="internal@example.invalid"
  state["mail"].append(json)
- return SimpleNamespace(status_code=201)
+ return SimpleNamespace(status_code=state.get("post_status",201))
 msj_store.requests.post=mock_post
 
 def submit(**changes):
@@ -112,6 +125,25 @@ assert '<option value="M" selected>' in html, "Customer size selection was lost"
 assert 'name="quantity" type="number" value="2"' in html, "Customer quantity was lost"
 assert len(order_rows)==2, "Invalid retry must not create an order"
 print("PASS: invalid mixed-garment request keeps Hoodie, M and quantity for safe correction")
+
+# A genuinely FAILED provider response can be retried by admin exactly once.
+state["fail_notification_db"]=False
+state["post_status"]=503
+r=submit(quantity="1",colour="Teal")
+assert r.status_code==303
+assert order_rows[3]["alert"]=="FAILED"
+before=len(state["mail"])
+state["post_status"]=201
+r=client.post("/admin/msj/orders/3/notification-retry",follow_redirects=False)
+assert r.status_code==302
+assert order_rows[3]["alert"]=="SENT"
+assert len(state["mail"])==before+1
+# An accidental second click must not email the buyer or the admin twice.
+r=client.post("/admin/msj/orders/3/notification-retry",follow_redirects=False)
+assert r.status_code==302
+assert len(state["mail"])==before+1
+assert order_rows[3]["alert"]=="SENT"
+print("PASS: failed internal order email can be retried once; sent alerts cannot be duplicated")
 
 print("PASS end-to-end mocked MSJ request: size/colour/price/consent validation, order saved, admin alert, receipt")
 print("PASS post-commit notification failure does not cause duplicate-order encouragement")
