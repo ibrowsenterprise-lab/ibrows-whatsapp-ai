@@ -301,6 +301,11 @@ onsubmit="return window.confirm('Publish all {{ draft_count }} MSJ drafts? Only 
 {% for status in ['NEW','CONTACTED','COLOUR_UNAVAILABLE','QUOTED','CONFIRMED','IN_PRODUCTION','FULFILLED','CANCELLED'] %}
 <option value="{{ status }}" {% if o.status == status %}selected{% endif %}>{{ status.replace('_',' ').title() }}</option>{% endfor %}
 </select><button class="button secondary" type="submit">Save status</button></form>
+{% if o.notification_status == 'FAILED' %}
+<form method="post" action="{{ url_for('msj.admin_retry_order_notification',order_id=o.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<button class="button secondary" type="submit">Retry internal order email</button></form>
+{% endif %}
 {% if o.status == 'COLOUR_UNAVAILABLE' %}
 {% if o.colour_alert_status in ['MANUAL_REQUIRED','FAILED'] %}
 <p class="note">{% if o.email %}Email notice failed. Please retry or contact the buyer directly.{% else %}No email provided: please notify the buyer by phone or WhatsApp.{% endif %}</p>
@@ -889,6 +894,55 @@ def register_msj_store(app, get_db, public_csrf, admin_csrf, validate_admin_csrf
             conn.commit()
         if sent:return "Colour-unavailable email accepted by Brevo (recipient delivery not independently confirmed)."
         return "Email notice failed. Please contact buyer directly or retry."
+
+    @bp.route("/admin/msj/orders/<int:order_id>/notification-retry",methods=["POST"])
+    @admin_required
+    def admin_retry_order_notification(order_id):
+        """Retry only a failed internal MSJ order alert, never the buyer's order."""
+        validate_admin_csrf()
+        connect_setup()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT o.reference,d.title,o.garment,o.size,o.colour,
+                    o.quantity,o.buyer_name,o.phone,o.location
+                    FROM msj_merch_orders o JOIN msj_merch_designs d ON d.id=o.design_id
+                    WHERE o.id=%s""",(order_id,))
+                row=cur.fetchone()
+        if not row:abort(404)
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""UPDATE msj_merch_orders
+                    SET notification_status='SENDING',updated_at=NOW()
+                    WHERE id=%s AND notification_status='FAILED'
+                    RETURNING id""",(order_id,))
+                claimed=cur.fetchone() is not None
+            conn.commit()
+        if not claimed:
+            return redirect(url_for("msj.admin_index",message="Only failed internal order emails can be retried."))
+        ref,title,garment,size,colour,quantity,buyer_name,phone,location=row
+        try:
+            send_notification(order_id,ref,{"title":title},garment,size,colour,quantity,buyer_name,phone,location)
+        except Exception:
+            # If Brevo accepted an email but recording the result failed, retrying
+            # could deliver duplicates. Require manual checking instead.
+            app.logger.exception("MSJ order %s: uncertain admin email retry delivery",ref)
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""UPDATE msj_merch_orders
+                        SET notification_status='REVIEW_REQUIRED',
+                            notification_error='Check Brevo/inbox before any manual resend',
+                            updated_at=NOW()
+                        WHERE id=%s AND notification_status='SENDING'""",(order_id,))
+                conn.commit()
+            return redirect(url_for("msj.admin_index",message="Email delivery uncertain. Check Brevo and inbox before any manual resend."))
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT notification_status FROM msj_merch_orders WHERE id=%s",(order_id,))
+                final=cur.fetchone()
+        message=("Internal order email accepted by provider; inbox delivery not independently confirmed."
+                 if final and final[0]=="SENT" else
+                 "Internal email attempt failed. Confirm Brevo settings and retry from this page.")
+        return redirect(url_for("msj.admin_index",message=message))
 
     @bp.route("/admin/msj/orders/<int:order_id>/colour-contacted",methods=["POST"])
     @admin_required
