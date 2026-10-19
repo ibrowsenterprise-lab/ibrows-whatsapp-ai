@@ -33076,6 +33076,7 @@ SERVICE_REQUEST_TEMPLATE = r"""
       else if(t==='DETAILING') g=result('DETAIL',['DETAIL'],'You requested detailed/intensive vehicle cleaning.');
     }
     else if(serviceKey==='DESIGN_BRANDING'){
+      if(['MEDIA_PROMO','EVENT_TEASER','MEDIA_MONTHLY'].includes(selected)) return null;
       const s=val('service_needed'), d=low('design_type'), q=low('quantity'), both=d+' '+q;
       if(s==='JINGLE_CREATION'||/jingle|radio advert|audio advert/.test(both)) g=result('JINGLE_STARTER',['JINGLE_STARTER'],'Your brief is for a jingle / audio advertising deliverable.');
       else if(s==='VIDEO_MARKETING'||/video|reel|tiktok|promo clip|promotional clip/.test(both)) g=result('VIDEO_STARTER',['VIDEO_STARTER','SOCIAL_GROWTH','SOCIAL_PRO'],'Your brief is for video-marketing content.');
