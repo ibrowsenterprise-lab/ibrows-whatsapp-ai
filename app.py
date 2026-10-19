@@ -35618,6 +35618,19 @@ def cleanup_expired_data(force=False):
 # FRIENDLY GLOBAL LIMIT / THROTTLE RESPONSES
 # =========================================================
 
+@app.errorhandler(psycopg.OperationalError)
+@app.errorhandler(psycopg.InterfaceError)
+def temporary_database_unavailable(_error):
+    # Never replay writes: a disconnected commit can have an uncertain outcome.
+    app.logger.error("Temporary database connection failure", exc_info=True)
+    body = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Please try again shortly | IBROWS Enterprise</title></head><body style="font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;margin:0;background:#f6f8f7;color:#13231d"><main style="max-width:680px;margin:8vh auto;padding:24px"><div style="background:#fff;border:1px solid #dce8e2;border-radius:16px;padding:26px"><h1 style="margin-top:0">Temporarily unavailable</h1><p>We could not complete this request. Please wait a moment before trying again.</p><p>If you were submitting a form or uploading files, check for a confirmation or saved item before submitting again. A connection interruption can leave the result unconfirmed.</p><p>Use your browser Back button to return to the previous page, or <a href="/" style="color:#0f4c3a;font-weight:700">return to IBROWS Enterprise</a>.</p></div></main></body></html>"""
+    response = Response(body, status=503, mimetype="text/html")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Retry-After"] = "30"
+    return response
+
+
+
 @app.errorhandler(413)
 def request_entity_too_large(_error):
     body = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload too large | IBROWS Enterprise</title></head><body style="font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;margin:0;background:#f6f8f7;color:#13231d"><main style="max-width:680px;margin:8vh auto;padding:24px"><div style="background:#fff;border:1px solid #dce8e2;border-radius:16px;padding:26px"><h1 style="margin-top:0">Upload too large</h1><p>The selected files exceed the maximum size accepted in one request. Please return to the previous page and choose fewer or smaller files.</p><p>Use your browser Back button to return to the form, or <a href="/" style="color:#0f4c3a;font-weight:700">return to IBROWS Enterprise</a>.</p></div></main></body></html>"""
