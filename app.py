@@ -31045,9 +31045,9 @@ SERVICE_PRICING_PACKAGES = {
         {"code":"COMPANY_SETUP","name":"Company Setup Support","price":"from MK75,000 + official fees","summary":"Support for more involved company registration and setup.","features":["Registration coordination","Supporting-document review","Setup checklist"]},
     ],
     "PHOTO_RESTORATION": [
-        {"code":"RESTORE_5","name":"Memories 5","price":"MK15,000","summary":"Restore up to 5 old photographs while preserving identity.","features":["Up to 5 photos","Clarity/light-damage repair","HD delivery"]},
-        {"code":"RESTORE_10","name":"Memories 10","price":"MK25,000","summary":"Good-value restoration for a family photo set.","features":["Up to 10 photos","Restoration and enhancement","HD delivery"],"popular":True},
-        {"code":"RESTORE_20","name":"Archive 20","price":"MK45,000","summary":"For a larger family or historical collection.","features":["Up to 20 photos","Restoration and enhancement","HD delivery"]},
+        {"code":"RESTORE_5","name":"Memories 5","price":"MK25,000–50,000","summary":"Restoration of five photographs at MK5,000–10,000 per photo.","features":["5 photos","Identity preserved","HD delivery; final quote after review"]},
+        {"code":"RESTORE_10","name":"Memories 10","price":"MK50,000–100,000","summary":"Restoration of ten photographs at MK5,000–10,000 per photo.","features":["10 photos","Identity preserved","HD delivery; final quote after review"],"popular":True},
+        {"code":"RESTORE_20","name":"Archive 20","price":"MK100,000–200,000","summary":"Restoration of twenty photographs at MK5,000–10,000 per photo.","features":["20 photos","Identity preserved","HD delivery; final quote after review"]},
     ],
     "CLEANING": [
         {"code":"HOME_STANDARD","name":"Affordable Home Clean","price":"from MK30,000","summary":"Routine residential cleaning for a normally maintained home.","features":["General rooms","Floors and surfaces","Final scope confirmed after review"]},
@@ -31061,9 +31061,13 @@ SERVICE_PRICING_PACKAGES = {
     ],
     "DESIGN_BRANDING": [
         {"code":"SOCIAL_POST","name":"Social Graphic","price":"MK10,000","summary":"One clean social-media design.","features":["1 design","Platform-ready size","One revision"]},
-        {"code":"POSTER_FLYER","name":"Poster / Flyer","price":"MK15,000","summary":"Affordable promotional artwork for digital or print use.","features":["Custom layout","Client branding","One revision"],"popular":True},
+        {"code":"POSTER_FLYER","name":"Business Poster / Flyer","price":"MK10,000–20,000","summary":"One digital poster for your business, event or promotion.","features":["Custom layout","Client branding","One revision"],"popular":True},
         {"code":"CONTENT_STARTER","name":"Content Creation Starter","price":"from MK30,000","summary":"A small content bundle for a campaign, page or promotion.","features":["Content planning","Creative copy/visual direction","Scope confirmed from the brief"]},
-        {"code":"VIDEO_STARTER","name":"Video Marketing Starter","price":"from MK40,000","summary":"Short promotional video content for social or digital marketing.","features":["Short-form promotional edit","Brand/message integration","Platform-ready delivery"]},
+        {"code":"VIDEO_STARTER","name":"Promotional Video","price":"MK35,000–60,000","summary":"One 15–30-second promotional video.","features":["Brand/message integration","WhatsApp, Facebook or Instagram","Final quote after brief review"]},
+        {"code":"MEDIA_PROMO","name":"Starter Promotion Package","price":"MK50,000","summary":"One poster, one 15-second video and one social media caption.","features":["Poster + video + caption","One revision","English or Chichewa captions"]},
+        {"code":"PRODUCT_PHOTOS","name":"Product Photo Enhancement","price":"MK20,000–35,000","summary":"Five product images with improved lighting and backgrounds.","features":["5 product images","Products and branding preserved","Final quote after review"]},
+        {"code":"EVENT_TEASER","name":"Event Poster + Teaser","price":"MK35,000–60,000","summary":"One event poster and one short promotional teaser.","features":["Event poster","Short teaser","Final quote after brief review"]},
+        {"code":"MEDIA_MONTHLY","name":"Monthly Content Package","price":"MK120,000–180,000/month","summary":"Four posters and two short promotional videos per month.","features":["4 posters + 2 videos","Content production","Ad spend and page management separate"]},
         {"code":"JINGLE_STARTER","name":"Jingle Creation","price":"from MK50,000","summary":"A short branded advertising jingle or audio promotional piece.","features":["Creative concept","Branded audio production","Final audio delivery"]},
         {"code":"LOGO_STARTER","name":"Logo Starter","price":"MK30,000","summary":"A simple professional logo starting point.","features":["Logo concept","Basic colour direction","Core export files"]},
         {"code":"MINI_BRAND","name":"Logo + Mini Brand Kit","price":"MK60,000","summary":"A practical starter identity for a growing business.","features":["Logo concept","Colour/font direction","Basic brand assets"]},
@@ -31108,7 +31112,7 @@ SERVICE_PRICING_NOTES = {
     "CAREER_JOBS": "Employment, interviews and selection are never guaranteed. Applications are submitted only after the client approves the specific application.",
     "SCHOLARSHIPS": "Admission and scholarship awards are decided by institutions/funders. Research-heavy proposal work may require a separate quotation.",
     "BUSINESS_REGISTRATION": "IBROWS service fees do not include government/statutory registration fees or third-party charges unless a quotation expressly says so.",
-    "PHOTO_RESTORATION": "Packages are based on the number of source photos. Identity and original features are preserved by default.",
+    "PHOTO_RESTORATION": "Introductory rate: MK5,000–10,000 per photo, minimum five photos. Package ranges illustrate 5, 10 or 20 photos; your final quote uses the actual photo count and restoration complexity. Identity and original features are preserved by default.",
     "CLEANING": "Physical-service prices are starting guides; property size, condition, supplies, frequency and location can change the final quotation.",
     "CAR_WASH": "Prices shown are guides for standard vehicles; SUVs, trucks, severe dirt and special detailing may cost more.",
     "DESIGN_BRANDING": "Printing, paid advertising, talent/voice costs, premium music or stock licences and other third-party costs are separate unless stated in the quotation. Video and jingle prices are starting guides because duration and production complexity vary.",
@@ -31292,6 +31296,8 @@ def _service_package_guidance(service_key, payload=None, selected_code=None):
         design_type = raw_text("design_type", 300)
         quantity = raw_text("quantity", 160)
         combined = f"{design_type} {quantity}"
+        if selected_code in {"MEDIA_PROMO", "EVENT_TEASER", "MEDIA_MONTHLY"}:
+            return None
         if service_needed == "JINGLE_CREATION" or any(k in combined for k in ("jingle", "radio advert", "audio advert")):
             recommended = "JINGLE_STARTER"
             acceptable = {"JINGLE_STARTER"}
@@ -33201,6 +33207,11 @@ if(submittedReferenceButton){submittedReferenceButton.addEventListener('click',c
 
 def _render_service_request_page(service_key, error="", values=None):
     values = dict(values or {})
+    # Only accept known catalogue codes; a URL never supplies a price or payment state.
+    if request.method == "GET" and service_key in {"DESIGN_BRANDING", "PHOTO_RESTORATION"}:
+        package_code = _service_clean(request.args.get("package"), 80).upper()
+        if _service_pricing_package(service_key, package_code):
+            values.setdefault("package_choice", package_code)
     if request.method == "POST" and "package_choice" not in values:
         values["package_choice"] = _service_clean(request.form.get("package_choice"), 80).upper()
     config = {
@@ -34220,7 +34231,7 @@ SERVICE_PORTFOLIO_TEMPLATE = r"""
 {% if service_key=='DESIGN_BRANDING' %}
 <section id="media-pricing" class="services" aria-labelledby="media-pricing-title"><div class="wrap">
 <div class="section-head"><span class="eyebrow">IBROWS MEDIA</span><h2 id="media-pricing-title">Media services &amp; pricing</h2><p>Introductory prices in Malawi kwacha (MWK). Choose a service and tell us what you need.</p></div>
-<div class="service-grid"><article class="service-card"><h3 style="margin:0 0 10px;font-size:19px">Business poster</h3><strong style="color:var(--brand);font-size:21px">MK10,000–20,000</strong><p>One digital poster for your business, event or promotion.</p><a class="btn" href="{{ enquiry_url }}">Enquire now</a></article><article class="service-card"><h3 style="margin:0 0 10px;font-size:19px">Promotional video</h3><strong style="color:var(--brand);font-size:21px">MK35,000–60,000</strong><p>One 15–30-second video for WhatsApp, Facebook or Instagram.</p><a class="btn" href="{{ enquiry_url }}">Enquire now</a></article><article class="service-card"><h3 style="margin:0 0 10px;font-size:19px">Product photo enhancement</h3><strong style="color:var(--brand);font-size:21px">MK20,000–35,000</strong><p>Five product images with improved lighting and backgrounds; original products and branding preserved.</p><a class="btn" href="{{ enquiry_url }}">Enquire now</a></article><article class="service-card"><h3 style="margin:0 0 10px;font-size:19px">Old-photo restoration</h3><strong style="color:var(--brand);font-size:21px">MK5,000–10,000 per photo</strong><p>Clarity, lighting and damage repairs while preserving identity. Minimum five photographs.</p><a class="btn" href="/photo-restoration">Enquire now</a></article><article class="service-card"><h3 style="margin:0 0 10px;font-size:19px">Event poster + teaser</h3><strong style="color:var(--brand);font-size:21px">MK35,000–60,000</strong><p>One event poster and one short promotional teaser.</p><a class="btn" href="{{ enquiry_url }}">Enquire now</a></article><article class="service-card"><h3 style="margin:0 0 10px;font-size:19px">Monthly content package</h3><strong style="color:var(--brand);font-size:21px">MK120,000–180,000</strong><p>Four posters and two short promotional videos per month.</p><a class="btn" href="{{ enquiry_url }}">Enquire now</a></article></div><div class="service-card" style="margin-top:18px;background:var(--soft)"><h3 style="margin-top:0">Starter promotion package · MK50,000</h3><p>One business poster, one 15-second promotional video and one social media caption. Includes one revision.</p><a class="btn primary" href="{{ enquiry_url }}">Request the MK50,000 package</a></div><p style="color:var(--muted)">Final quotations depend on the brief, complexity and supplied materials. Advertising spend and printing are quoted separately. English or Chichewa captions available. Include your preferred package in the enquiry.</p></div></section>
+<div class="service-grid">{% for package in media_packages %}<article class="service-card"><h3 style="margin:0 0 10px;font-size:19px">{{ package.name }}</h3><strong style="color:var(--brand);font-size:21px">{{ package.price }}</strong><p>{{ package.summary }}</p><a class="btn" href="{{ url_for('design_branding_service', package=package.code) }}">Enquire now</a></article>{% endfor %}<article class="service-card"><h3 style="margin:0 0 10px;font-size:19px">Old-photo restoration</h3><strong style="color:var(--brand);font-size:21px">MK5,000–10,000 per photo</strong><p>Clarity, lighting and damage repairs while preserving identity. Minimum five photographs.</p><a class="btn" href="{{ url_for('photo_restoration_service', package='RESTORE_5') }}">Enquire now</a></article></div><div class="service-card" style="margin-top:18px;background:var(--soft)"><h3 style="margin-top:0">{{ media_starter.name }} · {{ media_starter.price }}</h3><p>{{ media_starter.summary }} Includes one revision.</p><a class="btn primary" href="{{ url_for('design_branding_service', package=media_starter.code) }}">Request the MK50,000 package</a></div><p style="color:var(--muted)">Final quotations depend on the brief, complexity and supplied materials. Advertising spend and printing are quoted separately. English or Chichewa captions available. Your selected package is carried into the enquiry for you to review.</p></div></section>
 {% endif %}
 <section id="portfolio" class="gallery-section"><div class="wrap"><div class="section-head"><h2>{{ config.title }} portfolio</h2><p>{% if service_key=='DESIGN_BRANDING' %}Browse image samples below, then continue to video and audio examples where available.{% else %}Tap any image to view it at full size. Captions identify service illustrations and actual work where applicable.{% endif %}</p>{% if total_images > images|length %}<p>Showing {{ images|length }} of {{ total_images }} images to keep the first page quick on mobile.</p>{% endif %}</div>{% if images %}<div class="gallery">{% for image in images %}<a class="photo" href="{{ url_for('service_portfolio_media', asset_id=image.id) }}" target="_blank" rel="noopener"><img loading="{{ 'eager' if loop.first else 'lazy' }}" decoding="async" fetchpriority="{{ 'high' if loop.first else 'low' }}" src="{{ url_for('service_portfolio_media', asset_id=image.id, preview='1') }}" alt="{{ image.alt_text or image.caption or config.title }}"><div class="copy"><strong>{{ image.caption or config.title + ' work' }}</strong><span>Tap to enlarge</span></div></a>{% endfor %}</div>{% if total_images > images|length %}<div style="margin-top:20px"><a class="btn" href="{{ request.path }}?all=1#portfolio">View all {{ total_images }} images</a></div>{% elif show_all and total_images > 12 %}<div style="margin-top:20px"><a class="btn" href="{{ request.path }}#portfolio">Show fewer images</a></div>{% endif %}{% elif not videos and not audios %}<div class="empty">{{ config.empty }}</div>{% endif %}</div></section>
 {% if service_key=='DESIGN_BRANDING' and videos %}<section class="media-section"><div class="wrap"><div class="section-head"><h2>Video marketing & content samples</h2><p>Short examples of promotional video, social content and campaign media produced or prepared by IBROWS.</p></div><div class="video-grid">{% for item in videos %}<article class="media-card"><video controls preload="metadata" playsinline><source src="{{ url_for('service_portfolio_media', asset_id=item.id) }}" type="{{ item.mime_type }}">Your browser does not support this video.</video><div class="copy"><strong>{{ item.caption or 'IBROWS video sample' }}</strong><span>{{ item.size_label }}</span></div></article>{% endfor %}</div></div></section>{% endif %}
@@ -34478,6 +34489,9 @@ def _render_service_portfolio(service_key):
         SERVICE_PORTFOLIO_TEMPLATE,
         service_key=service_key, config=config, images=images, total_images=len(all_images), show_all=show_all, videos=videos, audios=audios,
         comparison_pairs=comparison_pairs, preview_url=preview_url,
+        media_packages=[_service_pricing_package("DESIGN_BRANDING", code) for code in
+                        ("POSTER_FLYER", "VIDEO_STARTER", "PRODUCT_PHOTOS", "EVENT_TEASER", "MEDIA_MONTHLY")],
+        media_starter=_service_pricing_package("DESIGN_BRANDING", "MEDIA_PROMO"),
         whatsapp_url=whatsapp_url, enquiry_url=enquiry_url, year=datetime.now(ADMIN_TIMEZONE).year,
     ), 200
 
