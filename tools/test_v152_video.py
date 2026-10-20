@@ -3,6 +3,8 @@ from pathlib import Path
 import ast
 import subprocess
 import tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import imageio_ffmpeg
 from media_video_compression import compress_portfolio_video, MAX_INPUT_BYTES, MAX_OUTPUT_BYTES
