@@ -1,0 +1,44 @@
+name: V152 build and test media video compression
+on:
+  push:
+    branches: [feature/media-video-compression-v152]
+    paths:
+      - tools/apply_v152_video.py
+      - media_video_compression.py
+      - tools/test_v152_video.py
+      - requirements.txt
+      - .github/workflows/v152-build.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  compression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python requirements
+        run: python -m pip install -r requirements.txt
+      - name: Apply safe targeted V152 source transformation
+        run: python tools/apply_v152_video.py
+      - name: Compile and test real video compression
+        run: |
+          python -m py_compile app.py media_video_compression.py
+          python tools/test_v152_video.py
+          python tools/test_msj_store.py
+          python tools/test_msj_garments.py
+          python tools/test_v139_client_submission.py
+      - name: Commit verified generated app only on review branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'V152 wire automatic compression into IBROWS Media video upload'
+            git push origin HEAD:feature/media-video-compression-v152
+          fi
