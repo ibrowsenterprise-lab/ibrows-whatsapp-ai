@@ -1,0 +1,19 @@
+name: IBROWS 20 October read-only live audit
+on:
+  push:
+    branches: [audit/ibrows-daily-20261020]
+    paths: ['.github/workflows/ibrows-daily-20261020.yml','tools/audit_daily_20261020.py']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run 31-route live visitor audit and Media security checks
+        run: python tools/audit_daily_20261020.py
