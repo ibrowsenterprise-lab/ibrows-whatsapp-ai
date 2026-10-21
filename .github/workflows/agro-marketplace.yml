@@ -1,7 +1,7 @@
 name: Agriculture marketplace integration and regression gate
 on:
   push:
-    branches: [feature/agro-managed-marketplace]
+    branches: [feature/agro-managed-marketplace, fix/agro-quantity-display]
     paths:
       - agro_marketplace.py
       - agro_marketplace_schema.sql
@@ -68,5 +68,5 @@ jobs:
           git add app.py
           if ! git diff --cached --quiet; then
             git commit -m 'Integrate tested IBROWS-managed agriculture marketplace'
-            git push origin HEAD:feature/agro-managed-marketplace
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
