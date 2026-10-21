@@ -1,13 +1,15 @@
 name: Agriculture marketplace integration and regression gate
 on:
   push:
-    branches: [feature/agro-managed-marketplace, fix/agro-quantity-display]
+    branches: [feature/agro-managed-marketplace, fix/agro-quantity-display, feature/agro-professional-ui]
     paths:
       - agro_marketplace.py
+      - agro_marketplace_ui.py
       - agro_marketplace_schema.sql
       - migrations/agro_marketplace_v1.sql
       - tests/test_agro_postgres.py
       - tests/test_marketplace.py
+      - tests/test_agro_ui.py
       - tests/test_agro_marketplace_contract.py
       - tools/integrate_agro_marketplace.py
       - .github/workflows/agro-marketplace.yml
@@ -49,8 +51,8 @@ jobs:
         run: python tools/integrate_agro_marketplace.py
       - name: Compile and run marketplace tests against disposable PostgreSQL 18
         run: |
-          python -m py_compile app.py agro_marketplace.py
-          python -m pytest tests/test_marketplace.py tests/test_agro_marketplace_contract.py tests/test_agro_postgres.py -v
+          python -m py_compile app.py agro_marketplace.py agro_marketplace_ui.py
+          python -m pytest tests/test_marketplace.py tests/test_agro_marketplace_contract.py tests/test_agro_postgres.py tests/test_agro_ui.py -v
       - name: Existing customer services, MSJ, discovery and media regression tests
         run: |
           python tools/test_v139_client_submission.py
