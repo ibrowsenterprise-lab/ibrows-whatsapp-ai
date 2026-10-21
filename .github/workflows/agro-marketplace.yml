@@ -1,0 +1,72 @@
+name: Agriculture marketplace integration and regression gate
+on:
+  push:
+    branches: [feature/agro-managed-marketplace]
+    paths:
+      - agro_marketplace.py
+      - agro_marketplace_schema.sql
+      - migrations/agro_marketplace_v1.sql
+      - tests/test_agro_postgres.py
+      - tests/test_marketplace.py
+      - tests/test_agro_marketplace_contract.py
+      - tools/integrate_agro_marketplace.py
+      - .github/workflows/agro-marketplace.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  marketplace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: ibrows_test
+          POSTGRES_PASSWORD: disposable_test_password
+          POSTGRES_DB: ibrows_marketplace_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ibrows_test -d ibrows_marketplace_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DATABASE_URL: postgresql://ibrows_test:disposable_test_password@localhost:5432/ibrows_marketplace_test
+      IBROWS_ALLOW_INCOMPLETE_CONFIG: '1'
+      FLASK_SECRET_KEY: disposable-integration-test-secret
+      OPENAI_API_KEY: sk-test-only-no-external-api
+      ADMIN_USERNAME: integration-test-admin
+      ADMIN_PASSWORD: disposable-admin-password
+      META_APP_SECRET: disposable-meta-secret
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt pytest
+      - name: Integrate without changing existing service functions
+        run: python tools/integrate_agro_marketplace.py
+      - name: Compile and run marketplace tests against disposable PostgreSQL 18
+        run: |
+          python -m py_compile app.py agro_marketplace.py
+          python -m pytest tests/test_marketplace.py tests/test_agro_marketplace_contract.py tests/test_agro_postgres.py -v
+      - name: Existing customer services, MSJ, discovery and media regression tests
+        run: |
+          python tools/test_v139_client_submission.py
+          python tools/test_msj_store.py
+          python tools/test_msj_garments.py
+          python tools/test_msj_order_mocked.py
+          python tools/test_msj_bulk_publish.py
+          python tools/test_msj_review_admin.py
+          python tools/test_v139_project_discovery.py
+          python tools/test_v152_video.py
+      - name: Record verified application on review branch only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'Integrate tested IBROWS-managed agriculture marketplace'
+            git push origin HEAD:feature/agro-managed-marketplace
+          fi
