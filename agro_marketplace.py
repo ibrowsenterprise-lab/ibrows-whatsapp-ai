@@ -6,8 +6,15 @@ from flask import current_app
 from flask import Blueprint, abort, redirect, render_template_string, request, url_for
 
 
+def format_quantity(value):
+    """Remove padding zeros while preserving fractional stock and whole-number zeros."""
+    text = format(Decimal(str(value)), 'f')
+    return text.rstrip('0').rstrip('.') if '.' in text else text
+
+
 def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, validate_csrf, rate_limit=None, client_ip=None, reference_for_id=None, alert=None):
     bp = Blueprint('agro_marketplace', __name__)
+    bp.add_app_template_filter(format_quantity, 'agro_quantity')
 
     @bp.before_request
     def protect_marketplace():
@@ -43,7 +50,7 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
         <style>body{font:16px system-ui;background:#f4f8f5;color:#102d23;margin:0}main{max-width:1000px;margin:auto;padding:22px}a{color:#07533c}article{background:white;border:1px solid #dbe6df;border-radius:14px;padding:18px;margin:12px 0}input,button{padding:12px;margin:5px}button,.action{display:inline-block;background:#07533c;color:white;border:0;border-radius:8px;padding:12px;text-decoration:none}</style>
         <main><a href="/agriculture">← Agriculture</a><h1>Available Farm Produce</h1><p>IBROWS coordinates all buyer enquiries. Availability and final prices are confirmed before a transaction.</p>
         <form method="get"><input name="commodity" aria-label="Commodity" placeholder="Commodity" value="{{ commodity }}"><input name="location" aria-label="Location" placeholder="District or location" value="{{ location }}"><button>Search</button></form>
-        {% for p in rows %}<article><h2>{{p[1]}}</h2><p>{{p[2] or ''}}</p><p>{{p[3]}} {{p[4]}} · {{p[7]}}</p><p>{% if p[5] is not none %}MK {{'{:,.0f}'.format(p[5])}} / {{p[6] or p[4]}}{% else %}Price on enquiry{% endif %}</p><p>{{p[8] or ''}}</p><a class="action" href="{{ url_for('agro_marketplace.buyer_enquiry', listing_id=p[0]) }}">Enquire through IBROWS</a></article>{% else %}<p>No approved produce listings available yet.</p>{% endfor %}</main></html>''', rows=rows, commodity=commodity, location=location)
+        {% for p in rows %}<article><h2>{{p[1]}}</h2><p>{{p[2] or ''}}</p><p>{{p[3]|agro_quantity}} {{p[4]}} · {{p[7]}}</p><p>{% if p[5] is not none %}MK {{'{:,.0f}'.format(p[5])}} / {{p[6] or p[4]}}{% else %}Price on enquiry{% endif %}</p><p>{{p[8] or ''}}</p><a class="action" href="{{ url_for('agro_marketplace.buyer_enquiry', listing_id=p[0]) }}">Enquire through IBROWS</a></article>{% else %}<p>No approved produce listings available yet.</p>{% endfor %}</main></html>''', rows=rows, commodity=commodity, location=location)
 
     @bp.route('/agriculture/marketplace/<int:listing_id>/enquire', methods=['GET','POST'])
     def buyer_enquiry(listing_id):
@@ -178,7 +185,7 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
             cur.execute('''SELECT id,commodity,quantity,quantity_unit,location,status,created_at
                            FROM agro_marketplace_listings ORDER BY created_at DESC LIMIT 100''')
             rows=cur.fetchall()
-        return render_template_string('''<meta name="viewport" content="width=device-width,initial-scale=1"><main style="font:16px system-ui;max-width:950px;margin:auto"><a href="/admin/service-requests">Buyer enquiries and service requests</a><h1>Agro listings moderation</h1><p>Approval publishes the listing publicly. Confirm seller permission, current stock, and price before approving.</p>{% for p in rows %}<section style="padding:12px;border-bottom:1px solid #ddd"><strong>#{{p[0]}} {{p[1]}}</strong> — {{p[2]}} {{p[3]}} — {{p[4]}} — {{p[5]}}<form method="post"><input type="hidden" name="csrf_token" value="{{csrf}}"><input type="hidden" name="listing_id" value="{{p[0]}}"><label>Remaining stock <input name="quantity" type="number" min="0" step="0.001" value="{{p[2]}}"></label><select name="status">{% for s in ['APPROVED','REJECTED','PAUSED','SOLD_OUT'] %}<option value="{{s}}"{% if s==p[5] %} selected{% endif %}>{{s}}</option>{% endfor %}</select><button>Update</button></form></section>{% else %}<p>No listings yet.</p>{% endfor %}</main>''',rows=rows,csrf=get_csrf_token())
+        return render_template_string('''<meta name="viewport" content="width=device-width,initial-scale=1"><main style="font:16px system-ui;max-width:950px;margin:auto"><a href="/admin/service-requests">Buyer enquiries and service requests</a><h1>Agro listings moderation</h1><p>Approval publishes the listing publicly. Confirm seller permission, current stock, and price before approving.</p>{% for p in rows %}<section style="padding:12px;border-bottom:1px solid #ddd"><strong>#{{p[0]}} {{p[1]}}</strong> — {{p[2]|agro_quantity}} {{p[3]}} — {{p[4]}} — {{p[5]}}<form method="post"><input type="hidden" name="csrf_token" value="{{csrf}}"><input type="hidden" name="listing_id" value="{{p[0]}}"><label>Remaining stock <input name="quantity" type="number" min="0" step="0.001" value="{{p[2]|agro_quantity}}"></label><select name="status">{% for s in ['APPROVED','REJECTED','PAUSED','SOLD_OUT'] %}<option value="{{s}}"{% if s==p[5] %} selected{% endif %}>{{s}}</option>{% endfor %}</select><button>Update</button></form></section>{% else %}<p>No listings yet.</p>{% endfor %}</main>''',rows=rows,csrf=get_csrf_token())
     return bp
 
 

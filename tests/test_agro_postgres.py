@@ -47,6 +47,7 @@ def test_seed_privacy_filter_and_html_escape(live):
     r=c.get('/agriculture/marketplace')
     assert r.status_code==200
     assert b'MK 52,000' in r.data and b'White maize' in r.data
+    assert b'50 50 kg bags' in r.data and b'50.000' not in r.data
     assert b'Area 25 Sector 4, Lilongwe' in r.data
     for secret in (b'PRIVATE SELLER',b'999123456',b'seller_phone',b'seller_name'):
         assert secret not in r.data
@@ -89,6 +90,8 @@ def test_admin_csrf_stock_and_seed_does_not_republish(live):
     assert c.get('/admin/agro-marketplace').status_code==302
     assert c.post('/admin/agro-marketplace',data={'listing_id':id,'status':'APPROVED'}).status_code==302
     form=admin(c)
+    page=c.get('/admin/agro-marketplace')
+    assert b'value="50"' in page.data and b'50.000' not in page.data
     assert c.post('/admin/agro-marketplace',data={'listing_id':id,'status':'APPROVED'}).status_code==403
     response=c.post('/admin/agro-marketplace',data={**form,'listing_id':id,'quantity':'0','status':'APPROVED'})
     assert response.status_code==302
