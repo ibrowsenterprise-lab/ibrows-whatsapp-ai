@@ -47,7 +47,8 @@ def test_seed_privacy_filter_and_html_escape(live):
     r=c.get('/agriculture/marketplace')
     assert r.status_code==200
     assert b'MK 52,000' in r.data and b'White maize' in r.data
-    assert b'50 50 kg bags' in r.data and b'50.000' not in r.data
+    assert b'50 bags available' in r.data and b'50 kg per bag' in r.data
+    assert b'50 50 kg bags' not in r.data and b'50.000' not in r.data
     assert b'Area 25 Sector 4, Lilongwe' in r.data
     for secret in (b'PRIVATE SELLER',b'999123456',b'seller_phone',b'seller_name'):
         assert secret not in r.data
