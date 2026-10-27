@@ -21894,6 +21894,21 @@ def send_whatsapp_message(recipient, message):
         print(f"WhatsApp send status: {response.status_code}", flush=True)
         if not success:
             print("WhatsApp send failed with non-success HTTP status.", flush=True)
+            # Only log numeric Graph error identifiers. The response message can
+            # contain sensitive account or recipient details and must stay private.
+            try:
+                graph_error = response.json().get("error", {})
+                if not isinstance(graph_error, dict):
+                    graph_error = {}
+                codes = []
+                for key in ("code", "error_subcode"):
+                    value = graph_error.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        codes.append(f"{key}={value}")
+                if codes:
+                    print("WhatsApp Graph error: " + " ".join(codes), flush=True)
+            except (ValueError, AttributeError, TypeError):
+                pass
         return success
     except requests.RequestException as error:
         print(f"WhatsApp send error: {type(error).__name__}", flush=True)
@@ -28338,6 +28353,8 @@ def claim_whatsapp_message(message_id, customer_number):
             conn.commit()
             if reclaimed and has_outbox:
                 return "RETRY_REPLY",f"__IBROWS_OUTBOX__:{message_id}"
+            if reclaimed and reply_text:
+                return "RETRY_REPLY",reply_text
             return ("PROCESS",None) if reclaimed else ("IGNORE",None)
 
 
