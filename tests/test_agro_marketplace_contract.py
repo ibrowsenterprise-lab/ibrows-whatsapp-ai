@@ -8,4 +8,9 @@ def test_existing_application_functions_and_routes_are_preserved():
     def functions(tree):
         return {n.name:ast.dump(n,include_attributes=False) for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))}
     before,after=functions(old),functions(new)
-    assert before=={key:after[key] for key in before}
+    # WhatsApp retry recovery is deliberately revised and covered separately.
+    # Continue guarding all other pre-marketplace functions against changes.
+    allowed_changes = {'claim_whatsapp_message'}
+    assert {k:v for k,v in before.items() if k not in allowed_changes} == {
+        k:after[k] for k in before if k not in allowed_changes
+    }
