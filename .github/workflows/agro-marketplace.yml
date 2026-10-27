@@ -52,7 +52,7 @@ jobs:
       - name: Compile and run marketplace tests against disposable PostgreSQL 18
         run: |
           python -m py_compile app.py agro_marketplace.py agro_marketplace_ui.py
-          python -m pytest tests/test_marketplace.py tests/test_agro_marketplace_contract.py tests/test_agro_postgres.py tests/test_agro_ui.py -v
+          python -m pytest tests/test_marketplace.py tests/test_agro_marketplace_contract.py tests/test_agro_postgres.py tests/test_agro_ui.py tests/test_whatsapp_diagnostics_isolated.py tests/test_whatsapp_postgres.py -v
       - name: Existing customer services, MSJ, discovery and media regression tests
         run: |
           python tools/test_v139_client_submission.py
