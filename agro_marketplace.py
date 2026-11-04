@@ -141,6 +141,12 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
                 abort(400, 'Invalid source quantity')
             if not commodity or not location or not unit or not qty.is_finite() or not 0 < qty < Decimal('10000000000000'):
                 abort(400, 'Incomplete source listing')
+            # Never turn a mixed-variety request into one misleading public price.
+            # A seller must confirm stock per variety before separate listings are made.
+            source_grade = str(data.get('variety_grade') or '').lower()
+            source_price = str(data.get('target_price') or '').lower()
+            if ('/' in source_grade or ('white' in source_price and 'brown' in source_price)):
+                abort(409, 'Multiple varieties or prices detected. Confirm stock per variety before creating listings.')
             price_text = request.form.get('price_mwk', '').strip()
             try:
                 price = Decimal(price_text)
