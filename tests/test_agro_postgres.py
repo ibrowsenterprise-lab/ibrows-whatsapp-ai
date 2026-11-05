@@ -23,6 +23,7 @@ def live(application, monkeypatch):
     with a.get_db() as conn, conn.cursor() as c:
         c.execute('DELETE FROM public_rate_limits')
         c.execute('DELETE FROM agro_marketplace_buyer_enquiries')
+        c.execute('DELETE FROM agro_marketplace_listing_sources')
         c.execute('DELETE FROM agro_marketplace_listings')
         c.execute('DELETE FROM website_service_requests')
         c.execute("""INSERT INTO website_service_requests(id,reference,service_key,full_name,phone,payload)
@@ -118,7 +119,8 @@ def test_existing_public_services_and_navigation(live):
     a,c=live
     for path in ['/','/agriculture','/career-jobs','/scholarships-opportunities','/business-registration','/business-email','/cleaning','/car-wash','/construction','/fumigation','/landscaping','/design-branding','/photo-restoration','/project-discovery','/team','/privacy','/terms','/msj']:
         assert c.get(path).status_code in (200,302),path
-    assert b'/agriculture/marketplace' in c.get('/agriculture').data
+    assert c.get('/agriculture').headers['Location'].endswith('/agriculture/marketplace')
+    assert c.get('/agriculture?sell=1').status_code==200
     assert c.post('/webhook',json={}).status_code in (403,503)
 
 def test_marketplace_failure_does_not_disable_existing_services(live):
@@ -126,5 +128,5 @@ def test_marketplace_failure_does_not_disable_existing_services(live):
     a.app.config['AGRO_MARKETPLACE_READY']=False
     try:
         assert c.get('/agriculture/marketplace').status_code==503
-        assert c.get('/agriculture').status_code==200
+        assert c.get('/agriculture?sell=1').status_code==200
     finally: a.app.config['AGRO_MARKETPLACE_READY']=True

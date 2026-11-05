@@ -20,6 +20,7 @@ class Form(dict):
 class Upload:
     filename="site.jpeg"
 class Request:
+    args={"sell":"1"}
     method="GET"
     form=Form()
     files={"site_photo":Upload()}
