@@ -237,7 +237,7 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
             validate_csrf()
             listing_id = request.form.get('listing_id',type=int)
             status = request.form.get('status','')
-            if not listing_id or status not in ('APPROVED','REJECTED','PAUSED','SOLD_OUT'):
+            if not listing_id or status not in ('PENDING','APPROVED','REJECTED','PAUSED','SOLD_OUT'):
                 abort(400)
             quantity = request.form.get('quantity', '').strip()
             try:
