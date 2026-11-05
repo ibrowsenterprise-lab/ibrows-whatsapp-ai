@@ -32999,6 +32999,11 @@ SERVICE_REQUEST_TEMPLATE = r"""
 <div><label>Expected / target price (optional)</label><input name="target_price" maxlength="160" value="{{ values.get('target_price','') }}" placeholder="e.g. MK... per kg / per bag"></div>
 <div><label>Transport available?</label><select name="transport_available"><option value="">Not specified</option>{% for value,label in [('YES','Yes'),('NO','No'),('DISCUSS','To be discussed')] %}<option value="{{ value }}"{% if values.get('transport_available')==value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
 <div><label>Packaging (optional)</label><input name="packaging" maxlength="180" value="{{ values.get('packaging','') }}" placeholder="e.g. 50 kg bags / loose / buyer packaging"></div>
+<div class="full"><details><summary style="cursor:pointer;padding:14px 0;font-weight:700">Selling several varieties or pack sizes?</summary><p class="note">Enter every variety below, including the first one, with its own quantity and price. Leave these rows empty for a single product. IBROWS reviews your request before publishing.</p>
+<div id="seller-variety-rows">{% set names=request.form.getlist('variant_name') %}{% set count=[names|length,2]|max %}{% for i in range(count) %}<fieldset style="min-width:0;border:1px solid #d8e2da;border-radius:10px;padding:14px;margin:12px 0"><legend>Variety {{loop.index}}</legend><div class="grid">
+{% for key,label,kind in [('variant_name','Variety / pack name','text'),('variant_quantity','Available quantity','number'),('variant_unit','Quantity unit (e.g. kg)','text'),('variant_price','Price in MWK','number'),('variant_price_unit','Price per (e.g. kg)','text')] %}<div><label>{{label}}<input name="{{key}}" type="{{kind}}"{% if kind=='number' %} min="0.001" step="any" inputmode="decimal"{% endif %} maxlength="150" value="{{request.form.getlist(key)[i] if i < request.form.getlist(key)|length else ''}}"></label></div>{% endfor %}</div></fieldset>{% endfor %}</div>
+<button type="button" id="seller-add-variety">+ Add variety</button></details></div>
+<script>document.addEventListener('DOMContentLoaded',function(){const rows=document.getElementById('seller-variety-rows'),add=document.getElementById('seller-add-variety');if(!rows)return;add.addEventListener('click',function(){if(rows.children.length>=20)return;const row=rows.children[0].cloneNode(true);row.querySelector('legend').textContent='Variety '+(rows.children.length+1);row.querySelectorAll('input').forEach(i=>i.value='');rows.appendChild(row);row.querySelector('input').focus();add.disabled=rows.children.length>=20;});});</script>
 <div class="full"><label>Anything else about quality, moisture, collection or delivery? (optional)</label><textarea name="notes" maxlength="3000">{{ values.get('notes','') }}</textarea></div>
 <div class="full note">Submitting this form does not mean IBROWS has accepted a purchase or sale. A transaction is confirmed only after both sides agree on produce, quantity, quality, price and collection/delivery arrangements.</div>
 {% endif %}
@@ -34079,6 +34084,8 @@ def fumigation_service():
 @app.route("/agriculture", methods=["GET", "POST"])
 def agriculture_service():
     service_key = "AGRICULTURE"
+    if request.method == "GET" and request.args.get("sell") != "1" and not request.args.get("submitted"):
+        return redirect(url_for("agro_marketplace.catalogue"))
     if request.method == "GET":
         return _render_service_request_page(service_key), 200
     validate_public_service_csrf(service_key)
@@ -34139,6 +34146,22 @@ def agriculture_service():
             "notes": _service_clean_multiline(request.form.get("notes"), 3000),
             "trade_status": "Enquiry only — transaction not yet accepted",
         }
+        from werkzeug.datastructures import MultiDict
+        variant_keys = ('variant_name','variant_quantity','variant_unit','variant_price','variant_price_unit')
+        variant_columns = [request.form.getlist(k) for k in variant_keys]
+        supplied = MultiDict()
+        if len({len(column) for column in variant_columns}) != 1:
+            raise ValueError('Incomplete variety details.')
+        for row in zip(*variant_columns):
+            if any(value.strip() for value in row):
+                for key,value in zip(variant_keys,row): supplied.add(key,value)
+        if supplied:
+            from agro_marketplace import parse_variants
+            options = parse_variants(supplied)
+            payload['product_options'] = options
+            # Retain a readable summary in the existing admin and email views.
+            summary = '\n'.join(f"{v['name']}: {v['quantity']} {v['unit']} at MK {v['price']} per {v['price_unit']}" for v in options)
+            payload['notes'] = (payload['notes'] + '\nVarieties supplied:\n' + summary).strip()
         ref = _create_website_service_request(service_key, full_name, phone, email, payload)
         return redirect(url_for("agriculture_service", submitted=ref))
     except ValueError as exc:

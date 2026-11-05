@@ -9,8 +9,9 @@ def test_existing_application_functions_and_routes_are_preserved():
         return {n.name:ast.dump(n,include_attributes=False) for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))}
     before,after=functions(old),functions(new)
     # WhatsApp retry recovery is deliberately revised and covered separately.
+    # Agriculture now opens the catalogue and validates structured varieties; integration tests cover both.
     # Continue guarding all other pre-marketplace functions against changes.
-    allowed_changes = {'claim_whatsapp_message'}
+    allowed_changes = {'claim_whatsapp_message', 'agriculture_service'}
     assert {k:v for k,v in before.items() if k not in allowed_changes} == {
         k:after[k] for k in before if k not in allowed_changes
     }

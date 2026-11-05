@@ -15,6 +15,7 @@ class Cursor:
         self.db.queries.append((sql,params))
         if 'FROM website_service_requests WHERE id=' in sql:
             self.row=(10,'IBR-SR-2026-0010','AGRICULTURE',{'commodity':'maize','location':'Area 25 Sector 4','quantity':'50','quantity_unit':'50 kg bags','variety_grade':'white'})
+        elif 'FROM agro_marketplace_listings WHERE source_request_id=' in sql: self.row=None
         elif 'INSERT INTO agro_marketplace_listings' in sql: self.row=(7,)
         elif 'FROM agro_marketplace_listings' in sql and 'WHERE status=' in sql: self.rows=self.db.public_rows
         elif 'FROM agro_marketplace_listings' in sql: self.row=(7,'maize')
