@@ -270,7 +270,7 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
 
 
 def initialize_marketplace(get_db):
-    """Atomic, additive migration. Never alters or deletes existing service records.
+    """Atomic setup and authorized corrections; preserves existing service records.
 
     Bounded locks and one transaction ensure a failed rollout leaves the old
     application intact. Idempotent seed never republishes moderated stock.
@@ -281,6 +281,7 @@ def initialize_marketplace(get_db):
         cur.execute("SELECT pg_advisory_xact_lock(20261021, 10)")
         cur.execute((Path(__file__).parent / 'migrations/agro_marketplace_v1.sql').read_text())
         cur.execute((Path(__file__).parent / 'migrations/agro_marketplace_varieties.sql').read_text())
+        cur.execute((Path(__file__).parent / 'migrations/agro_rice_units_20261105.sql').read_text())
         cur.execute("""INSERT INTO agro_marketplace_listings
             (source_request_id,seller_name,seller_phone,commodity,variety_grade,quantity,
              quantity_unit,price_mwk,price_unit,location,status,reviewed_at)
