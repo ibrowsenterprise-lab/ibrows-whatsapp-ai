@@ -6,7 +6,9 @@ import re
 import unittest
 from pathlib import Path
 from jinja2 import Environment
-from crm_quality import MARKER, improve_crm_template, install_crm_improvements
+from decimal import Decimal
+from crm_quality import (MARKER, improve_crm_template, install_crm_improvements,
+                         _can_convert_to_eligibility, install_eligibility_package_support)
 
 APP_SOURCE = Path(__file__).resolve().parents[1].joinpath("app.py").read_text(encoding="utf-8")
 match = re.search(r'CUSTOMER_CRM_TEMPLATE = """(.*?)"""', APP_SOURCE, re.S)
@@ -69,6 +71,56 @@ class TestCustomerCRM(unittest.TestCase):
         self.assertIn("Reply in IBROWS inbox", html)
         self.assertIn("TEST_CSRF_NOT_A_REAL_SECRET", html)
         self.assertNotIn('name="payment_confirmed"', html)
+
+    def test_one_off_conversion_refuses_existing_payments_and_monthly_quotes(self):
+        clean = ("265999000111", "Scholarship Search", "NEW", None, None, None,
+                 None, "MWK", "NOT_STARTED")
+        self.assertTrue(_can_convert_to_eligibility(clean, False, False))
+        self.assertFalse(_can_convert_to_eligibility(clean, True, False))
+        self.assertFalse(_can_convert_to_eligibility(clean, False, True))
+        self.assertFalse(_can_convert_to_eligibility(
+            clean[:1] + ("Scholarship Eligibility Check",) + clean[2:], False, False))
+        self.assertFalse(_can_convert_to_eligibility(
+            clean[:6] + (Decimal("60000"),) + clean[7:], False, False))
+        self.assertFalse(_can_convert_to_eligibility(
+            clean[:8] + ("ACCEPTED",), False, False))
+        self.assertFalse(_can_convert_to_eligibility(
+            clean[:2] + ("CLOSED",) + clean[3:], False, False))
+
+    def test_eligibility_package_price_and_ai_context_are_separate(self):
+        from flask import Flask
+        app = Flask("ibrows-oneoff-service-test")
+        prices = {"Scholarship Search": Decimal("60000")}
+        context = lambda number: [{"role": "user",
+            "content": "- Scholarship Eligibility Check: PAID; verified received MWK 5,000; required MWK 5,000."}]
+        def old_canonical(service):
+            return {"scholarship search":"Scholarship Search"}.get(
+                str(service).lower(), service)
+        fake_ns = {
+            "CAREER_SERVICE_DEFAULT_PRICES_MWK": prices,
+            "get_db": lambda: None,
+            "admin_required": lambda fn: fn,
+            "validate_csrf": lambda: None,
+            "_safe_admin_return_path": lambda p: p or "/admin/leads",
+            "_activity_insert": lambda *args: None,
+            "canonicalize_service": old_canonical,
+            "build_verified_payment_context": context,
+        }
+        self.assertTrue(install_eligibility_package_support(app, fake_ns))
+        self.assertEqual(prices["Scholarship Search"], Decimal("60000"))
+        self.assertEqual(prices["Scholarship Eligibility Check"], Decimal("5000"))
+        self.assertEqual(fake_ns["canonicalize_service"]("scholarship eligibility check"),
+                         "Scholarship Eligibility Check")
+        self.assertEqual(fake_ns["canonicalize_service"]("scholarship search"),
+                         "Scholarship Search")
+        text = fake_ns["build_verified_payment_context"]("265999000111")[0]["content"]
+        self.assertIn("one-off", text.lower())
+        self.assertIn("NOT the MK60,000/month", text)
+        self.assertIn("crm_convert_scholarship_eligibility", app.view_functions)
+        rules = [r for r in app.url_map.iter_rules()
+                 if r.endpoint == "crm_convert_scholarship_eligibility"]
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].methods - {"OPTIONS"}, {"POST"})
 
     def test_unexpected_template_fails_safely(self):
         with self.assertRaises(ValueError):
