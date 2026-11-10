@@ -60,3 +60,14 @@ for lo,hi in [(13940,14049),(16060,16122),(11670,11732),
         if any(w in line.lower() for w in ("api_key","secret","authorization","access_token","password")):
             line="[sensitive omitted]"
         print(f"{i:05d} {line[:270]}")
+
+print("=== AI PAYMENT CONTEXT PATH ===")
+for lo,hi in [(6609,6690),(33503,33555),(6238,6302)]:
+    print("SERVICE",lo,hi)
+    for i in range(lo,hi+1):
+        row=s[i-1]
+        if any(w in row.lower() for w in ("api_key", "secret", "authorization", "access_token", "password")): row="[potential sensitive omitted]"
+        print(f"{i:05d} {row[:240]}")
+for i,line in enumerate(s,1):
+    if "build_verified_payment_context(" in line or "get_verified_service_payment_state(" in line:
+        print("CALLED",i, line[:200])
