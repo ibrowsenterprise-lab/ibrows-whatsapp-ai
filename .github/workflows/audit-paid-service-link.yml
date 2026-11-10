@@ -1,0 +1,16 @@
+name: Inspect paid-service linkage without touching database
+on:
+  push:
+    branches: [audit/payment-to-service-readonly-20261110]
+    paths: [tools/audit_paid_service_link.py,.github/workflows/audit-paid-service-link.yml]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python tools/audit_paid_service_link.py
