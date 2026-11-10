@@ -58,6 +58,7 @@ class ContactLaunchTests(unittest.TestCase):
             "crm_quality": types.SimpleNamespace(install_crm_improvements=lambda _: None),
             "whatsapp_menu_patch": types.SimpleNamespace(install_whatsapp_menu_fix=lambda _: None),
             "explicit_qa_cleanup": types.SimpleNamespace(run_exact_qa_cleanup=lambda _: None),
+            "correct_eligibility_record": types.SimpleNamespace(correct_verified_eligibility_once=lambda _: None),
         }
         with patch.dict(sys.modules, stub_modules):
             config = runpy.run_path(str(ROOT / "gunicorn.conf.py"))

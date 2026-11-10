@@ -1,0 +1,22 @@
+name: Correct verified one-off scholarship package label safely
+on:
+  pull_request:
+    branches: [main]
+    paths: [correct_eligibility_record.py, tests/test_correct_eligibility_record.py, gunicorn.conf.py]
+  push:
+    branches: [fix/real-paid-eligibility-label-20261110]
+    paths: [correct_eligibility_record.py, tests/test_correct_eligibility_record.py, gunicorn.conf.py]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: |
+          python -m py_compile correct_eligibility_record.py gunicorn.conf.py
+          python -m unittest discover -s tests -p 'test_correct_eligibility_record.py' -v
+          git diff --check
