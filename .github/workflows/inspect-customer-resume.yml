@@ -1,0 +1,16 @@
+name: Read-only inspect AI resume code
+on:
+  push:
+    branches: [fix/customer-resume-ai-20261110]
+    paths: [tools/inspect_customer_resume.py, .github/workflows/inspect-customer-resume.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python tools/inspect_customer_resume.py
