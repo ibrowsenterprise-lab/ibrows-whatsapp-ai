@@ -6632,6 +6632,14 @@ def build_verified_payment_context(customer_number):
     if not any_open:
         lines.append("- No open paid-career-service ledger record is currently available for this customer.")
 
+    # Scholarship packages must use the same trusted CRM ledger as career
+    # packages. A screenshot or customer message does NOT verify a payment.
+    from scholarship_payment_context import scholarship_payment_context_lines
+    scholarship_state = get_verified_service_payment_state(
+        customer_number, "Scholarship Search"
+    )
+    lines.extend(scholarship_payment_context_lines(scholarship_state))
+
     career_assist = get_career_assist_lifecycle_state(customer_number)
     ca_state = career_assist["state"]
     if ca_state == "ACTIVE":
