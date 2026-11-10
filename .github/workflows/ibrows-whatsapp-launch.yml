@@ -1,0 +1,57 @@
+name: IBROWS WhatsApp launch contact checks
+on:
+  pull_request:
+    paths:
+      - launch_contact_config.py
+      - gunicorn.conf.py
+      - tests/test_launch_contact.py
+      - .github/workflows/ibrows-whatsapp-launch.yml
+  push:
+    branches: [main, fix/whatsapp-launch-contact-20261110]
+    paths:
+      - launch_contact_config.py
+      - gunicorn.conf.py
+      - tests/test_launch_contact.py
+      - .github/workflows/ibrows-whatsapp-launch.yml
+permissions:
+  contents: read
+jobs:
+  isolated-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check syntax and isolated launch behaviour without any credentials
+        run: |
+          python -m py_compile gunicorn.conf.py launch_contact_config.py
+          python -m unittest discover -s tests -p test_launch_contact.py -v
+  public-smoke:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: isolated-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Wait for Render and verify public links without creating enquiries
+        run: |
+          python - <<'PY'
+          import time
+          from urllib.request import urlopen, Request
+          url = "https://www.ibrowsenterprise.com/"
+          for attempt in range(36):
+              try:
+                  with urlopen(Request(url, headers={"User-Agent": "IBROWS-launch-smoke/1.0"}), timeout=20) as r:
+                      html = r.read(1_500_000).decode("utf-8", "replace")
+                      assert r.status == 200
+                  if "wa.me/265883242594" in html and "wa.me/265882242594" not in html and "+265 883 242 594" in html:
+                      print("PASS: official site routes WhatsApp to verified AI number")
+                      break
+              except Exception as exc:
+                  print(type(exc).__name__, str(exc)[:160])
+              print("Waiting for deployed contact update", attempt + 1)
+              time.sleep(10)
+          else:
+              raise SystemExit("FAIL: production WhatsApp contact not verified within retry window")
+          PY
