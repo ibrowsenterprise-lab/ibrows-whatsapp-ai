@@ -40,3 +40,13 @@ for i in sel[:100]:
             print(f"{j:05d} [omitted potential credential]")
         else: print(f"{j:05d} {line[:190]}")
 print("BLOCK_COUNT",len(sel))
+
+print("=== FOCUSED ADMIN WORKFLOW ===")
+for lo,hi in [(11946,12090),(13770,13875),(13915,13940),(14052,14125),
+               (16060,16125),(6238,6302),(9773,9835)]:
+    print("SECTION",lo,hi)
+    for i in range(lo,hi+1):
+        row=s[i-1]
+        if any(w in row.lower() for w in ("secret","api_key","authorization","access_token","password")):
+            row="[omitted sensitive]"
+        print(f"{i:05d} {row[:210]}")
