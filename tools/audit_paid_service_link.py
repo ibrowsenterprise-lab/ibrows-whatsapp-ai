@@ -50,3 +50,13 @@ for lo,hi in [(11946,12090),(13770,13875),(13915,13940),(14052,14125),
         if any(w in row.lower() for w in ("secret","api_key","authorization","access_token","password")):
             row="[omitted sensitive]"
         print(f"{i:05d} {row[:210]}")
+
+print("=== SPECIFIC PAYMENT UI / POST ROUTES ===")
+for lo,hi in [(13940,14049),(16060,16122),(11670,11732),
+               (11810,11880),(27962,28025),(6609,6688)]:
+    print("SHORT_RANGE",lo,hi)
+    for i in range(lo,hi+1):
+        line=s[i-1]
+        if any(w in line.lower() for w in ("api_key","secret","authorization","access_token","password")):
+            line="[sensitive omitted]"
+        print(f"{i:05d} {line[:270]}")
