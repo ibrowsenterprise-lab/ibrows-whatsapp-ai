@@ -122,6 +122,84 @@ class TestCustomerCRM(unittest.TestCase):
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0].methods - {"OPTIONS"}, {"POST"})
 
+    def test_conversion_post_requires_admin_confirmation_and_never_writes_payment(self):
+        from flask import Flask, abort, request
+        app = Flask("ibrows-oneoff-conversion-offline-test")
+        @app.get("/admin/customers/<customer_number>", endpoint="admin_customer_history")
+        def customer_history(customer_number):
+            return "OFFLINE CRM PAGE"
+
+        data = {"row": [
+            "265999000111", "Scholarship Search", "NEW", None, None, None,
+            None, "MWK", "NOT_STARTED"], "payments": [], "changes": [], "commits": 0}
+
+        class Cursor:
+            result = None
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def execute(self, query, params):
+                if "FROM leads WHERE id=%s FOR UPDATE" in query:
+                    self.result = tuple(data["row"])
+                elif "SELECT EXISTS(SELECT 1 FROM lead_payments" in query:
+                    self.result = (bool(data["payments"]),)
+                elif "SELECT EXISTS(" in query:
+                    self.result = (False,)
+                elif "UPDATE leads" in query:
+                    self.result = None
+                    data["changes"].append(("package-updated", params))
+                    data["row"][1] = "Scholarship Eligibility Check"
+                    data["row"][6] = Decimal("5000")
+                else:
+                    raise AssertionError("Unexpected SQL in isolated conversion test")
+            def fetchone(self): return self.result
+
+        class Conn:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def cursor(self): return Cursor()
+            def commit(self): data["commits"] += 1
+
+        def require_admin(func):
+            def protected(**kwargs):
+                if request.headers.get("X-Is-Test-Admin") != "yes":
+                    abort(401)
+                return func(**kwargs)
+            return protected
+
+        ns = {
+            "CAREER_SERVICE_DEFAULT_PRICES_MWK": {"Scholarship Search": Decimal("60000")},
+            "get_db": lambda: Conn(),
+            "admin_required": require_admin,
+            "validate_csrf": lambda: (None if request.form.get("csrf_token") == "OFFLINE_ONLY" else abort(400)),
+            "_safe_admin_return_path": lambda p: p if p and p.startswith("/admin/") else "/admin/leads",
+            "_activity_insert": lambda cur, lead_id, kind, note: data["changes"].append((kind, note)),
+            "canonicalize_service": lambda name: name,
+            "build_verified_payment_context": lambda number: [],
+        }
+        self.assertTrue(install_eligibility_package_support(app, ns))
+        path = "/admin/leads/1/scholarship-eligibility-package"
+        payload = {"csrf_token": "OFFLINE_ONLY", "confirm_scope": "ELIGIBILITY",
+                   "acknowledge_price": "1", "return_to": "/admin/leads"}
+        with app.test_client() as client:
+            self.assertEqual(client.post(path, data=payload).status_code, 401)
+            self.assertEqual(client.post(
+                path, headers={"X-Is-Test-Admin": "yes"},
+                data={**payload, "acknowledge_price": "0"}).status_code, 400)
+            self.assertEqual(client.post(
+                path, headers={"X-Is-Test-Admin": "yes"},
+                data={**payload, "csrf_token": "WRONG"}).status_code, 400)
+            self.assertEqual(data["changes"], [])
+            self.assertEqual(data["commits"], 0)
+            successful = client.post(path, headers={"X-Is-Test-Admin": "yes"}, data=payload)
+            self.assertEqual(successful.status_code, 303)
+            self.assertEqual(data["row"][1], "Scholarship Eligibility Check")
+            self.assertEqual(data["row"][6], Decimal("5000"))
+            self.assertEqual(data["payments"], [])
+            self.assertEqual(data["commits"], 1)
+            self.assertEqual(client.post(
+                path, headers={"X-Is-Test-Admin": "yes"}, data=payload).status_code, 409)
+            self.assertEqual(data["commits"], 1)
+
     def test_unexpected_template_fails_safely(self):
         with self.assertRaises(ValueError):
             improve_crm_template("<div>unknown template</div>")
