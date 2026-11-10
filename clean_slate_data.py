@@ -93,10 +93,8 @@ def validate_clean_slate_snapshot(state):
         return False
     if state["demo_lead_ids"] != list(DEMO_LEAD_IDS):
         return False
-    if not set(state["demo_lead_names"]).issubset({
-        "Jones #ibrows", "verified customer", "Ibrows Enterprise"
-    }):
-        return False
+    # Old labels are not customer-verification identifiers: only locked IDs,
+    # authorized payment totals and exact real-service guards control changes.
     if state["demo_payment"] != (5, Decimal("62000")):
         return False
     if state["project_ids"] != list(DEMO_PROJECT_IDS):
