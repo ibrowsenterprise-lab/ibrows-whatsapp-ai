@@ -14,7 +14,7 @@ block='''        # Only explicit customer requests resume the AI after human tak
             clear_customer_menu_state(customer_number)
             reply = (
                 "IBROWS AI Assistant is active again. You can now ask a question "
-                'or send "Show me your menu" to explore services.\n\n'
+                'or send "Show me your menu" to explore services.\\n\\n'
                 "To speak with Jones again, reply 0."
             )
             save_message(customer_number, "user", customer_message)
@@ -30,7 +30,7 @@ anchor2="""    # Pause first so the customer's explicit preference is respected 
     # if lead recording or notification later fails.
 """
 replacement2='''    # Tell customers how to return to the assistant when they are ready.
-    reply += "\n\nTo return to AI support later, send: Resume AI"
+    reply += "\\n\\nTo return to AI support later, send: Resume AI"
 
 '''+anchor2
 assert original.count(anchor1)==1, f"Unexpected paused guard anchor count {original.count(anchor1)}"
