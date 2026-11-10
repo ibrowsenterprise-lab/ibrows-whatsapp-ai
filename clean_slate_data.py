@@ -310,7 +310,10 @@ def run_clean_slate_once(flask_app):
                         (CUTOFF,),
                     )
                 rows_deleted["application_pack_state"] = _delete(
-                    cur, "application_pack_state", "TRUE"
+                    cur, "application_pack_state",
+                    "updated_at<%s AND customer_number<>("
+                    "SELECT customer_number FROM leads WHERE id=%s)",
+                    (CUTOFF, REAL_LEAD_ID),
                 )
 
                 # Fake CRM finance is audit-archived first and deleted only
@@ -365,14 +368,16 @@ def run_clean_slate_once(flask_app):
                     (CUTOFF, mnum, MARTHA_CHAT_START),
                 )
                 rows_deleted["old_human_handover_states"] = _delete(
-                    cur, "ai_takeover_state", "customer_number<>%s", (mnum,)
+                    cur, "ai_takeover_state",
+                    "customer_number<>%s AND updated_at<%s", (mnum, CUTOFF)
                 )
                 rows_deleted["old_menu_states"] = _delete(
-                    cur, "customer_menu_state", "customer_number<>%s", (mnum,)
+                    cur, "customer_menu_state",
+                    "customer_number<>%s AND updated_at<%s", (mnum, CUTOFF)
                 )
-                rows_deleted["old_outbox"] = _delete(
-                    cur, "whatsapp_delivery_outbox", "customer_number<>%s", (mnum,)
-                )
+                # Keep unexpired delivery retries: never discard a queued
+                # outbound message merely because the conversation was a test.
+                rows_deleted["old_outbox"] = 0
 
                 rows_deleted["demo_budget"] = _delete(
                     cur, "business_expense_budgets",
