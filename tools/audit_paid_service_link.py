@@ -71,3 +71,16 @@ for lo,hi in [(6609,6690),(33503,33555),(6238,6302)]:
 for i,line in enumerate(s,1):
     if "build_verified_payment_context(" in line or "get_verified_service_payment_state(" in line:
         print("CALLED",i, line[:200])
+
+print("=== DATA CLEANUP ROUTES AND FUNCTIONS ===")
+for n in ast.walk(t):
+    if isinstance(n,ast.FunctionDef) and (
+        "delete" in n.name or "archive" in n.name or "cleanup" in n.name or "purge" in n.name or "privacy" in n.name or
+        ("website_service" in n.name and ("admin" in n.name or "delete" in n.name))
+    ):
+        print("POTENTIAL_FUNC",n.name,n.lineno,n.end_lineno)
+        if "website" in n.name or "privacy" in n.name or "delete" in n.name:
+            for i in range(n.lineno,min(n.end_lineno,n.lineno+20)+1):
+                row=s[i-1]
+                if any(w in row.lower() for w in ("secret","api_key","password","authorization","token=")): row="[redacted]"
+                print(f"{i:05d} {row[:190]}")
