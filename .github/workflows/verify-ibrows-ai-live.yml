@@ -1,0 +1,28 @@
+name: Verify live public one-tap IBROWS AI redirect
+on:
+  push:
+    branches: [audit/verify-public-ai-link-20261110]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify live production route (GET only; no WhatsApp message sent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            headers="$(mktemp)"
+            status="$(curl --max-time 12 -sS -o /dev/null -D "$headers" -w '%{http_code}' 'https://www.ibrowsenterprise.com/ai' || true)"
+            destination="$(grep -i '^location:' "$headers" | head -1 | tr -d '\r' | cut -d' ' -f2-)"
+            echo "attempt=$attempt status=$status destination=$destination"
+            if [ "$status" = "302" ] && [ "$destination" = "https://wa.me/265883242594?text=Show%20me%20your%20menu" ]; then
+              echo "PASS: public one-tap AI link opens verified AI WhatsApp menu"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'FAIL: /ai did not redirect to the expected WhatsApp menu link' >&2
+          exit 1
