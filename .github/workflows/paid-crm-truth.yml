@@ -1,0 +1,21 @@
+name: Paid CRM ledger truth and service readiness
+on:
+  push:
+    branches: [fix/crm-paid-workflow-truth-20261111]
+    paths: [crm_paid_truth.py,crm_paid_note_cleanup.py,gunicorn.conf.py,tests/test_crm_paid_truth.py,.github/workflows/paid-crm-truth.yml]
+  pull_request:
+    branches: [main]
+    paths: [crm_paid_truth.py,crm_paid_note_cleanup.py,gunicorn.conf.py,tests/test_crm_paid_truth.py]
+permissions: {contents: read}
+jobs:
+  paid-crm-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python -m pip install "Flask>=3,<4"
+      - run: python -m py_compile crm_paid_truth.py crm_paid_note_cleanup.py gunicorn.conf.py
+      - run: python -m unittest discover -s tests -p 'test_crm_paid_truth.py' -v
+      - run: git diff --check
