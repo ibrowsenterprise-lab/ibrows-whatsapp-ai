@@ -127,7 +127,7 @@ def _snapshot(cur):
     lead_ids = [x[0] for x in cur.fetchall()]
 
     cur.execute(
-        """SELECT id,customer_name,service,estimated_value,
+        """SELECT id,service,estimated_value,
                   COALESCE(value_currency,'MWK')
            FROM leads WHERE id=%s FOR SHARE""",
         (REAL_LEAD_ID,),
