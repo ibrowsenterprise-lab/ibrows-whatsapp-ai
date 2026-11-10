@@ -30,3 +30,11 @@ for lo,hi in [(8050,8210),(20770,21070),(27100,27430),(27945,28040)]:
         row=lines[i-1]
         if any(x in row.lower() for x in ("api_key","access_token","password","authorization","secret","token:")):row="[sanitized]"
         print(f"{i:05d} {row[:220]}")
+
+print("=== PAID INTENT ROUTING AND PROMPT ===")
+for lo,hi in [(19667,19830),(20030,20200),(20500,20595),(20686,20830),(20830,21005),(21810,21901)]:
+    print("BLOCK",lo,hi)
+    for i in range(lo,hi+1):
+        row=lines[i-1]
+        if any(w in row.lower() for w in ("api_key","authorization","password","access_token","secret","token:")):row="[sanitized]"
+        print(f"{i:05d} {row[:230]}")
