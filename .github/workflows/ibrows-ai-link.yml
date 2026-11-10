@@ -1,0 +1,24 @@
+name: IBROWS AI one-tap demo route validation
+on:
+  pull_request:
+    branches: [main]
+    paths: [public_ai_shortcut.py, gunicorn.conf.py, tests/test_public_ai_shortcut.py]
+  push:
+    branches: [main]
+    paths: [public_ai_shortcut.py, gunicorn.conf.py, tests/test_public_ai_shortcut.py]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify redirect, isolation, and existing public site launch hooks
+        run: |
+          python -m unittest discover -s tests -p 'test_public_ai_shortcut.py' -v
+          python -m unittest discover -s tests -p 'test_launch_contact.py' -v
+          python -m py_compile gunicorn.conf.py public_ai_shortcut.py
