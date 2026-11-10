@@ -229,10 +229,12 @@ def _archive(cur, table, where_clause, params, classification):
     snapshot = ("to_jsonb(l) - 'file_bytes'"
                 if table == "website_service_request_files"
                 else "to_jsonb(l)")
+    # The sandbox state is keyed by project_id and has no id column.
+    pk_column = "project_id" if table == "project_sandbox_state" else "id"
     sql = f"""
         INSERT INTO ibrows_clean_slate_audit
             (source_table, source_pk, original_snapshot, classification)
-        SELECT %s, l.id::text, {snapshot}, %s
+        SELECT %s, l.{pk_column}::text, {snapshot}, %s
         FROM {table} l WHERE {where_clause}
         ON CONFLICT (source_table,source_pk) DO NOTHING
     """
