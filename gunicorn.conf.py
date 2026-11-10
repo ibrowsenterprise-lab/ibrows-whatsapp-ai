@@ -7,6 +7,8 @@ after the application has generated a successful public response.
 from launch_contact_config import rewrite_public_whatsapp_html
 from public_ai_shortcut import register_public_ai_shortcut
 from crm_quality import install_crm_improvements
+from crm_paid_truth import install_paid_crm_truth
+from crm_paid_note_cleanup import correct_paid_eligibility_note_once
 from whatsapp_menu_patch import install_whatsapp_menu_fix
 
 MITGO_META_TAG = '<meta name="mitgo-verification" content="0f143843-cefa-4d05-91a9-ab05bdbc998c" />'
@@ -17,6 +19,8 @@ def post_worker_init(worker):
     flask_app = worker.wsgi
     register_public_ai_shortcut(flask_app)
     install_crm_improvements(flask_app)
+    install_paid_crm_truth(flask_app)
+    correct_paid_eligibility_note_once(flask_app)
     install_whatsapp_menu_fix(flask_app)
 
     @flask_app.after_request
