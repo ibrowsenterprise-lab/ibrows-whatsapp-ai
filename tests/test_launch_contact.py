@@ -51,8 +51,17 @@ class ContactLaunchTests(unittest.TestCase):
 
     def test_public_hook_preserves_mitgo_and_never_touches_admin_or_webhook(self):
         app = FakeApp()
-        config = runpy.run_path(str(ROOT / "gunicorn.conf.py"))
-        config["post_worker_init"](types.SimpleNamespace(wsgi=app))
+        # This test is only for the public HTML hook. Stub unrelated private
+        # CRM, WhatsApp and QA-cleanup startup integrations so the test neither
+        # imports the production app nor ever connects to a customer database.
+        stub_modules = {
+            "crm_quality": types.SimpleNamespace(install_crm_improvements=lambda _: None),
+            "whatsapp_menu_patch": types.SimpleNamespace(install_whatsapp_menu_fix=lambda _: None),
+            "explicit_qa_cleanup": types.SimpleNamespace(run_exact_qa_cleanup=lambda _: None),
+        }
+        with patch.dict(sys.modules, stub_modules):
+            config = runpy.run_path(str(ROOT / "gunicorn.conf.py"))
+            config["post_worker_init"](types.SimpleNamespace(wsgi=app))
         request = types.SimpleNamespace(method="GET", path="/")
         fake_flask = types.SimpleNamespace(request=request)
         with patch.dict(sys.modules, {"flask": fake_flask}):
