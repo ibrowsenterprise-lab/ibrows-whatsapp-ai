@@ -43,3 +43,13 @@ for lo,hi in merged:
         n+=1
     if n>700:break
 print("LINES_PRINTED",n,"MATCHES",len(starts))
+
+print("=== MENU FUNCTION DETAILS ===")
+for node in tree.body:
+    if not isinstance(node,ast.FunctionDef):
+        continue
+    if node.name in ("handle_numbered_service_menu","get_customer_menu_state","set_customer_menu_state",
+                     "clear_customer_menu_state","detect_explicit_human_handover"):
+        print("FUNCTION",node.name,node.lineno,node.end_lineno)
+        for j in range(node.lineno-1,min(node.end_lineno,node.lineno+240)):
+            print(f"{j+1:05d} {safe(s[j])}")
