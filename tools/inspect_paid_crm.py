@@ -46,3 +46,11 @@ for lo,hi in ranges:
         if total>=550:break
     if total>=550:break
 print("SOURCE_PRINTED",total)
+
+print("=== TARGETED COMPLETE FUNCTIONS ===")
+for lo,hi in [(11565,11653),(14060,14180),(14305,14363),(13827,13916),(28031,28080)]:
+    print("TARGET_RANGE",lo,hi)
+    for i in range(lo,hi+1):
+        row=lines[i-1]
+        if any(x in row.lower() for x in ("api_key","access_token","secret","password","authorization")): row="[sanitized line]"
+        print(f"{i:05d} {row[:235]}")
