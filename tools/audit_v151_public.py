@@ -23,7 +23,7 @@ ENQUIRY_FORMS = {
  "/career-jobs", "/scholarships-opportunities", "/cleaning",
  "/design-branding/enquiry", "/landscaping/enquiry", "/landscaping/preview",
  "/construction/enquiry", "/construction/design-quote", "/construction/tender-boq-support",
- "/business-registration", "/business-email", "/photo-restoration", "/fumigation", "/agriculture"
+ "/business-registration", "/business-email", "/photo-restoration", "/fumigation"
 }
 opener = build_opener()
 class Parse(HTMLParser):
@@ -95,6 +95,11 @@ for path in PAGES:
   if path in ENQUIRY_FORMS:
    check(p.forms>0 and "csrf_token" in p.inputs and "consent" in p.inputs,
          f"{path} missing enquiry form, CSRF or consent")
+  if path=="/agriculture":
+   # This is a public GET search for produce, not an enquiry submission.
+   # CSRF and consent apply to separate POST buyer/seller submission forms.
+   check({"commodity", "location"}.issubset(p.inputs),
+         "/agriculture missing public produce-search filters")
   if path=="/project-discovery":
    check(p.forms>0 and "contact_name" in p.inputs and "project_components" in p.inputs,
          "/project-discovery missing multi-stage customer intake")
