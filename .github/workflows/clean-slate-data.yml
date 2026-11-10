@@ -1,0 +1,33 @@
+name: Validate agriculture-and-paid-service production clean slate
+on:
+  push:
+    branches: [fix/production-clean-slate-agro-martha-20261110]
+    paths:
+      - clean_slate_data.py
+      - tests/test_clean_slate_data.py
+      - gunicorn.conf.py
+      - tests/test_launch_contact.py
+      - .github/workflows/clean-slate-data.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - clean_slate_data.py
+      - tests/test_clean_slate_data.py
+      - gunicorn.conf.py
+      - tests/test_launch_contact.py
+permissions:
+  contents: read
+jobs:
+  guard-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Compile only source and startup config
+        run: python -m py_compile clean_slate_data.py gunicorn.conf.py
+      - name: Exercise deletion/finance guards offline with no secrets
+        run: python -m unittest discover -s tests -p 'test_clean_slate_data.py' -v
+      - name: Validate whitespace
+        run: git diff --check
