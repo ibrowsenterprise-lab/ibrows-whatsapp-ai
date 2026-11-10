@@ -76,7 +76,10 @@ def improve_paid_leads_template(template):
         '<div class="completed-service" style="background:#ecfdf3;color:#067647;margin:9px 0">'
         'Payment confirmed — eligibility assessment awaiting completion. '
         'No quotation or second payment required for this MK5,000 package.'
-        '</div>{% endif %}'
+        '</div>'
+        '<a class="quick" href="{{ url_for(\'admin_eligibility_case\',lead_id=lead.id) }}">'
+        'Open Paid Eligibility Work Queue</a>'
+        '{% endif %}'
         '<div class="summary">{{ (lead.summary or \'No summary available.\')'
         '|ibrows_current_paid_summary(lead.payment_status) }}</div>',
     )
