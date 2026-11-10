@@ -1,0 +1,40 @@
+name: Paid eligibility workflow regression
+on:
+  push:
+    branches: [main]
+    paths:
+      - app.py
+      - scholarship_eligibility_intake.py
+      - scholarship_eligibility_backend.py
+      - crm_paid_truth.py
+      - gunicorn.conf.py
+      - tests/test_scholarship_eligibility_workflow.py
+      - .github/workflows/paid-eligibility-regression.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - app.py
+      - scholarship_eligibility_intake.py
+      - scholarship_eligibility_backend.py
+      - crm_paid_truth.py
+      - gunicorn.conf.py
+      - tests/test_scholarship_eligibility_workflow.py
+      - .github/workflows/paid-eligibility-regression.yml
+permissions:
+  contents: read
+jobs:
+  eligibility-no-network:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Install isolated test framework only
+        run: python -m pip install "Flask>=3,<4"
+      - name: Compile application, paid-service modules and startup hooks
+        run: python -m py_compile app.py scholarship_eligibility_intake.py scholarship_eligibility_backend.py gunicorn.conf.py
+      - name: Test explicit customer commands, payment gates, work stages and admin protection
+        run: python -m unittest discover -s tests -p 'test_scholarship_eligibility_workflow.py' -v
+      - name: Validate patch formatting
+        run: git diff --check
