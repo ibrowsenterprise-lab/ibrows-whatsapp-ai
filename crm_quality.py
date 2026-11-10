@@ -5,6 +5,7 @@ authoritative ledger. Payment can only be recorded through the existing
 authenticated, CSRF-protected, idempotent admin workflow after verification.
 """
 import re
+from decimal import Decimal
 
 MARKER = "<!-- ibrows-crm-quality:20261110 -->"
 
@@ -64,10 +65,26 @@ def improve_crm_template(source):
 </div>
 {% endif %}
 {% if lead.service == 'Scholarship Search' %}
-<div class="crm-scope"><strong>Check scholarship package before recording payment.</strong>
-The MK5,000 Eligibility Check is a one-off screening service; it does not activate
-the MK60,000/month Scholarship Assist plan. Set and confirm the correct package
-amount in the lead manager after checking the actual mobile-money or bank record.</div>
+<div class="crm-scope"><strong>Confirm the selected scholarship package first.</strong>
+The MK5,000 Eligibility Check is one-off screening. It is not the MK60,000/month Scholarship Assist plan.
+Do not record payment against the wrong service or treat a payment screenshot as a verified transfer.</div>
+{% if lead.payment_status == 'NOT_PAID' and not lead.paid_label and not lead.estimated_value_label %}
+<details class="crm-actions-panel">
+<summary>Set MK5,000 one-off Eligibility Check package</summary>
+<p class="crm-hint">Only do this after confirming directly with the customer that they selected the one-off screening package. This does NOT record payment.</p>
+<form method="POST" action="{{ url_for('crm_convert_scholarship_eligibility', lead_id=lead.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<input type="hidden" name="return_to" value="{{ crm_return }}">
+<input type="hidden" name="confirm_scope" value="ELIGIBILITY">
+<label><input type="checkbox" name="acknowledge_price" value="1" required> Customer agreed to the one-off MK5,000 eligibility check, not a monthly scholarship subscription.</label>
+<button type="submit">Set one-off package — payment remains unverified</button>
+</form>
+</details>
+{% endif %}
+{% elif lead.service == 'Scholarship Eligibility Check' %}
+<div class="crm-scope"><strong>One-off screening package · MK5,000.</strong>
+The customer's profile can be screened after a real payment is independently verified and recorded.
+This does not authorize a monthly scholarship search or ongoing applications.</div>
 {% endif %}
 <p class="crm-preview">{{ (lead.summary or 'No summary available.')|truncate(165, True) }}</p>
 <details class="crm-details">
@@ -168,6 +185,7 @@ def install_crm_improvements(flask_app):
         return False
 
     namespace["CUSTOMER_CRM_TEMPLATE"] = upgraded
+    install_eligibility_package_support(flask_app, namespace)
 
     @flask_app.after_request
     def _crm_sensitive_response_headers(response):
@@ -180,4 +198,152 @@ def install_crm_improvements(flask_app):
         return response
 
     print("IBROWS CRM: admin-only customer improvements active", flush=True)
+    return True
+
+
+
+def _can_convert_to_eligibility(lead, paid, another_active_package):
+    """Refuse conversion of any already-commercially-active or settled lead."""
+    if not lead or paid or another_active_package:
+        return False
+    (_number, service, status, merged, privacy_deleted, consumed,
+     estimated, currency, quote_status) = lead
+    if service != "Scholarship Search" or status not in ("NEW", "CONTACTED"):
+        return False
+    if merged is not None or privacy_deleted is not None or consumed is not None:
+        return False
+    if quote_status != "NOT_STARTED":
+        return False
+    if currency != "MWK":
+        return False
+    if estimated is not None and Decimal(str(estimated)) != Decimal("5000"):
+        return False
+    return True
+
+
+def install_eligibility_package_support(flask_app, namespace):
+    """Register an explicitly admin-selected one-off package.
+
+    No screenshot, message or package selection can produce a ledger payment.
+    Only the existing verified-payment admin workflow can do so.
+    """
+    required = (
+        "CAREER_SERVICE_DEFAULT_PRICES_MWK", "get_db", "admin_required",
+        "validate_csrf", "_safe_admin_return_path", "_activity_insert",
+        "canonicalize_service", "build_verified_payment_context",
+    )
+    if not all(name in namespace for name in required):
+        return False
+
+    prices = namespace["CAREER_SERVICE_DEFAULT_PRICES_MWK"]
+    if "Scholarship Eligibility Check" not in prices:
+        prices["Scholarship Eligibility Check"] = Decimal("5000")
+
+    previous_canonicalize = namespace["canonicalize_service"]
+    def canonicalize_with_one_off(value):
+        normalized = " ".join(str(value or "").lower().split())
+        if normalized in {
+            "scholarship eligibility check", "scholarship eligibility screening",
+        }:
+            return "Scholarship Eligibility Check"
+        return previous_canonicalize(value)
+    namespace["canonicalize_service"] = canonicalize_with_one_off
+
+    original_context = namespace["build_verified_payment_context"]
+    def package_aware_payment_context(customer_number):
+        context = original_context(customer_number)
+        if not isinstance(context, list):
+            return context
+        extra = (
+            "\nONE-OFF SCHOLARSHIP RULE: 'Scholarship Eligibility Check' is a separate "
+            "MK5,000 screening service, NOT the MK60,000/month 'Scholarship Search' "
+            "subscription. It only authorizes profile/qualification screening and "
+            "identifying requirements for the customer's specific opportunity. "
+            "Do not treat its payment as authorizing a shortlist, application "
+            "submissions or a recurring term. When its VERIFIED STATUS is PAID, "
+            "help with screening, clearly explain missing evidence and remind "
+            "the customer that final eligibility decisions belong to funders. "
+            "When not PAID, do not claim money received; request verification. "
+            "For a one-off customer, use the exact CRM service label "
+            "'Scholarship Eligibility Check' for future follow-ups."
+        )
+        output = []
+        for part in context:
+            if isinstance(part, dict) and isinstance(part.get("content"), str) and (
+                "- Scholarship Eligibility Check:" in part["content"]
+            ):
+                output.append({**part, "content": part["content"] + extra})
+            else:
+                output.append(part)
+        return output
+    namespace["build_verified_payment_context"] = package_aware_payment_context
+
+    if "crm_convert_scholarship_eligibility" not in flask_app.view_functions:
+        def convert_scholarship_eligibility(lead_id):
+            from flask import abort, request, redirect, url_for
+            namespace["validate_csrf"]()
+            if (request.form.get("confirm_scope") != "ELIGIBILITY"
+                    or request.form.get("acknowledge_price") != "1"):
+                abort(400)
+            with namespace["get_db"]() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT customer_number, service, status, merged_into_lead_id,
+                                  privacy_deleted_at, entitlement_consumed_at,
+                                  estimated_value, COALESCE(value_currency,'MWK'),
+                                  COALESCE(quote_status,'NOT_STARTED')
+                           FROM leads WHERE id=%s FOR UPDATE""",
+                        (lead_id,),
+                    )
+                    lead = cur.fetchone()
+                    if not lead:
+                        abort(404)
+                    cur.execute(
+                        "SELECT EXISTS(SELECT 1 FROM lead_payments WHERE lead_id=%s)",
+                        (lead_id,),
+                    )
+                    has_payment = bool(cur.fetchone()[0])
+                    cur.execute(
+                        """SELECT EXISTS(
+                             SELECT 1 FROM leads
+                             WHERE customer_number=%s AND id<>%s
+                               AND service='Scholarship Eligibility Check'
+                               AND status IN ('NEW','CONTACTED')
+                               AND merged_into_lead_id IS NULL
+                               AND privacy_deleted_at IS NULL
+                           )""",
+                        (lead[0], lead_id),
+                    )
+                    already_active = bool(cur.fetchone()[0])
+                    if not _can_convert_to_eligibility(lead, has_payment, already_active):
+                        abort(409)
+                    cur.execute(
+                        """UPDATE leads
+                           SET service='Scholarship Eligibility Check',
+                               estimated_value=5000, value_currency='MWK',
+                               updated_at=NOW()
+                           WHERE id=%s""",
+                        (lead_id,),
+                    )
+                    namespace["_activity_insert"](
+                        cur, lead_id, "LEAD_UPDATED",
+                        "Admin confirmed MK5,000 one-off Scholarship Eligibility Check "
+                        "package; no payment recorded. Verify actual funds before assistance.",
+                    )
+                conn.commit()
+            return_to = namespace["_safe_admin_return_path"](
+                request.form.get("return_to")
+            )
+            return redirect(
+                url_for("admin_customer_history", customer_number=lead[0],
+                        return_to=return_to),
+                code=303,
+            )
+
+        flask_app.add_url_rule(
+            "/admin/leads/<int:lead_id>/scholarship-eligibility-package",
+            endpoint="crm_convert_scholarship_eligibility",
+            view_func=namespace["admin_required"](convert_scholarship_eligibility),
+            methods=["POST"],
+        )
     return True
