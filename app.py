@@ -3643,6 +3643,12 @@ def handle_numbered_service_menu(customer_number, customer_name, customer_messag
       JONES -> activate the real human handover workflow
     """
     text = _normalise_menu_text(customer_message)
+    # Standalone 0 is always the human-handover command, even when the AI
+    # displayed a menu without setting a deterministic menu state.
+    # Never treat quantities like 0kg as the handover command.
+    if text == "0":
+        clear_customer_menu_state(customer_number)
+        return {"action": "JONES"}
     current = get_customer_menu_state(customer_number)
 
     # MENU/services requests always open a fresh main menu.
