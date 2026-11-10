@@ -1,0 +1,24 @@
+name: Exact QA cleanup safety tests
+on:
+  push:
+    branches: [fix/archive-explicit-qa-data-20261110]
+    paths: [explicit_qa_cleanup.py, tests/test_explicit_qa_cleanup.py, gunicorn.conf.py, .github/workflows/qa-cleanup-tests.yml]
+  pull_request:
+    branches: [main]
+    paths: [explicit_qa_cleanup.py, tests/test_explicit_qa_cleanup.py, gunicorn.conf.py]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Compile QA cleanup and production app startup hook
+        run: python -m py_compile explicit_qa_cleanup.py gunicorn.conf.py
+      - name: Run isolated in-memory tests; no real database and no network
+        run: python -m unittest discover -s tests -p 'test_explicit_qa_cleanup.py' -v
+      - name: Inspect diff hygiene
+        run: git diff --check
