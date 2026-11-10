@@ -17,3 +17,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: python tools/inspect_whatsapp_leads.py
+      - name: Audit public pages, customer forms and admin access (GET only)
+        run: python tools/audit_v151_public.py
