@@ -1,7 +1,7 @@
 """One-time 2026-11-10 IBROWS production data clean slate.
 
 User explicitly confirmed the only real transactions/projects are the
-Agriculture Marketplace and Martha's verified MWK 5,000 Eligibility Check.
+Agriculture Marketplace and one verified MWK 5,000 Eligibility Check.
 Remove *old* demonstration operational data only; preserve public assets,
 service configuration, the agricultural supply chain, and the paid customer.
 
@@ -15,10 +15,10 @@ from decimal import Decimal
 from datetime import datetime, timezone
 import sys
 
-EVENT_KEY = "IBROWS_REAL_ONLY_AGRICULTURE_AND_MARTHA_20261110"
+EVENT_KEY = "IBROWS_REAL_ONLY_AGRICULTURE_AND_ONE_VERIFIED_SERVICE_20261110"
 # Snapshot boundary: new business activity after this time must be retained.
 CUTOFF = datetime(2026, 11, 10, 20, 1, 0, tzinfo=timezone.utc)
-MARTHA_CHAT_START = datetime(2026, 11, 10, 16, 32, 0, tzinfo=timezone.utc)
+VERIFIED_CUSTOMER_CHAT_START = datetime(2026, 11, 10, 16, 32, 0, tzinfo=timezone.utc)
 LOCK_ID = 81420261110
 
 REAL_LEAD_ID = 19
@@ -86,8 +86,7 @@ PROTECTED_TABLES = (
 def validate_clean_slate_snapshot(state):
     """Pure, strict validation that avoids an incorrect production reset."""
     if state["real_lead"] != (
-        19, "Martha", "Scholarship Eligibility Check",
-        Decimal("5000"), "MWK",
+        19, "Scholarship Eligibility Check", Decimal("5000"), "MWK",
     ):
         return False
     if state["real_payment"] != (1, Decimal("5000"), "MWK"):
@@ -95,7 +94,7 @@ def validate_clean_slate_snapshot(state):
     if state["demo_lead_ids"] != list(DEMO_LEAD_IDS):
         return False
     if not set(state["demo_lead_names"]).issubset({
-        "Jones #ibrows", "Martha", "Ibrows Enterprise"
+        "Jones #ibrows", "verified customer", "Ibrows Enterprise"
     }):
         return False
     if state["demo_payment"] != (5, Decimal("62000")):
@@ -135,8 +134,8 @@ def _snapshot(cur):
     )
     row = cur.fetchone()
     real_lead = None if not row else (
-        row[0], row[1], row[2], Decimal(str(row[3])), row[4]
-    ) if row[3] is not None else None
+        row[0], row[1], Decimal(str(row[2])), row[3]
+    ) if row[2] is not None else None
 
     cur.execute(
         """SELECT COUNT(*),COALESCE(SUM(amount),0),
@@ -346,8 +345,8 @@ def run_clean_slate_once(flask_app):
                 if rows_deleted["non_agri_requests"] != len(DEMO_WEBSITE_IDS):
                     raise RuntimeError("Website QA count changed; rollback")
 
-                # Preserve only Martha's current paid-service conversation.
-                # All earlier September test chatter, including from Martha's
+                # Preserve only the verified customer's current paid-service conversation.
+                # All earlier September test chatter, including from the verified customer's
                 # number, is removed so the AI will not confuse service context.
                 cur.execute(
                     "SELECT customer_number FROM leads WHERE id=%s",
@@ -357,17 +356,17 @@ def run_clean_slate_once(flask_app):
                 rows_deleted["old_chat_messages"] = _delete(
                     cur, "conversations",
                     "created_at<%s AND NOT (customer_number=%s AND created_at>=%s)",
-                    (CUTOFF, mnum, MARTHA_CHAT_START),
+                    (CUTOFF, mnum, VERIFIED_CUSTOMER_CHAT_START),
                 )
                 rows_deleted["old_attachment_memories"] = _delete(
                     cur, "attachment_memories",
                     "created_at<%s AND NOT (customer_number=%s AND created_at>=%s)",
-                    (CUTOFF, mnum, MARTHA_CHAT_START),
+                    (CUTOFF, mnum, VERIFIED_CUSTOMER_CHAT_START),
                 )
                 rows_deleted["old_message_dedupe"] = _delete(
                     cur, "processed_whatsapp_messages",
                     "processed_at<%s AND NOT (customer_number=%s AND processed_at>=%s)",
-                    (CUTOFF, mnum, MARTHA_CHAT_START),
+                    (CUTOFF, mnum, VERIFIED_CUSTOMER_CHAT_START),
                 )
                 rows_deleted["old_human_handover_states"] = _delete(
                     cur, "ai_takeover_state",
@@ -414,7 +413,7 @@ def run_clean_slate_once(flask_app):
                     (
                         EVENT_KEY, dumps(rows_deleted),
                         "User confirmed 10 Nov 2026: only Agriculture Marketplace "
-                        "and Martha one-off MWK 5000 scholarship screening are real. "
+                        "and the one verified MWK 5000 scholarship screening are real. "
                         "Prior lead payments and project invoices were demonstrations; "
                         "financial snapshots retained outside active reporting.",
                     ),
