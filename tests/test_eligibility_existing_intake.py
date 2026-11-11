@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from scholarship_eligibility_backend import (
-    DEFAULT_STAGE, PAGE, academic_reply_evidence, classify_customer_reply,
-    get_customer_reply_status, can_move_stage,
+    DEFAULT_STAGE, PAGE, academic_reply_evidence, classify_customer_reply_with_evidence,
+    get_customer_reply_status_extended, can_move_stage,
 )
 from scholarship_eligibility_intake import SERVICE
 
@@ -59,7 +59,7 @@ class ExistingIntakeTests(unittest.TestCase):
         evidence = academic_reply_evidence(ACADEMIC_REPLIES)
         self.assertTrue({"degree", "grade", "experience", "language", "destination"} <= set(evidence))
         t = datetime(2026, 11, 11, tzinfo=timezone.utc)
-        title, description, new_reply, ready = classify_customer_reply(
+        title, description, new_reply, ready = classify_customer_reply_with_evidence(
             t, t + timedelta(hours=1), evidence
         )
         self.assertTrue(new_reply)
@@ -70,7 +70,7 @@ class ExistingIntakeTests(unittest.TestCase):
 
     def test_existing_paid_answers_are_loaded_without_writes(self):
         cursor = FakeCursor(ACADEMIC_REPLIES)
-        title, description, replied, ready = get_customer_reply_status(
+        title, description, replied, ready = get_customer_reply_status_extended(
             lambda: FakeConnection(cursor), "FAKE_CUSTOMER"
         )
         self.assertTrue(replied)
@@ -83,14 +83,14 @@ class ExistingIntakeTests(unittest.TestCase):
         evidence = academic_reply_evidence(["OK", "Thank you"])
         self.assertEqual(evidence, ())
         t = datetime(2026, 11, 11, tzinfo=timezone.utc)
-        _, description, replied, ready = classify_customer_reply(t, t + timedelta(seconds=10), evidence)
+        _, description, replied, ready = classify_customer_reply_with_evidence(t, t + timedelta(seconds=10), evidence)
         self.assertTrue(replied)
         self.assertFalse(ready)
         self.assertIn("Ask only for missing", description)
 
     def test_no_intake_request_does_not_make_fictitious_progress(self):
         t = datetime(2026, 11, 11, tzinfo=timezone.utc)
-        _, _, replied, ready = classify_customer_reply(None, t, ("degree","grade","experience","location"))
+        _, _, replied, ready = classify_customer_reply_with_evidence(None, t, ("degree","grade","experience","location"))
         self.assertFalse(replied)
         self.assertFalse(ready)
 
