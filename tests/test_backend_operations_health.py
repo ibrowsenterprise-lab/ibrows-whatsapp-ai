@@ -9,17 +9,19 @@ import unittest
 
 from backend_operations_health import (
     PAGE, has_new_reply, paid_case_row, read_health,
-    install_backend_operations,
+    classify_reminder_health, install_backend_operations,
 )
 
 
 class FakeCursor:
-    def __init__(self,metrics,customers,stages=None,media=(125*1048576,19*1048576),failure=False):
+    def __init__(self,metrics,customers,stages=None,media=(125*1048576,19*1048576),failure=False,reminder=None,paused_handoffs=0):
         self.metrics=metrics
         self.customers=customers
         self.stages=stages
         self.media=media
         self.failure=failure
+        self.reminder=reminder if reminder is not None else (None,None,False)
+        self.paused_handoffs=paused_handoffs
         self.current=""
         self.sql=[]
     def __enter__(self):return self
@@ -38,6 +40,8 @@ class FakeCursor:
             return ("scholarship_eligibility_cases",) if self.stages is not None else (None,)
         if self.current.startswith("SELECT pg_total_relation_size"):
             return self.media
+        if self.current.startswith("SELECT t.last_run_at"):
+            return (*self.reminder, self.paused_handoffs)
         raise AssertionError("Unknown read-one SQL: "+self.current[:120])
     def fetchall(self):
         if self.current.startswith("SELECT l.id,l.customer_name"):
@@ -93,7 +97,7 @@ class ReadOnlyHealthTests(unittest.TestCase):
         self.assertTrue(result["paid_cases"][0]["needs_review"])
         self.assertEqual(result["paid_cases"][0]["stage"],"Not yet recorded")
         self.assertTrue(all(sql.startswith("SELECT") for sql,params in cur.sql))
-        self.assertEqual(len(cur.sql),4)
+        self.assertEqual(len(cur.sql),5)
         self.assertNotIn("UPDATE leads",str(cur.sql))
         self.assertIn("processed_whatsapp_messages",cur.sql[0][0])
         self.assertIn("agro_marketplace_listings",cur.sql[0][0])
@@ -103,8 +107,31 @@ class ReadOnlyHealthTests(unittest.TestCase):
         cur=FakeCursor(METRICS,[CLIENT_ROW],stages={19:"AWAITING_INFORMATION"})
         res=read_health(lambda:FakeConn(cur))
         self.assertEqual(res["paid_cases"][0]["stage"],"AWAITING_INFORMATION")
-        self.assertEqual(len(cur.sql),5)
-        self.assertEqual(cur.sql[-2][1],([19],))
+        self.assertEqual(len(cur.sql),6)
+        self.assertEqual(cur.sql[-3][1],([19],))
+
+    def test_reminder_monitor_flags_stale_or_missing_without_claiming_failure(self):
+        now=datetime(2026,11,11,12,0,tzinfo=UTC)
+        stale=classify_reminder_health(datetime(2026,10,6,3,8,tzinfo=UTC),True,False,now)
+        self.assertTrue(stale["attention"])
+        self.assertIn("older than 48 hours",stale["description"])
+        self.assertIn("does not prove reminders failed",stale["description"])
+        self.assertTrue(classify_reminder_health(None,None,False,now)["attention"])
+        self.assertTrue(classify_reminder_health(now,False,True,now)["attention"])
+        self.assertTrue(classify_reminder_health(now.replace(tzinfo=None),True,False,now)["attention"])
+        self.assertFalse(classify_reminder_health(now-timedelta(hours=2),True,False,now)["attention"])
+
+    def test_priority_panel_surfaces_paid_waiting_and_paused_handoffs(self):
+        cur=FakeCursor(METRICS,[CLIENT_ROW],reminder=(DAY,True,False),paused_handoffs=2)
+        result=read_health(lambda:FakeConn(cur))
+        self.assertEqual(result["pending_paid"],1)
+        self.assertEqual(result["paused_handoffs"],2)
+        self.assertFalse(result["reminder_health"]["attention"])
+        self.assertIn("Priority actions before serving more clients",PAGE)
+        self.assertIn("paid service case(s) still not marked delivered",PAGE)
+        self.assertIn("conversation(s) currently paused for human assistance",PAGE)
+        self.assertIn("48-hour monitoring threshold",PAGE)
+        self.assertNotIn("send_whatsapp_message(",PAGE)
 
     def test_null_intake_never_falsely_says_waiting(self):
         row=list(CLIENT_ROW);row[6]=None
