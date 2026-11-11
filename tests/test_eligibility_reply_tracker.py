@@ -6,6 +6,8 @@ from datetime import datetime, timezone, timedelta
 import unittest
 from scholarship_eligibility_backend import (
     classify_customer_reply, get_customer_reply_status, PAGE,
+    academic_reply_evidence, classify_customer_reply_with_evidence,
+    get_customer_reply_status_extended, can_move_stage, DEFAULT_STAGE,
 )
 
 UTC=timezone.utc
@@ -34,6 +36,35 @@ class FakeConn:
 
 
 class PaidCustomerReplyTests(unittest.TestCase):
+    def test_paid_intake_with_existing_answers_moves_to_review_not_delivery(self):
+        responses = [
+            "Bachelor degree in Malawi completed in 2022",
+            "GPA 3.1 and 14 years banking experience",
+            "English language and Finland and UK",
+        ]
+        fields = academic_reply_evidence(responses)
+        title, description, new_reply, ready = classify_customer_reply_with_evidence(
+            moment(11,1),moment(11,4),fields
+        )
+        self.assertTrue(new_reply)
+        self.assertTrue(ready)
+        self.assertIn("assessment review required",title)
+        from decimal import Decimal
+        paid={"lead_id":19,"service":"Scholarship Eligibility Check","status":"PAID",
+              "currency":"MWK","required":Decimal("5000"),"paid":Decimal("5000")}
+        self.assertTrue(can_move_stage(DEFAULT_STAGE,"REVIEWING",paid,intake_ready=True))
+        self.assertFalse(can_move_stage(DEFAULT_STAGE,"DELIVERED",paid,intake_ready=True))
+        self.assertFalse(can_move_stage(DEFAULT_STAGE,"REVIEWING",
+                                        {**paid,"status":"NOT_PAID"},intake_ready=True))
+
+    def test_short_acknowledgment_cannot_fast_track_paid_review(self):
+        fields = academic_reply_evidence(["Okay", "Thanks"])
+        _, _, replied, ready = classify_customer_reply_with_evidence(
+            moment(11,1),moment(11,4),fields
+        )
+        self.assertTrue(replied)
+        self.assertFalse(ready)
+
     def test_no_claim_that_existing_outbound_has_been_delivered(self):
         title,description,new=classify_customer_reply(moment(11,1),moment(10,19))
         self.assertEqual(title,"Waiting for the customer's response")
