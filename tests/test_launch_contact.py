@@ -62,6 +62,7 @@ class ContactLaunchTests(unittest.TestCase):
             "backend_operations_health": types.SimpleNamespace(install_backend_operations=lambda _: None),
             "payment_query_efficiency": types.SimpleNamespace(install_payment_query_batch=lambda _: None),
             "inbox_query_efficiency": types.SimpleNamespace(install_inbox_query_efficiency=lambda _: None),
+            "whatsapp_ai_runtime_resilience": types.SimpleNamespace(install_whatsapp_ai_resilience=lambda _: None),
             "whatsapp_menu_patch": types.SimpleNamespace(install_whatsapp_menu_fix=lambda _: None),
             "explicit_qa_cleanup": types.SimpleNamespace(run_exact_qa_cleanup=lambda _: None),
             "correct_eligibility_record": types.SimpleNamespace(correct_verified_eligibility_once=lambda _: None),
