@@ -312,26 +312,55 @@ label{display:flex;gap:10px;align-items:flex-start;margin:12px 0}input[type=chec
 MK40,000 application-support or monthly scholarship package. Never promise a scholarship award.</p>
 </section></main>
 <script>
+// Copy must work in Android WebViews where navigator.clipboard may be denied.
+// All operations happen on an explicit button tap; no message is sent.
+function copyEligibilityText(textareaId, statusId) {
+ const field=document.getElementById(textareaId);
+ const status=document.getElementById(statusId);
+ if(!field || !status)return;
+ const value=field.value;
+ if(!value){
+   status.textContent='There is no message to copy.';
+   return;
+ }
+ function selectVisibleText(){
+   try{
+     field.focus();
+     field.select();
+     if(typeof field.setSelectionRange==='function'){
+       field.setSelectionRange(0,value.length);
+     }
+   }catch(err){}
+ }
+ function copied(){
+   status.textContent='Copied. Paste into the secure IBROWS Inbox and send manually. No message was sent automatically.';
+ }
+ function manualCopy(){
+   selectVisibleText();
+   status.textContent='Automatic copying is blocked in this browser. Long-press the message text, choose Select all, then Copy. If necessary, open this page in Chrome.';
+ }
+ selectVisibleText();
+ // Use synchronous legacy copy first, while Android still has a user gesture.
+ try {
+   if(typeof document.execCommand==='function' && document.execCommand('copy')){
+     copied();
+     return;
+   }
+ }catch(err){}
+ // Some modern browsers support only the asynchronous Clipboard API.
+ try {
+   if(navigator.clipboard && typeof navigator.clipboard.writeText==='function'){
+     navigator.clipboard.writeText(value).then(copied).catch(manualCopy);
+     return;
+   }
+ }catch(err){}
+ manualCopy();
+}
 function copyDocuments(){
- const el=document.getElementById('documents');if(!el)return;
- el.focus();el.select();const value=el.value;
- const info=document.getElementById('documents-copy-status');
- if(navigator.clipboard && navigator.clipboard.writeText){
-   navigator.clipboard.writeText(value).then(()=>{
-     info.textContent='Copied. Paste into the secure Inbox and send manually.';
-   }).catch(()=>{info.textContent='Text selected. Copy it using your phone menu.';});
- }else{info.textContent='Text selected. Copy it using your phone menu.';}
+ copyEligibilityText('documents','documents-copy-status');
 }
 function copyIntake(){
- const el=document.getElementById('intake');if(!el)return;el.focus();el.select();
- const value=el.value;
- if(navigator.clipboard && navigator.clipboard.writeText){
-   navigator.clipboard.writeText(value).then(()=>{
-     document.getElementById('copy-status').textContent='Copied. Open IBROWS Inbox and paste the message.';
-   }).catch(()=>{document.getElementById('copy-status').textContent='Select and copy the highlighted text manually.';});
- }else{
-   document.getElementById('copy-status').textContent='Text selected. Choose Copy from your phone menu.';
- }
+ copyEligibilityText('intake','copy-status');
 }
 </script></body></html>"""
 

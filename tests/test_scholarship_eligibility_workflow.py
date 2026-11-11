@@ -153,6 +153,19 @@ class AdminCaseTests(unittest.TestCase):
         self.assertIn("does not send any message",PAGE)
         self.assertIn("copyDocuments()",PAGE)
 
+    def test_android_copy_fallback_and_manual_selection(self):
+        # Android in-app WebViews may block navigator.clipboard; retain a
+        # synchronous user-gesture path and an honest manual fallback.
+        self.assertIn("document.execCommand('copy')", PAGE)
+        self.assertIn("navigator.clipboard.writeText(value)", PAGE)
+        self.assertIn("function copyEligibilityText(textareaId, statusId)", PAGE)
+        self.assertIn("copyEligibilityText('documents','documents-copy-status')", PAGE)
+        self.assertIn("copyEligibilityText('intake','copy-status')", PAGE)
+        self.assertIn("field.setSelectionRange(0,value.length)", PAGE)
+        self.assertIn("Long-press the message text", PAGE)
+        self.assertIn("No message was sent automatically.", PAGE)
+        self.assertNotIn("send_whatsapp_message(", PAGE)
+
     def test_admin_page_has_csrf_confirmation_and_no_auto_send(self):
         from flask import Flask
         app=Flask("ibrows-eligibility-offline")
