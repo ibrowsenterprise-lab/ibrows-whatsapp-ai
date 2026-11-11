@@ -9,6 +9,7 @@ on:
       - crm_paid_truth.py
       - gunicorn.conf.py
       - tests/test_scholarship_eligibility_workflow.py
+      - tests/test_eligibility_reply_tracker.py
       - .github/workflows/paid-eligibility-regression.yml
   pull_request:
     branches: [main]
@@ -19,6 +20,7 @@ on:
       - crm_paid_truth.py
       - gunicorn.conf.py
       - tests/test_scholarship_eligibility_workflow.py
+      - tests/test_eligibility_reply_tracker.py
       - .github/workflows/paid-eligibility-regression.yml
 permissions:
   contents: read
@@ -36,5 +38,7 @@ jobs:
         run: python -m py_compile app.py scholarship_eligibility_intake.py scholarship_eligibility_backend.py gunicorn.conf.py
       - name: Test explicit customer commands, payment gates, work stages and admin protection
         run: python -m unittest discover -s tests -p 'test_scholarship_eligibility_workflow.py' -v
+      - name: Test recorded customer replies without changing service state
+        run: python -m unittest discover -s tests -p 'test_eligibility_reply_tracker.py' -v
       - name: Validate patch formatting
         run: git diff --check
