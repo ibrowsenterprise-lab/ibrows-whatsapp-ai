@@ -1,4 +1,4 @@
-"""Ledger-backed WhatsApp AI payment context for Scholarship Search packages.
+"""Ledger-backed WhatsApp AI context for the exact paid eligibility package.
 
 No screenshots, chat messages, references, or estimates can mark a payment
 verified. This formatter receives only the CRM's authenticated-payment snapshot.
@@ -18,7 +18,7 @@ def scholarship_payment_context_lines(state):
     received_text = f"{currency} {paid:,.0f}"
     required_text = f"{currency} {required:,.0f}" if required is not None else "not set in the ledger"
     lines = [
-        f"- Scholarship Search (this customer's open lead): {status}; "
+        f"- {state.get('service') or 'Scholarship Eligibility Check'} (this customer's open lead): {status}; "
         f"verified ledger receipts {received_text}; recorded package price {required_text}."
     ]
 
