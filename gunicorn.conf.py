@@ -10,6 +10,7 @@ from crm_quality import install_crm_improvements
 from crm_paid_truth import install_paid_crm_truth
 from scholarship_eligibility_backend import install_eligibility_work_queue
 from whatsapp_menu_patch import install_whatsapp_menu_fix
+from automatic_verified_receipts import install_auto_receipts
 
 MITGO_META_TAG = '<meta name="mitgo-verification" content="0f143843-cefa-4d05-91a9-ab05bdbc998c" />'
 
@@ -22,6 +23,7 @@ def post_worker_init(worker):
     install_eligibility_work_queue(flask_app)
     install_paid_crm_truth(flask_app)
     install_whatsapp_menu_fix(flask_app)
+    install_auto_receipts(flask_app)
 
     @flask_app.after_request
     def _ibrows_public_launch_contact(response):
