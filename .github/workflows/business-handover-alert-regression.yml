@@ -1,0 +1,32 @@
+name: Business WhatsApp handover alert regression
+on:
+  push:
+    branches: [main]
+    paths:
+      - app.py
+      - handover_business_alerts.py
+      - tests/test_business_handover_whatsapp_alerts.py
+      - tests/test_zero_handover.py
+      - .github/workflows/business-handover-alert-regression.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - app.py
+      - handover_business_alerts.py
+      - tests/test_business_handover_whatsapp_alerts.py
+      - tests/test_zero_handover.py
+      - .github/workflows/business-handover-alert-regression.yml
+permissions: {contents: read}
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python -m pip install "Flask>=3,<4"
+      - run: python -m py_compile app.py handover_business_alerts.py
+      - run: python -m unittest discover -s tests -p 'test_business_handover_whatsapp_alerts.py' -v
+      - run: python -m unittest discover -s tests -p 'test_zero_handover.py' -v
+      - run: git diff --check
