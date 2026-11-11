@@ -12,6 +12,7 @@ from scholarship_eligibility_backend import install_eligibility_work_queue
 from whatsapp_menu_patch import install_whatsapp_menu_fix
 from automatic_verified_receipts import install_auto_receipts
 from backend_operations_health import install_backend_operations
+from payment_query_efficiency import install_payment_query_batch
 
 MITGO_META_TAG = '<meta name="mitgo-verification" content="0f143843-cefa-4d05-91a9-ab05bdbc998c" />'
 
@@ -26,6 +27,7 @@ def post_worker_init(worker):
     install_whatsapp_menu_fix(flask_app)
     install_auto_receipts(flask_app)
     install_backend_operations(flask_app)
+    install_payment_query_batch(flask_app)
 
     @flask_app.after_request
     def _ibrows_public_launch_contact(response):
