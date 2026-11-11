@@ -6,6 +6,7 @@ the sole business-assistant structured response and makes one bounded retry
 for malformed structured output only.
 """
 import json
+import re
 from types import SimpleNamespace
 from whatsapp_ai_json_resilience import (
     call_business_ai_resilient, safe_automation_interest_reply,
@@ -16,6 +17,33 @@ FALLBACK_SIGNATURE = (
     "Please try again shortly"
 )
 ASSISTANT_INSTRUCTIONS_MARKER = "You are the official WhatsApp AI Business Assistant"
+
+
+NAVIGATION_FOOTERS = {
+    "english": "Reply 0 to talk to Jones. Reply MENU to return to the main menu.",
+    "chichewa": "Tumizani 0 kuti mulankhule ndi Jones. Tumizani MENU kuti mubwerere ku menyu yayikulu.",
+    "tumbuka": "Tumizgani 0 kuti muyowoye na Jones. Tumizgani MENU kuti muwelere ku menyu yikuru.",
+}
+TUMBUKA_REPLY_WORDS = re.compile(r"\b(tingamovwirani|tingamovwira|mungatuma|mukukhumba|yowoyani|tumizgani|malonda ghinu)\b")
+CHICHEWA_REPLY_WORDS = re.compile(r"\b(zabwino|zikumveka|kukuthandizeni|kuthandiza|kukupangirani|kukupangilani|bizinesi yanu|mukufuna|muli ndi|tumizani|mulankhule|mpunga)\b")
+
+
+def add_navigation_footer(reply):
+    """Add stable shortcuts to the outgoing reply in its detected language."""
+    if not isinstance(reply, str) or not reply.strip():
+        return reply
+    reply = reply.rstrip()
+    if any(reply.endswith(footer) for footer in NAVIGATION_FOOTERS.values()):
+        return reply
+    normalized = reply.casefold()
+    if TUMBUKA_REPLY_WORDS.search(normalized):
+        language = "tumbuka"
+    elif CHICHEWA_REPLY_WORDS.search(normalized):
+        language = "chichewa"
+    else:
+        language = "english"
+    with_footer = f"{reply}\n\n{NAVIGATION_FOOTERS[language]}"
+    return with_footer if len(with_footer) <= 4096 else reply
 
 
 def is_business_assistant_request(args, kwargs):
@@ -90,21 +118,23 @@ def install_whatsapp_ai_resilience(flask_app):
         result = original_generate(customer_number, customer_message, *args, **kwargs)
         if not isinstance(result, dict):
             return result
-        reply = str(result.get("reply") or "")
-        if FALLBACK_SIGNATURE not in reply:
-            return result
-        # Only a narrow, well-known business AI sales question receives a
-        # deterministic response; no fabricated human alert or qualified lead.
-        service_reply = safe_automation_interest_reply(customer_message)
-        if service_reply:
-            result = dict(result)
-            result["reply"] = service_reply
-            result["lead_required"] = False
-            for key in ("service", "lead_summary", "handover_reason",
-                        "attachment_memory"):
-                result[key] = ""
-            result["detected_urls"] = []
-            print("IBROWS AI SALES CONTINUITY: safe fallback served", flush=True)
+        reply = result.get("reply")
+        if isinstance(reply, str) and FALLBACK_SIGNATURE in reply:
+            # Only a narrow, well-known business AI sales question receives a
+            # deterministic response; no fabricated human alert or qualified lead.
+            service_reply = safe_automation_interest_reply(customer_message)
+            if service_reply:
+                result = dict(result)
+                result["reply"] = service_reply
+                result["lead_required"] = False
+                for key in ("service", "lead_summary", "handover_reason",
+                            "attachment_memory"):
+                    result[key] = ""
+                result["detected_urls"] = []
+                print("IBROWS AI SALES CONTINUITY: safe fallback served", flush=True)
+        reply = add_navigation_footer(result.get("reply"))
+        if reply != result.get("reply"):
+            return {**result, "reply": reply}
         return result
 
     guarded_generate._ibrows_safe_ai_json = True

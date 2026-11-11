@@ -5,6 +5,7 @@ import sys
 from types import SimpleNamespace, ModuleType
 from unittest.mock import patch
 from whatsapp_ai_runtime_resilience import (
+    NAVIGATION_FOOTERS, add_navigation_footer,
     install_whatsapp_ai_resilience, is_business_assistant_request
 )
 
@@ -48,6 +49,21 @@ def fixture(outputs):
 
 
 class RuntimeResilienceTests(unittest.TestCase):
+    def test_navigation_footer_matches_reply_language_and_is_idempotent(self):
+        for language, reply in {
+            "english": "We can help with WhatsApp AI.",
+            "chichewa": "Zabwino. Titha kukuthandizeni ndi bizinesi yanu.",
+            "tumbuka": "Tingamovwirani para mukukhumba.",
+        }.items():
+            with self.subTest(language=language):
+                decorated = add_navigation_footer(reply)
+                self.assertEqual(decorated, reply + "\n\n" + NAVIGATION_FOOTERS[language])
+                self.assertEqual(add_navigation_footer(decorated), decorated)
+
+    def test_navigation_footer_keeps_full_length_reply_intact(self):
+        reply = "A" * 4096
+        self.assertEqual(add_navigation_footer(reply), reply)
+
     def test_route_match_limited_to_business_assistant(self):
         self.assertTrue(is_business_assistant_request((),{
             "model":"gpt-5.6-luna","store":False,
@@ -82,6 +98,7 @@ class RuntimeResilienceTests(unittest.TestCase):
         result=ns["generate_ai_reply"]("TEST_NUMBER",msg)
         self.assertIn("IBROWS",result["reply"])
         self.assertIn("bizinesi",result["reply"])
+        self.assertTrue(result["reply"].endswith(NAVIGATION_FOOTERS["chichewa"]))
         self.assertNotIn("temporarily unavailable",result["reply"])
         self.assertFalse(result["lead_required"])
         self.assertEqual(len(calls),0)
@@ -105,7 +122,7 @@ class RuntimeResilienceTests(unittest.TestCase):
         app,ns,endpoint,calls=fixture([])
         self.assertTrue(install_whatsapp_ai_resilience(app))
         result=ns["generate_ai_reply"]("TEST_NUMBER","Do I qualify for a scholarship?")
-        self.assertEqual(result["reply"],GENERIC)
+        self.assertEqual(result["reply"], GENERIC + "\n\n" + NAVIGATION_FOOTERS["english"])
         self.assertFalse(result["lead_required"])
 
 
