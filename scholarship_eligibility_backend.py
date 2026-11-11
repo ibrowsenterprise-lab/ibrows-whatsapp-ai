@@ -41,36 +41,66 @@ ACTION_NOTES = {
 
 
 
-def classify_customer_reply(last_intake, last_inbound):
-    """Describe saved conversation activity; NEVER infer report completion.
+def academic_reply_evidence(messages):
+    """Describe topics present in saved user replies without inventing credentials.
 
-    A newly received text may be a question, acknowledgement or qualification,
-    so show it as a reply awaiting review rather than claiming documents arrived.
+    This is a routing hint only, not proof of qualifications, transcript receipt,
+    graduation, or scholarship eligibility. Never send message content to logs.
+    """
+    import re
+    combined = "\n".join(str(message or "") for message in messages)[-18000:].casefold()
+    patterns = {
+        "degree": r"\b(bachelor(?:'s|s)?|bsc|b\.?a\.?|undergraduate|degree)\b",
+        "grade": r"\b(gpa|cgpa|classification|first class|second class|third class|honou?rs)\b",
+        "experience": r"\b(experience|banking|manager|worked|working|years? in)\b",
+        "location": r"\b(malawi|malawian|resident|nationality|citizenship)\b",
+        "language": r"\b(english|ielts|toefl|duolingo|medium of instruction)\b",
+        "destination": r"\b(finland|uk|united kingdom|europe|sweden|germany|norway|netherlands|country|countries)\b",
+    }
+    return tuple(label for label, pattern in patterns.items()
+                 if re.search(pattern, combined))
+
+
+def classify_customer_reply(last_intake, last_inbound, evidence=()):
+    """Conservatively separate payment, intake, review and delivery.
+
+    Intake metadata can flag work for a reviewer; it must never mark an
+    eligibility assessment finished, produce an academic verdict, or charge.
     """
     if last_intake is None:
         return (
-            "No academic intake request found in the saved conversation",
-            "If you have already sent it, check the IBROWS Inbox first. "
-            "Copying a message is not the same as sending it.",
-            False,
+            "No saved academic intake request found",
+            "Check the secure IBROWS Inbox before asking the customer for details. "
+            "Only a real saved intake message counts as sent.",
+            False, False,
         )
     if last_inbound is not None and last_inbound > last_intake:
+        ready = all(item in evidence for item in ("degree", "grade", "experience")) and len(evidence) >= 4
+        if ready:
+            return (
+                "Academic answers already received — assessment review required",
+                "Saved replies include degree, grading and experience topics. "
+                "Review the actual client answers in the Inbox, verify missing "
+                "evidence where needed, and perform the paid assessment. "
+                "Do not resend the full intake or mark a report delivered.",
+                True, True,
+            )
         return (
-            "New customer reply since the intake request",
-            "Open the IBROWS Inbox and read the reply. Only mark details "
-            "received after confirming what the customer actually provided.",
-            True,
+            "Customer replied — review their existing answers",
+            "Open the Inbox and check what was provided. Ask only for missing "
+            "academic details; do not send the entire intake form again.",
+            True, False,
         )
     return (
-        "Waiting for the customer's response",
-        "The academic-information request is recorded in the conversation, "
-        "but delivery to the customer's handset is not independently confirmed.",
-        False,
+        "Awaiting response to recorded academic intake",
+        "The request was saved to the conversation. Handset delivery is not "
+        "independently proved by this timestamp alone.",
+        False, False,
     )
 
 
 def get_customer_reply_status(db_factory, customer_number):
-    """Read-only activity check keyed to this exact customer's CRM number."""
+    """Read saved intake and replies for this exact customer; no writes or sends."""
     try:
         with db_factory() as conn:
             with conn.cursor() as cur:
@@ -99,26 +129,35 @@ def get_customer_reply_status(db_factory, customer_number):
                     customer_number,
                 ))
                 row = cur.fetchone()
-        if not row:
-            raise ValueError("No conversation activity returned")
-        return classify_customer_reply(row[0],row[1])
+                if not row:
+                    raise ValueError("No conversation activity returned")
+                evidence = ()
+                if row[0] is not None and row[1] is not None and row[1] > row[0]:
+                    cur.execute("""
+                        SELECT content FROM conversations
+                        WHERE customer_number=%s AND role='user'
+                          AND created_at>%s
+                        ORDER BY created_at DESC LIMIT 40
+                    """, (customer_number, row[0]))
+                    evidence = academic_reply_evidence([r[0] for r in cur.fetchall()])
+        return classify_customer_reply(row[0], row[1], evidence)
     except Exception as exc:
-        # No customer details in logs. The page stays available even during
-        # temporary database errors; never show a false 'no reply' conclusion.
         print("IBROWS ELIGIBILITY REPLY STATUS UNAVAILABLE: "
-              +type(exc).__name__,flush=True)
+              + type(exc).__name__, flush=True)
         return (
-            "Reply status temporarily unavailable",
-            "Open the IBROWS Inbox to check customer replies directly.",
-            False,
+            "Saved academic reply check temporarily unavailable",
+            "Open the secure IBROWS Inbox to review answers before requesting more.",
+            False, False,
         )
 
 
-def can_move_stage(current, target, payment_state):
+def can_move_stage(current, target, payment_state, intake_ready=False):
     return bool(
         is_verified_one_off(payment_state)
-        and current in NEXT_STAGES
-        and NEXT_STAGES[current] == target
+        and (
+            (current in NEXT_STAGES and NEXT_STAGES[current] == target)
+            or (intake_ready and current == DEFAULT_STAGE and target == "REVIEWING")
+        )
     )
 
 
@@ -158,12 +197,20 @@ label{display:flex;gap:10px;align-items:flex-start;margin:12px 0}input[type=chec
 <a class="action outline" href="{{ url_for('admin_inbox_chat',customer_number=customer_number) }}">Read latest customer messages</a>
 </section>
 <section class="card">
-<h2>Step 1 · Collect academic details</h2>
-<p class="small">Before sending, check whether the client has already answered these questions in the inbox. Send only what is still missing. Copying the message does not send it or start work automatically.</p>
+<h2>Step 1 · Review existing academic answers</h2>
+{% if intake_ready %}
+<div class="reply new"><strong>Intake answers are already saved.</strong>
+<p>Read the client's messages in the secure Inbox and assess what they provided. Do not send a second intake questionnaire or request another payment. Transcript and evidence still require verification.</p></div>
+{% elif new_reply %}
+<div class="reply"><strong>The client has replied.</strong>
+<p>Review those messages first. Request only any details still missing. Do not repeat questions already answered.</p></div>
+{% else %}
+<p class="small">If the client has not provided academic details, copy this intake message to the Inbox and send it. Copying it does not send it.</p>
 <textarea id="intake" readonly>{{ intake_message }}</textarea>
 <button type="button" id="copy-intake" onclick="copyIntake()">Copy intake message</button>
-<a class="action outline" href="{{ url_for('admin_inbox_chat',customer_number=customer_number) }}">Open IBROWS WhatsApp Inbox</a>
-<p id="copy-status" class="small" aria-live="polite">Use the inbox to send the message; copying it does not send anything automatically.</p>
+<p id="copy-status" class="small" aria-live="polite">Copying does not send anything automatically.</p>
+{% endif %}
+<a class="action outline" href="{{ url_for('admin_inbox_chat',customer_number=customer_number) }}">Read client answers in IBROWS Inbox</a>
 </section>
 <section class="card">
 <h2>Step 2 · Track actual work</h2>
@@ -186,7 +233,7 @@ MK40,000 application-support or monthly scholarship package. Never promise a sch
 </section></main>
 <script>
 function copyIntake(){
- const el=document.getElementById('intake');el.focus();el.select();
+ const el=document.getElementById('intake');if(!el)return;el.focus();el.select();
  const value=el.value;
  if(navigator.clipboard && navigator.clipboard.writeText){
    navigator.clipboard.writeText(value).then(()=>{
@@ -246,11 +293,15 @@ def install_eligibility_work_queue(flask_app):
                 else:
                     stage = DEFAULT_STAGE
 
+        reply_title, reply_description, new_reply, intake_ready = get_customer_reply_status(
+            ns["get_db"], number
+        )
         if request.method == "POST":
             if not paid or status == "CLOSED":
                 abort(409)
             target = request.form.get("next_stage")
-            if request.form.get("confirm_action") != "1" or not can_move_stage(stage,target,state):
+            if (request.form.get("confirm_action") != "1"
+                    or not can_move_stage(stage,target,state,intake_ready=intake_ready)):
                 abort(409)
             with ns["get_db"]() as conn:
                 with conn.cursor() as cur:
@@ -277,7 +328,7 @@ def install_eligibility_work_queue(flask_app):
                         (lead_id,),
                     )
                     latest_stage = cur.fetchone()[0]
-                    if not can_move_stage(latest_stage,target,state):
+                    if not can_move_stage(latest_stage,target,state,intake_ready=intake_ready):
                         abort(409)
                     cur.execute("""
                         UPDATE scholarship_eligibility_cases
@@ -293,17 +344,21 @@ def install_eligibility_work_queue(flask_app):
                 conn.commit()
             return redirect(url_for("admin_eligibility_case",lead_id=lead_id),code=303)
 
-        next_stage=NEXT_STAGES.get(stage)
-        reply_title, reply_description, new_reply = get_customer_reply_status(
-            ns["get_db"],number
-        )
+        next_stage=("REVIEWING" if stage == DEFAULT_STAGE and intake_ready
+                    else NEXT_STAGES.get(stage))
+        stage_label=("Intake answers recorded — eligibility assessment awaiting review"
+                     if stage == DEFAULT_STAGE and intake_ready
+                     else STAGES.get(stage,"Unknown"))
+        action_label=("Confirm existing answers reviewed — start assessment"
+                      if stage == DEFAULT_STAGE and intake_ready
+                      else ACTION_LABELS.get(next_stage))
         resp = render_template_string(
             PAGE, lead_id=lead_id,customer_name=name,customer_number=number,
             enquiry_status=status,paid=paid,stage=stage,
-            stage_label=STAGES.get(stage,"Unknown"),next_stage=next_stage,
+            stage_label=stage_label,next_stage=next_stage,
             reply_title=reply_title,reply_description=reply_description,
-            new_reply=new_reply,
-            action_label=ACTION_LABELS.get(next_stage),
+            new_reply=new_reply,intake_ready=intake_ready,
+            action_label=action_label,
             csrf_token=ns["get_csrf_token"](),
             intake_message=paid_eligibility_intake_message(),
         )
