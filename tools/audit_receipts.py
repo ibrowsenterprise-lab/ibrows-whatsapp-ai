@@ -18,3 +18,14 @@ for name,lo,hi in fns:
    row=s[i-1]
    if any(x in row.lower() for x in ("secret","password","access_token","api_key","authorization","bearer")):row="[redacted]"
    print(f"{i:05d} {row[:240]}")
+
+print("=== FOCUSED RECEIPT/ADMIN IMPLEMENTATION ===")
+for lo,hi in [
+ (9250,9420),(9750,9905),(10150,10265),(13970,14072),
+ (28650,28682),(29635,29720),(30005,30075),
+ (15600,15630),(28060,28126)]:
+ print("RANGE",lo,hi)
+ for i in range(lo,hi+1):
+  row=s[i-1]
+  if any(k in row.lower() for k in ("api_key","access_token","password","authorization","bearer","secret")):row="[sanitized]"
+  print(f"{i:05d} {row[:250]}")
