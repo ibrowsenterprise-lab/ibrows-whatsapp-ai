@@ -76,3 +76,33 @@ def unpaid_eligibility_intake_message():
         "team confirms a balance is actually outstanding. Reply 0 for "
         "human assistance."
     )
+
+
+def required_documents_request_message():
+    """Professional follow-up for paid clients whose academic answers are saved.
+
+    Administrator copies into the secure WhatsApp Inbox after checking whether
+    documents were previously provided. The function itself never sends.
+    """
+    return (
+        "Hello, and thank you for completing your IBROWS Scholarship "
+        "Eligibility Check questionnaire. We have your academic and "
+        "professional details on record, so you do not need to answer "
+        "those questions again.\n\n"
+        "Before we complete your eligibility assessment, please share:\n"
+        "1. Your most recent CV/resume (PDF or Word document).\n"
+        "2. Your Bachelor's academic transcript showing your modules "
+        "and results (clear PDF or readable images).\n\n"
+        "If either document has already been sent, please tell us and "
+        "we will check your existing record. If you cannot obtain a "
+        "transcript yet, let us know so we can explain what can be "
+        "assessed provisionally and what remains unverified.\n\n"
+        "For your privacy, do not send banking details, passwords, PINs, "
+        "national ID numbers or unrelated sensitive information. You may "
+        "hide unnecessary personal identifiers from the documents.\n\n"
+        "Your MWK 5,000 eligibility-check payment is already confirmed. "
+        "No additional payment is required for this service. "
+        "We will confirm receipt of the documents and review them "
+        "before issuing your written eligibility assessment.\n\n"
+        "Thank you for choosing IBROWS Enterprise."
+    )

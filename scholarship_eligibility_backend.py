@@ -8,6 +8,7 @@ existing verified payment. No academic documents are stored here.
 from decimal import Decimal
 from scholarship_eligibility_intake import (
     SERVICE, REQUIRED_MWK, is_verified_one_off, paid_eligibility_intake_message,
+    required_documents_request_message,
 )
 
 DEFAULT_STAGE = "PAID_AWAITING_INTAKE"
@@ -34,7 +35,7 @@ ACTION_LABELS = {
 }
 ACTION_NOTES = {
     "AWAITING_INFORMATION": "Staff confirmed one-off eligibility intake message was sent to customer.",
-    "REVIEWING": "Staff confirmed relevant academic details received and began eligibility review.",
+    "REVIEWING": "Staff confirmed the CV and transcript were both received and checked, and began eligibility assessment.",
     "READY_FOR_DELIVERY": "Staff confirmed one-off eligibility report reviewed for delivery.",
     "DELIVERED": "Staff confirmed one-off eligibility report delivered to customer.",
 }
@@ -197,6 +198,19 @@ def get_customer_reply_status_extended(db_factory, customer_number):
         return title, description, new_reply, False
 
 
+def documents_confirmed_for_review(form, target):
+    """Start the paid assessment only after both documents are manually checked.
+
+    The administrator must open the private Inbox and review the actual CV
+    and academic transcript. Text-only intake is never sufficient.
+    This routine does not read or expose document contents.
+    """
+    if target != "REVIEWING":
+        return True
+    return (form.get("confirm_cv_received") == "1"
+            and form.get("confirm_transcript_received") == "1")
+
+
 def can_move_stage(current, target, payment_state, intake_ready=False):
     return bool(
         is_verified_one_off(payment_state)
@@ -258,8 +272,20 @@ label{display:flex;gap:10px;align-items:flex-start;margin:12px 0}input[type=chec
 {% endif %}
 <a class="action outline" href="{{ url_for('admin_inbox_chat',customer_number=customer_number) }}">Open IBROWS WhatsApp Inbox — read client answers</a>
 </section>
+{% if paid and stage in ('PAID_AWAITING_INTAKE','AWAITING_INFORMATION') %}
 <section class="card">
-<h2>Step 2 · Track actual work</h2>
+<h2>Step 2 · Verify CV and transcript</h2>
+<div class="warning"><strong>Documents require manual verification.</strong>
+<p>Saved questionnaire answers do not prove that a CV or transcript was uploaded. Check any existing WhatsApp attachments first; do not ask the customer to resend files already present.</p></div>
+<p class="small">When these documents are missing, copy this tailored request and send it using the private Inbox. This button only copies text; it does not send any message or change the customer's case.</p>
+<textarea id="documents" readonly>{{ documents_message }}</textarea>
+<button type="button" onclick="copyDocuments()">Copy missing-document request</button>
+<a class="action outline" href="{{ url_for('admin_inbox_chat',customer_number=customer_number) }}">Open secure IBROWS Inbox to request or verify files</a>
+<p class="small" id="documents-copy-status" aria-live="polite">Do not request additional payment or a repeated academic questionnaire.</p>
+</section>
+{% endif %}
+<section class="card">
+<h2>Step 3 · Track actual work</h2>
 <p><strong>{{ stage_label }}</strong></p>
 {% if stage == 'DELIVERED' %}
 <p class="small">The eligibility assessment is marked delivered. This does not imply scholarship admission or a submitted university application.</p>
@@ -267,6 +293,14 @@ label{display:flex;gap:10px;align-items:flex-start;margin:12px 0}input[type=chec
 <form method="post" action="{{ url_for('admin_eligibility_case',lead_id=lead_id) }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <input type="hidden" name="next_stage" value="{{ next_stage }}">
+{% if next_stage == 'REVIEWING' %}
+<div class="warning"><strong>Evidence gate before assessment:</strong>
+<p>Review the real uploaded documents in the secure Inbox. Do not tick these boxes based only on the client's typed GPA or work history.</p></div>
+<label><input type="checkbox" name="confirm_cv_received" value="1" required>
+<span>I have opened and checked this client's actual CV/resume.</span></label>
+<label><input type="checkbox" name="confirm_transcript_received" value="1" required>
+<span>I have opened and checked this client's actual Bachelor's academic transcript.</span></label>
+{% endif %}
 <label><input type="checkbox" name="confirm_action" value="1" required>
 <span>I confirm this step actually happened. The system will record my confirmation, not perform the step for me.</span></label>
 <button type="submit">{{ action_label }}</button>
@@ -278,6 +312,16 @@ label{display:flex;gap:10px;align-items:flex-start;margin:12px 0}input[type=chec
 MK40,000 application-support or monthly scholarship package. Never promise a scholarship award.</p>
 </section></main>
 <script>
+function copyDocuments(){
+ const el=document.getElementById('documents');if(!el)return;
+ el.focus();el.select();const value=el.value;
+ const info=document.getElementById('documents-copy-status');
+ if(navigator.clipboard && navigator.clipboard.writeText){
+   navigator.clipboard.writeText(value).then(()=>{
+     info.textContent='Copied. Paste into the secure Inbox and send manually.';
+   }).catch(()=>{info.textContent='Text selected. Copy it using your phone menu.';});
+ }else{info.textContent='Text selected. Copy it using your phone menu.';}
+}
 function copyIntake(){
  const el=document.getElementById('intake');if(!el)return;el.focus();el.select();
  const value=el.value;
@@ -347,6 +391,7 @@ def install_eligibility_work_queue(flask_app):
                 abort(409)
             target = request.form.get("next_stage")
             if (request.form.get("confirm_action") != "1"
+                    or not documents_confirmed_for_review(request.form, target)
                     or not can_move_stage(stage,target,state,intake_ready=intake_ready)):
                 abort(409)
             with ns["get_db"]() as conn:
@@ -392,10 +437,10 @@ def install_eligibility_work_queue(flask_app):
 
         next_stage=("REVIEWING" if stage == DEFAULT_STAGE and intake_ready
                     else NEXT_STAGES.get(stage))
-        stage_label=("Intake answers recorded — eligibility assessment awaiting review"
+        stage_label=("Academic answers recorded — awaiting verified CV and transcript"
                      if stage == DEFAULT_STAGE and intake_ready
                      else STAGES.get(stage,"Unknown"))
-        action_label=("Confirm existing answers reviewed — start assessment"
+        action_label=("Confirm documents checked — begin paid assessment"
                       if stage == DEFAULT_STAGE and intake_ready
                       else ACTION_LABELS.get(next_stage))
         resp = render_template_string(
@@ -407,6 +452,7 @@ def install_eligibility_work_queue(flask_app):
             action_label=action_label,
             csrf_token=ns["get_csrf_token"](),
             intake_message=paid_eligibility_intake_message(),
+            documents_message=required_documents_request_message(),
         )
         from flask import make_response
         r=make_response(resp)
