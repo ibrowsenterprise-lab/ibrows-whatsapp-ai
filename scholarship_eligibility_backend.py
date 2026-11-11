@@ -40,6 +40,80 @@ ACTION_NOTES = {
 }
 
 
+
+def classify_customer_reply(last_intake, last_inbound):
+    """Describe saved conversation activity; NEVER infer report completion.
+
+    A newly received text may be a question, acknowledgement or qualification,
+    so show it as a reply awaiting review rather than claiming documents arrived.
+    """
+    if last_intake is None:
+        return (
+            "No academic intake request found in the saved conversation",
+            "If you have already sent it, check the IBROWS Inbox first. "
+            "Copying a message is not the same as sending it.",
+            False,
+        )
+    if last_inbound is not None and last_inbound > last_intake:
+        return (
+            "New customer reply since the intake request",
+            "Open the IBROWS Inbox and read the reply. Only mark details "
+            "received after confirming what the customer actually provided.",
+            True,
+        )
+    return (
+        "Waiting for the customer's response",
+        "The academic-information request is recorded in the conversation, "
+        "but delivery to the customer's handset is not independently confirmed.",
+        False,
+    )
+
+
+def get_customer_reply_status(db_factory, customer_number):
+    """Read-only activity check keyed to this exact customer's CRM number."""
+    try:
+        with db_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                      (
+                        SELECT MAX(created_at)
+                        FROM conversations
+                        WHERE customer_number=%s
+                          AND role='assistant'
+                          AND (
+                            POSITION(%s IN content)>0 OR
+                            POSITION(%s IN content)>0
+                          )
+                      ) AS intake_at,
+                      (
+                        SELECT MAX(created_at)
+                        FROM conversations
+                        WHERE customer_number=%s
+                          AND role='user'
+                      ) AS last_customer_at
+                """, (
+                    customer_number,
+                    "Your MK5,000 Scholarship Eligibility Check payment is confirmed",
+                    "IBROWS Enterprise 🎓 | Scholarship Eligibility Check",
+                    customer_number,
+                ))
+                row = cur.fetchone()
+        if not row:
+            raise ValueError("No conversation activity returned")
+        return classify_customer_reply(row[0],row[1])
+    except Exception as exc:
+        # No customer details in logs. The page stays available even during
+        # temporary database errors; never show a false 'no reply' conclusion.
+        print("IBROWS ELIGIBILITY REPLY STATUS UNAVAILABLE: "
+              +type(exc).__name__,flush=True)
+        return (
+            "Reply status temporarily unavailable",
+            "Open the IBROWS Inbox to check customer replies directly.",
+            False,
+        )
+
+
 def can_move_stage(current, target, payment_state):
     return bool(
         is_verified_one_off(payment_state)
@@ -62,7 +136,7 @@ h1{font-size:23px;margin:5px 0}h2{font-size:18px;margin:2px 0 10px}
 button,a.action{display:block;text-align:center;width:100%;padding:13px 12px;min-height:47px;border-radius:9px;background:#101828;color:white;border:0;text-decoration:none;font-weight:750;font-size:14px;cursor:pointer;margin:9px 0}
 button[disabled]{background:#b0b6c4;cursor:not-allowed}a.outline{border:1px solid #ccd2da;background:white;color:#101828}
 textarea{display:block;width:100%;height:290px;resize:vertical;padding:12px;border:1px solid #ccd2da;border-radius:9px;font:13px/1.55 system-ui;white-space:pre-wrap}
-.warning{background:#fff7eb;border-radius:10px;padding:12px;font-size:13px}
+.warning{background:#fff7eb;border-radius:10px;padding:12px;font-size:13px}.reply{border-left:4px solid #1d4ed8;background:#eff6ff;padding:12px;border-radius:8px}.reply.new{border-left-color:#b45309;background:#fffbeb}
 label{display:flex;gap:10px;align-items:flex-start;margin:12px 0}input[type=checkbox]{width:21px;height:21px;flex-shrink:0}
 </style></head><body>
 <header><a href="{{ url_for('admin_leads') }}">← Customers &amp; Enquiries</a></header>
@@ -75,8 +149,17 @@ label{display:flex;gap:10px;align-items:flex-start;margin:12px 0}input[type=chec
 <p class="small">Enquiry: {{ enquiry_status }} · Assessment: {{ stage_label }}</p>
 </section>
 <section class="card">
+<h2>Customer reply tracker</h2>
+<div class="reply{% if new_reply %} new{% endif %}">
+<strong>{{ reply_title }}</strong>
+<p class="small">{{ reply_description }}</p>
+</div>
+<p class="small">This checks only recorded conversation timestamps, not whether a WhatsApp message was delivered or whether academic documents are complete. Refresh this page to check again.</p>
+<a class="action outline" href="{{ url_for('admin_inbox_chat',customer_number=customer_number) }}">Read latest customer messages</a>
+</section>
+<section class="card">
 <h2>Step 1 · Collect academic details</h2>
-<p class="small">This message reflects the customer's already-stated European Master's goal. Send it through the customer's IBROWS conversation. It does not request a new payment.</p>
+<p class="small">Before sending, check whether the client has already answered these questions in the inbox. Send only what is still missing. Copying the message does not send it or start work automatically.</p>
 <textarea id="intake" readonly>{{ intake_message }}</textarea>
 <button type="button" id="copy-intake" onclick="copyIntake()">Copy intake message</button>
 <a class="action outline" href="{{ url_for('admin_inbox_chat',customer_number=customer_number) }}">Open IBROWS WhatsApp Inbox</a>
@@ -211,10 +294,15 @@ def install_eligibility_work_queue(flask_app):
             return redirect(url_for("admin_eligibility_case",lead_id=lead_id),code=303)
 
         next_stage=NEXT_STAGES.get(stage)
+        reply_title, reply_description, new_reply = get_customer_reply_status(
+            ns["get_db"],number
+        )
         resp = render_template_string(
             PAGE, lead_id=lead_id,customer_name=name,customer_number=number,
             enquiry_status=status,paid=paid,stage=stage,
             stage_label=STAGES.get(stage,"Unknown"),next_stage=next_stage,
+            reply_title=reply_title,reply_description=reply_description,
+            new_reply=new_reply,
             action_label=ACTION_LABELS.get(next_stage),
             csrf_token=ns["get_csrf_token"](),
             intake_message=paid_eligibility_intake_message(),
