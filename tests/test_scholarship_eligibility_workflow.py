@@ -10,7 +10,7 @@ from scholarship_eligibility_intake import (
 )
 from scholarship_eligibility_backend import (
     DEFAULT_STAGE, NEXT_STAGES, PAGE, can_move_stage,
-    install_eligibility_work_queue,
+    install_eligibility_work_queue, documents_confirmed_for_review,
 )
 
 SOURCE=Path(__file__).resolve().parents[1]/"app.py"
@@ -126,6 +126,32 @@ class AdminCaseTests(unittest.TestCase):
             current=next_stage
         self.assertFalse(can_move_stage("AWAITING_INFORMATION","DELIVERED",GOOD))
         self.assertFalse(can_move_stage("DELIVERED","AWAITING_INFORMATION",GOOD))
+
+    def test_cv_and_transcript_are_both_required_before_review(self):
+        self.assertTrue(documents_confirmed_for_review({
+            "confirm_cv_received": "1", "confirm_transcript_received": "1"
+        }, "REVIEWING"))
+        for form in ({}, {"confirm_cv_received": "1"},
+                     {"confirm_transcript_received": "1"},
+                     {"confirm_cv_received": "yes", "confirm_transcript_received": "1"}):
+            self.assertFalse(documents_confirmed_for_review(form, "REVIEWING"))
+        self.assertTrue(documents_confirmed_for_review({}, "AWAITING_INFORMATION"))
+        self.assertTrue(documents_confirmed_for_review({}, "READY_FOR_DELIVERY"))
+        self.assertFalse(can_move_stage(DEFAULT_STAGE, "DELIVERED", GOOD, intake_ready=True))
+
+    def test_document_request_respects_privacy_and_existing_payment(self):
+        from scholarship_eligibility_intake import required_documents_request_message
+        msg = required_documents_request_message()
+        self.assertIn("CV/resume",msg)
+        self.assertIn("academic transcript",msg)
+        self.assertIn("already been sent",msg)
+        self.assertIn("No additional payment",msg)
+        self.assertIn("not need to answer",msg)
+        self.assertNotIn("send your PIN",msg)
+        self.assertIn("name=\"confirm_cv_received\"",PAGE)
+        self.assertIn("name=\"confirm_transcript_received\"",PAGE)
+        self.assertIn("does not send any message",PAGE)
+        self.assertIn("copyDocuments()",PAGE)
 
     def test_admin_page_has_csrf_confirmation_and_no_auto_send(self):
         from flask import Flask
