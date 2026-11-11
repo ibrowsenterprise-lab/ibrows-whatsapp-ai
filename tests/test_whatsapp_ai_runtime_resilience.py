@@ -34,13 +34,13 @@ def fixture(outputs):
         return SimpleNamespace(output_text="UNRELATED_OK")
     endpoint=SimpleNamespace(create=fake_create)
     client=SimpleNamespace(responses=endpoint)
-    ns={"client":client,"validate_ai_structured_output":fake_validator}
+    ns={"client":client,"validate_ai_structured_output":fake_validator,"generic":GENERIC}
     exec("def generate_ai_reply(customer_number,customer_message,**kwargs):\n"
          "    return {'reply': generic, 'lead_required':False,'service':'',"
          "'lead_summary':'','handover_reason':'','attachment_memory':'',"
          "'detected_urls':[]}\n"
          "def receive_webhook():\n    return None\n",
-         {**ns,"generic":GENERIC},ns)
+         ns)
     app=SimpleNamespace(view_functions={"receive_webhook":ns["receive_webhook"]})
     return app,ns,endpoint,requests
 
