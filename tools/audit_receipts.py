@@ -29,3 +29,11 @@ for lo,hi in [
   row=s[i-1]
   if any(k in row.lower() for k in ("api_key","access_token","password","authorization","bearer","secret")):row="[sanitized]"
   print(f"{i:05d} {row[:250]}")
+
+print("=== RECEIPT CORE ===")
+for lo,hi in [(9030,9275),(9419,9755),(14065,14098),(16005,16108),(29695,29705)]:
+ print("RECEIPT_RANGE",lo,hi)
+ for i in range(lo,hi+1):
+  row=s[i-1]
+  if any(x in row.lower() for x in ("secret","password","access_token","api_key","authorization","bearer")):row="[sanitized]"
+  print(f"{i:05d} {row[:242]}")
