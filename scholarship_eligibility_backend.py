@@ -84,9 +84,9 @@ def classify_customer_reply(last_intake, last_inbound):
     )
 
 
-def classify_customer_reply_with_evidence(last_intake, last_inbound, evidence=()):
-    """Four-field optional enhancement for the paid assessment admin queue."""
-    title, description, new_reply = classify_customer_reply(last_intake, last_inbound)
+def _enhance_reply_status(base, evidence=()):
+    """Elevate only a known new inbound reply with substantive topic evidence."""
+    title, description, new_reply = base
     ready = bool(
         new_reply
         and all(k in evidence for k in ("degree", "grade", "experience"))
@@ -109,6 +109,13 @@ def classify_customer_reply_with_evidence(last_intake, last_inbound, evidence=()
             True, False,
         )
     return title, description, new_reply, False
+
+
+def classify_customer_reply_with_evidence(last_intake, last_inbound, evidence=()):
+    """Four-field optional enhancement for the paid assessment admin queue."""
+    return _enhance_reply_status(
+        classify_customer_reply(last_intake, last_inbound), evidence
+    )
 
 
 def get_customer_reply_status(db_factory, customer_number):
@@ -180,9 +187,9 @@ def get_customer_reply_status_extended(db_factory, customer_number):
                     "IBROWS Enterprise 🎓 | Scholarship Eligibility Check",
                 ))
                 evidence = academic_reply_evidence([row[0] for row in cur.fetchall()])
-        # The legacy query has already established replies after the saved intake.
-        return classify_customer_reply_with_evidence(
-            True, True, evidence
+        # The legacy query established the new reply; no invented timestamps.
+        return _enhance_reply_status(
+            (title, description, new_reply), evidence
         )
     except Exception as exc:
         print("IBROWS ELIGIBILITY EVIDENCE CHECK UNAVAILABLE: "
