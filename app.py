@@ -6114,6 +6114,42 @@ def handle_local_human_handover(
             service=handover_service,
             handover_reason=handover_reason,
         )
+        # In addition to email, route human-takeover notifications to the
+        # explicitly designated old IBROWS WhatsApp Business App number.
+        # Free-form requires that recipient's own 24h inbound service window;
+        # outside it only an explicitly configured, approved template is used.
+        from handover_business_alerts import (
+            BUSINESS_ALERT_NUMBER,
+            configured_template,
+            configured_template_language,
+            deliver_handover_alert,
+            save_alert_audit,
+        )
+        try:
+            business_alert_window_open, _ = is_whatsapp_service_window_open(
+                BUSINESS_ALERT_NUMBER
+            )
+            alert_status, alert_channel = deliver_handover_alert(
+                customer_name, customer_number, handover_service,
+                window_open=business_alert_window_open,
+                send_text=send_whatsapp_message,
+                token=WHATSAPP_TOKEN, phone_number_id=PHONE_NUMBER_ID,
+                http_post=requests.post,
+                template_name=configured_template(),
+                template_language=configured_template_language(),
+            )
+            save_alert_audit(get_db, lead_id, alert_status, alert_channel)
+            print(
+                "IBROWS HANDOVER WHATSAPP ALERT: " + alert_status
+                + " via " + alert_channel + " to 0882 242 594",
+                flush=True,
+            )
+        except Exception as alert_error:
+            print(
+                "IBROWS HANDOVER WHATSAPP ALERT UNAVAILABLE: "
+                + type(alert_error).__name__,
+                flush=True,
+            )
     except Exception as handover_error:
         print(
             f"Local handover lead/notification error: {type(handover_error).__name__}: {handover_error}",
@@ -19731,6 +19767,23 @@ def receive_webhook():
                 f"MEDIA MESSAGE ACCEPTED: {message_type.upper()}",
                 flush=True
             )
+
+        # IBROWS's old WhatsApp Business App number can open its own 24-hour
+        # messaging window with a simple opt-in command. This is an internal
+        # alert subscription, not a paid customer lead or human handover.
+        if message_type == "text":
+            from handover_business_alerts import (
+                is_owner_activation, owner_activation_reply,
+            )
+            if is_owner_activation(customer_number, customer_message):
+                save_message(customer_number, "user", customer_message)
+                owner_reply = owner_activation_reply()
+                save_message(customer_number, "assistant", owner_reply)
+                store_pending_reply(message_id, owner_reply)
+                owner_sent = send_whatsapp_message(customer_number, owner_reply)
+                finish_whatsapp_message(message_id, owner_sent)
+                print("IBROWS BUSINESS ALERT RECEIVER WINDOW ACTIVATION", flush=True)
+                return "EVENT_RECEIVED", 200
 
         # Only explicit customer requests resume the AI after human takeover.
         # This branch must appear before the paused-conversation gate.
