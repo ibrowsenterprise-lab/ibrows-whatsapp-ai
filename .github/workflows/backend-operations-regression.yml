@@ -1,0 +1,39 @@
+name: Backend integrity and paid-client response monitoring
+on:
+  push:
+    branches: [main, feature/backend-operations-center-20261111]
+    paths:
+      - backend_operations_health.py
+      - gunicorn.conf.py
+      - tests/test_backend_operations_health.py
+      - tests/test_launch_contact.py
+      - .github/workflows/backend-operations-regression.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - backend_operations_health.py
+      - gunicorn.conf.py
+      - tests/test_backend_operations_health.py
+      - tests/test_launch_contact.py
+      - .github/workflows/backend-operations-regression.yml
+permissions: {contents: read}
+jobs:
+  backend-operations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python -m pip install "Flask>=3,<4"
+      - name: Verify app startup
+        run: python -m py_compile backend_operations_health.py gunicorn.conf.py
+      - name: Run admin-only integrity and paid-reply safety checks
+        run: python -m unittest discover -s tests -p 'test_backend_operations_health.py' -v
+      - name: Verify existing receipt, client and human handover workflow
+        run: |
+          python -m unittest discover -s tests -p 'test_automatic_verified_receipts.py' -v
+          python -m unittest discover -s tests -p 'test_scholarship_eligibility_workflow.py' -v
+          python -m unittest discover -s tests -p 'test_business_handover_whatsapp_alerts.py' -v
+          python -m unittest discover -s tests -p 'test_launch_contact.py' -v
+      - run: git diff --check
