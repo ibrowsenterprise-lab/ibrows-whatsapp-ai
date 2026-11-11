@@ -6,7 +6,7 @@ customer chats. It surfaces evidence-backed action items while preserving
 client privacy, backed by one authenticated route.
 """
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -48,6 +48,30 @@ code{overflow-wrap:anywhere}
 </div>
 <p class="small">Customer payment status comes only from the verified ledger, never a screenshot or an AI-generated note.</p>
 </div>
+
+<section class="card">
+<h2>Priority actions before serving more clients</h2>
+{% if pending_paid %}
+<div class="warning"><strong>{{ pending_paid }} verified paid service case(s) still not marked delivered.</strong>
+<p>Open each paid case below, check the customer's existing information, and complete the promised service. A paid receipt does not mean work was completed.</p></div>
+{% else %}
+<div class="good">No unfinished paid scholarship eligibility cases were found in the monitored service.</div>
+{% endif %}
+{% if reminder_health.attention %}
+<div class="warning"><strong>Reminder scheduler needs verification.</strong>
+<p>{{ reminder_health.description }}</p></div>
+{% else %}
+<div class="good">{{ reminder_health.description }}</div>
+{% endif %}
+{% if paused_handoffs %}
+<div class="warning"><strong>{{ paused_handoffs }} conversation(s) currently paused for human assistance.</strong>
+<p>Review the secure Inbox and ensure each customer has an actual response. Paused state alone does not prove a customer is waiting.</p></div>
+{% else %}
+<p class="small">No current AI-paused human handovers recorded.</p>
+{% endif %}
+<a class="action" href="{{ url_for('admin_inbox') }}">Check secure Inbox and human handovers</a>
+<p class="small">These are read-only advisory checks. They do not send messages, create reminders, or alter payments. The 48-hour monitoring threshold is an operational warning, not a customer service deadline.</p>
+</section>
 
 <section class="card">
 <h2>Paid service — customer replies</h2>
@@ -115,6 +139,47 @@ code{overflow-wrap:anywhere}
 
 <p class="small">Data is private to administrators. No customer chat text, account number, identity documents or API tokens are shown.</p>
 </main></body></html>"""
+
+
+def classify_reminder_health(last_run_at, last_ok, has_error, now_utc=None):
+    """Advisory freshness indicator, not proof that reminders were delivered."""
+    now = now_utc or datetime.now(timezone.utc)
+    if last_run_at is None:
+        return {
+            "attention": True,
+            "description": "No recorded reminder-run evidence is available. "
+                           "Check the scheduled job before relying on follow-up alerts.",
+        }
+    if last_run_at.tzinfo is None:
+        # Unknown timezone must not produce a falsely reassuring healthy result.
+        return {
+            "attention": True,
+            "description": "Reminder run timezone is unknown; verify the scheduler.",
+        }
+    if has_error or last_ok is not True:
+        return {
+            "attention": True,
+            "description": "The latest recorded reminder run did not report success. "
+                           "Check the scheduler and delivery channel.",
+        }
+    if last_run_at > now + timedelta(minutes=5):
+        return {
+            "attention": True,
+            "description": "The reminder run timestamp is unexpectedly in the future. "
+                           "Check server clock and scheduler records.",
+        }
+    if now - last_run_at > timedelta(hours=48):
+        return {
+            "attention": True,
+            "description": "The last recorded successful reminder run is older than "
+                           "48 hours. This does not prove reminders failed, but the "
+                           "scheduler needs an independent check.",
+        }
+    return {
+        "attention": False,
+        "description": "A recent successful reminder run is recorded. "
+                       "Individual WhatsApp/email delivery is not proven by this check.",
+    }
 
 
 def has_new_reply(intake_at, inbound_at):
@@ -226,10 +291,35 @@ def read_health(db_factory):
             sizes=cur.fetchone()
             if not sizes:
                 raise ValueError("Missing media size figures")
+
+            # A monitoring record can be stale even while there are no due
+            # reminders. A private warning is safer than claiming the job ran.
+            cur.execute("""
+                SELECT t.last_run_at,t.last_ok,
+                       COALESCE(NULLIF(BTRIM(t.last_error),''),NULL) IS NOT NULL AS has_error,
+                       (SELECT COUNT(*) FROM ai_takeover_state WHERE ai_paused=TRUE)
+                FROM (SELECT 1) one
+                LEFT JOIN LATERAL (
+                    SELECT last_run_at,last_ok,last_error
+                    FROM ibrows_task_health
+                    WHERE task_key='FOLLOWUP_REMINDERS'
+                    ORDER BY last_run_at DESC NULLS LAST
+                    LIMIT 1
+                ) t ON TRUE
+            """)
+            operational = cur.fetchone()
+            if operational is None or len(operational)!=4:
+                raise ValueError("Missing follow-up monitor evidence")
     cases=[paid_case_row(row,stages.get(row[0])) for row in candidate_rows]
+    reminder_health=classify_reminder_health(
+        operational[0],operational[1],operational[2]
+    )
     return {
         "totals":totals,
         "paid_cases":cases,
+        "pending_paid":sum(case["stage"]!="DELIVERED" for case in cases),
+        "reminder_health":reminder_health,
+        "paused_handoffs":operational[3],
         "media":{
             "website_mb":round(sizes[0]/1048576,1),
             "construction_mb":round(sizes[1]/1048576,1),
