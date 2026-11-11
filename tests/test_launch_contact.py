@@ -60,6 +60,7 @@ class ContactLaunchTests(unittest.TestCase):
             "scholarship_eligibility_backend": types.SimpleNamespace(install_eligibility_work_queue=lambda _: None),
             "automatic_verified_receipts": types.SimpleNamespace(install_auto_receipts=lambda _: None),
             "backend_operations_health": types.SimpleNamespace(install_backend_operations=lambda _: None),
+            "payment_query_efficiency": types.SimpleNamespace(install_payment_query_batch=lambda _: None),
             "whatsapp_menu_patch": types.SimpleNamespace(install_whatsapp_menu_fix=lambda _: None),
             "explicit_qa_cleanup": types.SimpleNamespace(run_exact_qa_cleanup=lambda _: None),
             "correct_eligibility_record": types.SimpleNamespace(correct_verified_eligibility_once=lambda _: None),
