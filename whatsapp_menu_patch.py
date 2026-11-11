@@ -12,7 +12,7 @@ What can we help you with? Reply with a number.
 3. Business Registration & Support
 4. Website, AI & Automation
 5. Graphic Design & Branding
-6. Social Media & Digital Marketing
+6. Social Media, Digital Marketing & Content Creation (videos and jingles)
 7. Photo Restoration
 8. Cleaning Services
 9. Car Wash
@@ -20,7 +20,6 @@ What can we help you with? Reply with a number.
 11. Landscaping
 12. Construction & Property Improvement
 13. Agro Dealing
-14. Content Creation, Video Marketing & Jingles
 
 0. Talk to Jones (human assistance)
 
@@ -34,7 +33,7 @@ Tumizani nambala ya ntchito yomwe mukufuna.
 3. Kulembetsa bizinesi ndi upangiri
 4. Mawebsite, AI ndi automation
 5. Graphic design ndi branding
-6. Social media ndi digital marketing
+6. Social media, digital marketing ndi kupanga content (makanema ndi jingles)
 7. Kukonza zithunzi zakale
 8. Kuyeretsa nyumba ndi maofesi
 9. Kutsuka magalimoto
@@ -42,7 +41,6 @@ Tumizani nambala ya ntchito yomwe mukufuna.
 11. Kukonza minda ndi malo (landscaping)
 12. Zomangamanga ndi kukonza nyumba
 13. Kugula ndi kugulitsa zokolola
-14. Content creation, makanema ndi jingles
 
 0. Lankhulani ndi Jones (munthu)
 
@@ -56,7 +54,7 @@ Sankhani nambala ya ntchito iyo mukukhumba.
 3. Kulembeska bizinesi na wovwiri
 4. Mawebsite, AI na automation
 5. Graphic design na branding
-6. Social media na digital marketing
+6. Social media, digital marketing na kupanga content (mavidiyo na jingles)
 7. Kunozga vithuzi vyakale
 8. Cleaning services
 9. Car wash
@@ -64,7 +62,6 @@ Sankhani nambala ya ntchito iyo mukukhumba.
 11. Landscaping
 12. Construction na property improvement
 13. Agro dealing — kugura na kuguliska vyakurya
-14. Content creation, video marketing na jingles
 
 0. Yowoyani na Jones (munthu)
 
@@ -150,7 +147,7 @@ def install_whatsapp_menu_fix(flask_app):
             result = dict(result)
             result["reply"] = str(result.get("reply") or "").replace(
                 "Please choose a number from 0 to 12",
-                "Please choose a number from 0 to 14",
+                "Please choose a number from 0 to 13",
             )
         return result
 
@@ -158,4 +155,4 @@ def install_whatsapp_menu_fix(flask_app):
     core._main_menu_selection = menu_selection
     core.handle_numbered_service_menu = menu_handler
     core._ibrows_multilingual_menu_fixed = True
-    print("IBROWS WHATSAPP MULTILINGUAL MENU FIX READY: 1-14 and 0", flush=True)
+    print("IBROWS WHATSAPP MULTILINGUAL MENU FIX READY: 1-13 and 0", flush=True)
