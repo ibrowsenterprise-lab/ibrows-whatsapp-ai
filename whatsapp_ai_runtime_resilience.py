@@ -32,20 +32,35 @@ def is_business_assistant_request(args, kwargs):
 
 def install_whatsapp_ai_resilience(flask_app):
     """Keep all unrelated OpenAI calls, webhook routing and ledgers unchanged."""
+    import sys
+    print("IBROWS AI JSON RESILIENCE: startup installer invoked",flush=True)
     view = getattr(flask_app, "view_functions", {}).get("receive_webhook")
-    if view is None:
+    ns = getattr(view, "__globals__", {}) if view is not None else {}
+    def has_primitives(mapping):
+        return bool(
+            mapping.get("client") is not None
+            and callable(mapping.get("generate_ai_reply"))
+            and callable(mapping.get("validate_ai_structured_output"))
+        )
+    if not has_primitives(ns):
+        # Some production Flask setups wrap the webhook view and its globals.
+        # The actual WSGI app is already imported under the same 'app' module
+        # as the multilingual-menu startup integration.
+        core = sys.modules.get("app")
+        ns = vars(core) if core is not None else {}
+    if not has_primitives(ns):
+        print("IBROWS AI JSON RESILIENCE: application primitives unavailable",flush=True)
         return False
-    ns = view.__globals__
-    core_client = ns.get("client")
-    original_generate = ns.get("generate_ai_reply")
-    validator = ns.get("validate_ai_structured_output")
-    if not core_client or not original_generate or not callable(validator):
-        return False
+    core_client = ns["client"]
+    original_generate = ns["generate_ai_reply"]
+    validator = ns["validate_ai_structured_output"]
     endpoint = getattr(core_client, "responses", None)
     original_create = getattr(endpoint, "create", None)
     if endpoint is None or not callable(original_create):
+        print("IBROWS AI JSON RESILIENCE: model endpoint unavailable",flush=True)
         return False
     if getattr(original_create, "_ibrows_safe_ai_json", False):
+        print("IBROWS AI JSON RESILIENCE: already installed",flush=True)
         return True
 
     def guarded_create(*args, **kwargs):

@@ -1,7 +1,9 @@
 """Offline integration checks: no real OpenAI, Meta, payments or databases."""
 import json
 import unittest
-from types import SimpleNamespace
+import sys
+from types import SimpleNamespace, ModuleType
+from unittest.mock import patch
 from whatsapp_ai_runtime_resilience import (
     install_whatsapp_ai_resilience, is_business_assistant_request
 )
@@ -83,6 +85,21 @@ class RuntimeResilienceTests(unittest.TestCase):
         self.assertNotIn("temporarily unavailable",result["reply"])
         self.assertFalse(result["lead_required"])
         self.assertEqual(len(calls),0)
+
+    def test_real_app_module_recovery_when_view_globals_are_wrapped(self):
+        app,ns,endpoint,calls=fixture([json.dumps(VALID)])
+        app.view_functions={}
+        core=ModuleType("app")
+        for key,value in ns.items():
+            setattr(core,key,value)
+        with patch.dict(sys.modules,{"app":core}):
+            self.assertTrue(install_whatsapp_ai_resilience(app))
+            result=endpoint.create(
+                model="gpt-5.6-luna",store=False,
+                instructions="You are the official WhatsApp AI Business Assistant",
+                input=[])
+            self.assertEqual(json.loads(result.output_text),VALID)
+            self.assertEqual(len(calls),1)
 
     def test_unrelated_fallback_does_not_fabricate_response(self):
         app,ns,endpoint,calls=fixture([])
