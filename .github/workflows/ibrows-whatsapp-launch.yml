@@ -4,6 +4,8 @@ on:
     paths:
       - launch_contact_config.py
       - gunicorn.conf.py
+      - inbox_query_efficiency.py
+      - tests/test_inbox_query_efficiency.py
       - tests/test_launch_contact.py
       - .github/workflows/ibrows-whatsapp-launch.yml
   push:
@@ -11,6 +13,8 @@ on:
     paths:
       - launch_contact_config.py
       - gunicorn.conf.py
+      - inbox_query_efficiency.py
+      - tests/test_inbox_query_efficiency.py
       - tests/test_launch_contact.py
       - .github/workflows/ibrows-whatsapp-launch.yml
 permissions:
@@ -26,8 +30,9 @@ jobs:
           python-version: "3.12"
       - name: Check syntax and isolated launch behaviour without any credentials
         run: |
-          python -m py_compile gunicorn.conf.py launch_contact_config.py
+          python -m py_compile gunicorn.conf.py launch_contact_config.py inbox_query_efficiency.py
           python -m unittest discover -s tests -p test_launch_contact.py -v
+          python -m unittest discover -s tests -p test_inbox_query_efficiency.py -v
   public-smoke:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: isolated-tests
