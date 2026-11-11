@@ -6635,8 +6635,10 @@ def build_verified_payment_context(customer_number):
     # Scholarship packages must use the same trusted CRM ledger as career
     # packages. A screenshot or customer message does NOT verify a payment.
     from scholarship_payment_context import scholarship_payment_context_lines
+    # One-off Eligibility Check is a distinct paid service from shortlisting,
+    # applications and monthly scholarship assistance.
     scholarship_state = get_verified_service_payment_state(
-        customer_number, "Scholarship Search"
+        customer_number, "Scholarship Eligibility Check", 5000
     )
     lines.extend(scholarship_payment_context_lines(scholarship_state))
 
