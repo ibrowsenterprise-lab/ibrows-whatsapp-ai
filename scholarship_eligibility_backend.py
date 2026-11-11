@@ -205,12 +205,12 @@ label{display:flex;gap:10px;align-items:flex-start;margin:12px 0}input[type=chec
 <div class="reply"><strong>The client has replied.</strong>
 <p>Review those messages first. Request only any details still missing. Do not repeat questions already answered.</p></div>
 {% else %}
-<p class="small">If the client has not provided academic details, copy this intake message to the Inbox and send it. Copying it does not send it.</p>
+<p class="small">If the client has not provided academic details, copy this intake message to the Inbox and send it. Copying it does not send anything automatically.</p>
 <textarea id="intake" readonly>{{ intake_message }}</textarea>
 <button type="button" id="copy-intake" onclick="copyIntake()">Copy intake message</button>
 <p id="copy-status" class="small" aria-live="polite">Copying does not send anything automatically.</p>
 {% endif %}
-<a class="action outline" href="{{ url_for('admin_inbox_chat',customer_number=customer_number) }}">Read client answers in IBROWS Inbox</a>
+<a class="action outline" href="{{ url_for('admin_inbox_chat',customer_number=customer_number) }}">Open IBROWS WhatsApp Inbox — read client answers</a>
 </section>
 <section class="card">
 <h2>Step 2 · Track actual work</h2>
