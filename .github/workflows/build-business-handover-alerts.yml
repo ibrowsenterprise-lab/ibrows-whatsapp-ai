@@ -1,0 +1,41 @@
+name: Build safe handover alerts for original business WhatsApp
+on:
+  push:
+    branches: [feat/handover-alerts-0882242594-20261111]
+    paths:
+      - handover_business_alerts.py
+      - tests/test_business_handover_whatsapp_alerts.py
+      - tools/apply_business_handover_alerts.py
+      - .github/workflows/build-business-handover-alerts.yml
+permissions:
+  contents: write
+jobs:
+  patch-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: true}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Apply guarded and exact WhatsApp routing patch
+        run: python tools/apply_business_handover_alerts.py
+      - name: Install isolated test framework
+        run: python -m pip install "Flask>=3,<4"
+      - name: Compile and validate live webhook with mock inputs
+        run: |
+          python -m py_compile app.py handover_business_alerts.py
+          python -m unittest discover -s tests -p 'test_business_handover_whatsapp_alerts.py' -v
+          python -m unittest discover -s tests -p 'test_zero_handover.py' -v
+          python -m unittest discover -s tests -p 'test_scholarship_eligibility_workflow.py' -v
+          git diff --check
+          git diff --stat
+      - name: Commit tested patch for review
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'Send human handover alerts to old IBROWS WhatsApp line'
+            git push origin HEAD:feat/handover-alerts-0882242594-20261111
+          fi
