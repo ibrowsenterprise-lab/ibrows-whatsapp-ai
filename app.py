@@ -6077,7 +6077,7 @@ def handle_local_human_handover(
         reply = (
             "Thank you. I have paused the AI assistant and recorded your request to talk to Jones. "
             "Jones will assist you here for IBROWS business matters. "
-            f"If your message is personal or not related to IBROWS business, you can WhatsApp Jones directly on {JONES_PERSONAL_WHATSAPP_DISPLAY}. "
+            "Please continue replying here; no separate number or saved contact is needed. "
             "Please keep business enquiries on this IBROWS number so your request stays in the business record."
         )
     else:
