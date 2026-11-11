@@ -1,0 +1,41 @@
+name: IBROWS WhatsApp AI JSON resilience regression
+
+on:
+  pull_request:
+    paths:
+      - "whatsapp_ai_json_resilience.py"
+      - "whatsapp_ai_runtime_resilience.py"
+      - "gunicorn.conf.py"
+      - "tests/test_whatsapp_ai_json_resilience.py"
+      - "tests/test_whatsapp_ai_runtime_resilience.py"
+      - "tests/test_launch_contact.py"
+      - ".github/workflows/whatsapp-ai-json-resilience.yml"
+  push:
+    branches: [main]
+    paths:
+      - "whatsapp_ai_json_resilience.py"
+      - "whatsapp_ai_runtime_resilience.py"
+      - "gunicorn.conf.py"
+      - "tests/test_whatsapp_ai_json_resilience.py"
+      - "tests/test_whatsapp_ai_runtime_resilience.py"
+      - ".github/workflows/whatsapp-ai-json-resilience.yml"
+
+jobs:
+  whatsapp-ai-json:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile isolated patch
+        run: python -m py_compile whatsapp_ai_json_resilience.py whatsapp_ai_runtime_resilience.py gunicorn.conf.py
+      - name: Verify bounded JSON model recovery
+        run: python -m unittest discover -s tests -p 'test_whatsapp_ai_json_resilience.py' -v
+      - name: Verify scoped integration and Chichewa continuity
+        run: python -m unittest discover -s tests -p 'test_whatsapp_ai_runtime_resilience.py' -v
+      - name: Preserve public WhatsApp links and startup isolation
+        run: python -m unittest discover -s tests -p 'test_launch_contact.py' -v
