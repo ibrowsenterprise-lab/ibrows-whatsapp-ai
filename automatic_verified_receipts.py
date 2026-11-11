@@ -378,6 +378,22 @@ def install_auto_receipts(flask_app):
             view_func=ns["admin_required"](admin_auto_receipts),
             methods=["GET"],
         )
+    # Surface the audit view on the existing authenticated CRM dashboard.
+    # No new public information or financial state is created.
+    original_dashboard=ns.get("DASHBOARD_TEMPLATE")
+    dashboard_anchor="<h2>Sales pipeline</h2>"
+    display_link=(
+        '<!-- ibrows-auto-receipt-delivery-link -->'
+        '<p style="margin:8px 0 14px;font-size:13px">'
+        '<a href="{{ url_for(\'admin_auto_receipts\') }}">'
+        'View automatic receipt deliveries</a></p>'
+    )
+    if (isinstance(original_dashboard,str)
+            and "ibrows-auto-receipt-delivery-link" not in original_dashboard
+            and original_dashboard.count(dashboard_anchor)==1):
+        ns["DASHBOARD_TEMPLATE"]=original_dashboard.replace(
+            dashboard_anchor,dashboard_anchor+"\n"+display_link,1
+        )
     print("IBROWS AUTO RECEIPT: verified-only PDF receipt delivery enabled",flush=True)
     return True
 
