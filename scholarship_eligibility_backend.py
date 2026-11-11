@@ -42,10 +42,9 @@ ACTION_NOTES = {
 
 
 def academic_reply_evidence(messages):
-    """Describe topics present in saved user replies without inventing credentials.
+    """Identify supplied academic topics, never claim qualification or document proof.
 
-    This is a routing hint only, not proof of qualifications, transcript receipt,
-    graduation, or scholarship eligibility. Never send message content to logs.
+    Pure heuristic for triage. No identifying data or message text enters logs.
     """
     import re
     combined = "\n".join(str(message or "") for message in messages)[-18000:].casefold()
@@ -61,46 +60,59 @@ def academic_reply_evidence(messages):
                  if re.search(pattern, combined))
 
 
-def classify_customer_reply(last_intake, last_inbound, evidence=()):
-    """Conservatively separate payment, intake, review and delivery.
-
-    Intake metadata can flag work for a reviewer; it must never mark an
-    eligibility assessment finished, produce an academic verdict, or charge.
-    """
+def classify_customer_reply(last_intake, last_inbound):
+    """Legacy three-field status; keep backwards compatibility and safe wording."""
     if last_intake is None:
         return (
-            "No saved academic intake request found",
-            "Check the secure IBROWS Inbox before asking the customer for details. "
-            "Only a real saved intake message counts as sent.",
-            False, False,
+            "No academic intake request found in the saved conversation",
+            "If you have already sent it, check the IBROWS Inbox first. "
+            "Copying a message is not the same as sending it.",
+            False,
         )
     if last_inbound is not None and last_inbound > last_intake:
-        ready = all(item in evidence for item in ("degree", "grade", "experience")) and len(evidence) >= 4
-        if ready:
-            return (
-                "Academic answers already received — assessment review required",
-                "Saved replies include degree, grading and experience topics. "
-                "Review the actual client answers in the Inbox, verify missing "
-                "evidence where needed, and perform the paid assessment. "
-                "Do not resend the full intake or mark a report delivered.",
-                True, True,
-            )
+        return (
+            "New customer reply since the intake request",
+            "Open the IBROWS Inbox and read the reply. Only mark details "
+            "received after confirming what the customer actually provided.",
+            True,
+        )
+    return (
+        "Waiting for the customer's response",
+        "The academic-information request is recorded in the conversation, "
+        "but delivery to the customer's handset is not independently confirmed.",
+        False,
+    )
+
+
+def classify_customer_reply_with_evidence(last_intake, last_inbound, evidence=()):
+    """Four-field optional enhancement for the paid assessment admin queue."""
+    title, description, new_reply = classify_customer_reply(last_intake, last_inbound)
+    ready = bool(
+        new_reply
+        and all(k in evidence for k in ("degree", "grade", "experience"))
+        and len(evidence) >= 4
+    )
+    if ready:
+        return (
+            "Academic answers already received — assessment review required",
+            "Saved replies include degree, grading and experience topics. "
+            "Review the actual client answers in the Inbox, verify missing "
+            "evidence where needed, and perform the paid assessment. "
+            "Do not resend the full intake or mark a report delivered.",
+            True, True,
+        )
+    if new_reply:
         return (
             "Customer replied — review their existing answers",
             "Open the Inbox and check what was provided. Ask only for missing "
             "academic details; do not send the entire intake form again.",
             True, False,
         )
-    return (
-        "Awaiting response to recorded academic intake",
-        "The request was saved to the conversation. Handset delivery is not "
-        "independently proved by this timestamp alone.",
-        False, False,
-    )
+    return title, description, new_reply, False
 
 
 def get_customer_reply_status(db_factory, customer_number):
-    """Read saved intake and replies for this exact customer; no writes or sends."""
+    """Original, read-only three-field API used by existing integrations/tests."""
     try:
         with db_factory() as conn:
             with conn.cursor() as cur:
@@ -129,26 +141,53 @@ def get_customer_reply_status(db_factory, customer_number):
                     customer_number,
                 ))
                 row = cur.fetchone()
-                if not row:
-                    raise ValueError("No conversation activity returned")
-                evidence = ()
-                if row[0] is not None and row[1] is not None and row[1] > row[0]:
-                    cur.execute("""
-                        SELECT content FROM conversations
-                        WHERE customer_number=%s AND role='user'
-                          AND created_at>%s
-                        ORDER BY created_at DESC LIMIT 40
-                    """, (customer_number, row[0]))
-                    evidence = academic_reply_evidence([r[0] for r in cur.fetchall()])
-        return classify_customer_reply(row[0], row[1], evidence)
+        if not row:
+            raise ValueError("No conversation activity returned")
+        return classify_customer_reply(row[0], row[1])
     except Exception as exc:
         print("IBROWS ELIGIBILITY REPLY STATUS UNAVAILABLE: "
               + type(exc).__name__, flush=True)
         return (
-            "Saved academic reply check temporarily unavailable",
-            "Open the secure IBROWS Inbox to review answers before requesting more.",
-            False, False,
+            "Reply status temporarily unavailable",
+            "Open the IBROWS Inbox to check customer replies directly.",
+            False,
         )
+
+
+def get_customer_reply_status_extended(db_factory, customer_number):
+    """Read-only extra triage for recorded answers; fail to the legacy safe view."""
+    title, description, new_reply = get_customer_reply_status(db_factory, customer_number)
+    if not new_reply:
+        return title, description, new_reply, False
+    try:
+        with db_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT content FROM conversations
+                    WHERE customer_number=%s AND role='user'
+                      AND created_at > (
+                        SELECT MAX(created_at) FROM conversations
+                        WHERE customer_number=%s AND role='assistant'
+                          AND (
+                            POSITION(%s IN content)>0 OR
+                            POSITION(%s IN content)>0
+                          )
+                      )
+                    ORDER BY created_at DESC LIMIT 40
+                """, (
+                    customer_number, customer_number,
+                    "Your MK5,000 Scholarship Eligibility Check payment is confirmed",
+                    "IBROWS Enterprise 🎓 | Scholarship Eligibility Check",
+                ))
+                evidence = academic_reply_evidence([row[0] for row in cur.fetchall()])
+        # The legacy query has already established replies after the saved intake.
+        return classify_customer_reply_with_evidence(
+            True, True, evidence
+        )
+    except Exception as exc:
+        print("IBROWS ELIGIBILITY EVIDENCE CHECK UNAVAILABLE: "
+              +type(exc).__name__, flush=True)
+        return title, description, new_reply, False
 
 
 def can_move_stage(current, target, payment_state, intake_ready=False):
@@ -293,7 +332,7 @@ def install_eligibility_work_queue(flask_app):
                 else:
                     stage = DEFAULT_STAGE
 
-        reply_title, reply_description, new_reply, intake_ready = get_customer_reply_status(
+        reply_title, reply_description, new_reply, intake_ready = get_customer_reply_status_extended(
             ns["get_db"], number
         )
         if request.method == "POST":
