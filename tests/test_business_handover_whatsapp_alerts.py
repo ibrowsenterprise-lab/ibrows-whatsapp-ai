@@ -133,7 +133,8 @@ class WhatsAppBusinessAlertTests(unittest.TestCase):
         self.assertIn(("email",15),events)
         self.assertIn(("old_business_whatsapp",True),events)
         self.assertIn(("audit","ACCEPTED"),events)
-        self.assertIn("0999 242 594",customer_response)
+        self.assertNotIn("0999 242 594",customer_response)
+        self.assertIn("continue replying here",customer_response)
         self.assertLess(events.index(("email",15)),events.index(("old_business_whatsapp",True)))
 
     def test_owner_opt_in_branch_in_actual_webhook(self):
