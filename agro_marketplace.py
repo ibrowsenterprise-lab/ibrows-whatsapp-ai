@@ -3,7 +3,7 @@ from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
 from agro_marketplace_ui import CATALOGUE, ENQUIRY, SUCCESS, MODERATION, IMPORT, SELL_WITH_PHOTOS, SELL_WITH_PHOTOS_SUCCESS
-from agro_photo_persistence import save_seller_photos
+from agro_photo_persistence import save_verified_seller_photos
 import re
 from flask import current_app
 from flask import Blueprint, abort, redirect, render_template_string, request, url_for
@@ -147,7 +147,7 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
                             RETURNING id""",
                             (request_id,name,phone,commodity,variety,str(quantity),unit,str(price),price_unit,location,description))
                         listing_id = cur.fetchone()[0]
-                        save_seller_photos(cur, request_id, request.files.getlist('produce_photos'))
+                        save_verified_seller_photos(cur, request_id, photos)
                         if photos:
                             cur.execute('UPDATE agro_produce_photos SET listing_id=%s WHERE seller_request_id=%s',
                                         (listing_id, request_id))
