@@ -30,7 +30,7 @@ def stock_summary(quantity, unit):
     # A bare pack weight such as "50kg" is ambiguous: do not call it bags.
     bare_weight = re.fullmatch(r'(\d+(?:\.\d+)?)\s*kg', label, re.IGNORECASE)
     if bare_weight:
-        return {'amount': amount, 'unit': 'packs', 'pack': format_quantity(bare_weight.group(1)) + ' kg per pack (packaging unconfirmed)'}
+        return {'amount': amount, 'unit': 'units', 'pack': 'Recorded unit: ' + format_quantity(bare_weight.group(1)) + ' kg (packaging needs confirmation)'}
     normal = label.lower()
     if normal in ('kg', 'kilogram', 'kilograms'):
         label = 'kg'
