@@ -1,0 +1,43 @@
+<section class="ibrows-produce-photos" aria-labelledby="produce-photo-heading">
+<style>
+.ibrows-produce-photos{font:inherit;color:#173d2e;margin:22px 0}.ibrows-produce-photos .photo-drop{display:block;border:2px dashed #8fb6a1;border-radius:16px;padding:24px 16px;background:#f3faf5;text-align:center;cursor:pointer}.ibrows-produce-photos .photo-drop:focus-within{outline:3px solid #d7ac46}.ibrows-produce-photos .photo-icon{font-size:34px;display:block}.ibrows-produce-photos .photo-title{font-size:18px;font-weight:750;display:block}.ibrows-produce-photos .photo-help{font-size:13px;color:#546d5f;display:block;margin-top:6px}.ibrows-produce-photos input[type=file]{position:absolute;width:1px;height:1px;opacity:0}.ibrows-produce-photos .photo-previews{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:10px;margin-top:12px}.ibrows-produce-photos .photo-preview{position:relative;border:1px solid #d8e6da;border-radius:10px;overflow:hidden;background:#fff}.ibrows-produce-photos .photo-preview img{width:100%;height:105px;object-fit:cover;display:block}.ibrows-produce-photos .photo-preview button{width:100%;padding:7px;border:0;background:#f1f5f1;color:#8a2424;font-weight:650;cursor:pointer}.ibrows-produce-photos .photo-error{color:#a02a2a;font-size:13px;margin:8px 0}.ibrows-produce-photos .photo-count{font-size:12px;color:#546d5f;margin-top:7px}
+</style>
+<h3 id="produce-photo-heading">Photos of your produce <small>(optional)</small></h3>
+<label class="photo-drop" for="produce-photos"><span class="photo-icon" aria-hidden="true">📷</span><span class="photo-title">Add produce photos</span><span class="photo-help">Take a photo or choose from your gallery · Up to 5 photos · 5 MB each</span></label>
+<input id="produce-photos" name="produce_photos" type="file" accept="image/jpeg,image/png,image/webp" multiple aria-describedby="photo-feedback">
+<div id="photo-feedback" class="photo-error" role="alert" aria-live="polite"></div>
+<div id="photo-count" class="photo-count">0 of 5 photos selected</div>
+<div id="photo-previews" class="photo-previews" aria-label="Selected photo previews"></div>
+<script>
+(function(){
+const input=document.getElementById('produce-photos'), previews=document.getElementById('photo-previews'), count=document.getElementById('photo-count'), error=document.getElementById('photo-feedback');
+if(!input || !window.DataTransfer)return;
+let selected=[];
+function render(){
+previews.replaceChildren();
+selected.forEach((file,index)=>{
+ const item=document.createElement('div');item.className='photo-preview';
+ const img=document.createElement('img');img.alt='Selected produce photo '+(index+1);
+ const url=URL.createObjectURL(file);img.src=url;img.onload=()=>URL.revokeObjectURL(url);
+ const button=document.createElement('button');button.type='button';button.textContent='Remove';button.setAttribute('aria-label','Remove photo '+(index+1));
+ button.addEventListener('click',()=>{selected.splice(index,1);sync();});
+ item.append(img,button);previews.append(item);
+});
+count.textContent=selected.length+' of 5 photos selected';
+const transfer=new DataTransfer();selected.forEach(f=>transfer.items.add(f));input.files=transfer.files;
+}
+function sync(){error.textContent='';render();}
+input.addEventListener('change',()=>{
+const incoming=Array.from(input.files);const accepted=[...selected];
+for(const file of incoming){
+ if(accepted.length>=5){error.textContent='Maximum 5 photos allowed.';break;}
+ if(!['image/jpeg','image/png','image/webp'].includes(file.type)){error.textContent='Choose JPEG, PNG or WebP photos only.';continue;}
+ if(file.size>5*1024*1024){error.textContent='Each photo must be 5 MB or less.';continue;}
+ if(accepted.reduce((sum,f)=>sum+f.size,0)+file.size>20*1024*1024){error.textContent='Maximum combined size is 20 MB.';continue;}
+ accepted.push(file);
+}
+selected=accepted;render();
+});
+})();
+</script>
+</section>

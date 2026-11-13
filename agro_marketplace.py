@@ -2,7 +2,8 @@
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
-from agro_marketplace_ui import CATALOGUE, ENQUIRY, SUCCESS, MODERATION, IMPORT
+from agro_marketplace_ui import CATALOGUE, ENQUIRY, SUCCESS, MODERATION, IMPORT, SELL_WITH_PHOTOS, SELL_WITH_PHOTOS_SUCCESS
+from agro_photo_persistence import save_verified_seller_photos
 import re
 from flask import current_app
 from flask import Blueprint, abort, redirect, render_template_string, request, url_for
@@ -93,13 +94,106 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
         response.headers['X-Robots-Tag'] = 'noindex, nofollow' if '/enquire' in request.path or request.path.startswith('/admin/') else 'index, follow'
         return response
 
+    @bp.route('/agriculture/marketplace/sell', methods=['GET', 'POST'])
+    def sell_with_photos():
+        """Mobile-friendly direct seller intake, with pending moderation."""
+        error = ''
+        values = request.form if request.method == 'POST' else {}
+        if request.method == 'POST':
+            validate_csrf()
+            if request.content_length and request.content_length > 25 * 1024 * 1024:
+                abort(413, 'Photo upload is too large.')
+            name = (request.form.get('name') or '').strip()[:180]
+            phone = (request.form.get('phone') or '').strip()[:80]
+            commodity = (request.form.get('commodity') or '').strip()[:120]
+            variety = (request.form.get('variety') or '').strip()[:150]
+            unit = (request.form.get('quantity_unit') or '').strip()[:80]
+            price_unit = (request.form.get('price_unit') or '').strip()[:80]
+            location = (request.form.get('location') or '').strip()[:220]
+            description = (request.form.get('description') or '').strip()[:1000]
+            if not all((name, commodity, unit, price_unit, location)) or not 7 <= len(''.join(c for c in phone if c.isdigit())) <= 15 or request.form.get('consent') != '1':
+                error = 'Complete the required fields, provide a valid phone number and confirm consent.'
+            else:
+                try:
+                    quantity = positive_number(request.form.get('quantity'), '10000000000000', '0.001')
+                    price = positive_number(request.form.get('price_mwk'), '100000000000000', '0.01')
+                    from agro_photo_validation import validate_produce_photos
+                    photos = validate_produce_photos(request.files.getlist('produce_photos'))
+                except ValueError as exc:
+                    error = str(exc)
+                if not error:
+                    payload = json.dumps({
+                        'trade_type': 'Sell Farm Produce to IBROWS',
+                        'commodity': commodity, 'variety_grade': variety,
+                        'quantity': str(quantity), 'quantity_unit': unit,
+                        'target_price': str(price), 'price_unit': price_unit,
+                        'location': location, 'description': description,
+                        'photo_count': len(photos), 'seller_consent': True,
+                    })
+                    with get_db() as conn, conn.cursor() as cur:
+                        cur.execute("""INSERT INTO website_service_requests
+                            (service_key,full_name,phone,payload,status,notification_status)
+                            VALUES ('AGRICULTURE',%s,%s,%s::jsonb,'NEW','PENDING')
+                            RETURNING id,created_at""", (name, phone, payload))
+                        request_id, created_at = cur.fetchone()
+                        if reference_for_id:
+                            reference = reference_for_id(request_id, created_at)
+                            cur.execute('UPDATE website_service_requests SET reference=%s WHERE id=%s',
+                                        (reference, request_id))
+                        cur.execute("""INSERT INTO agro_marketplace_listings
+                            (source_request_id,seller_name,seller_phone,commodity,variety_grade,
+                             quantity,quantity_unit,price_mwk,price_unit,location,description,status)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'PENDING')
+                            RETURNING id""",
+                            (request_id,name,phone,commodity,variety,str(quantity),unit,str(price),price_unit,location,description))
+                        listing_id = cur.fetchone()[0]
+                        save_verified_seller_photos(cur, request_id, photos)
+                        if photos:
+                            cur.execute('UPDATE agro_produce_photos SET listing_id=%s WHERE seller_request_id=%s',
+                                        (listing_id, request_id))
+                    if alert:
+                        try:
+                            alert(request_id)
+                        except Exception:
+                            current_app.logger.warning('Seller submission saved; notification requires retry')
+                    return render_template_string(SELL_WITH_PHOTOS_SUCCESS, page_title='Produce submitted', id=request_id)
+        return render_template_string(SELL_WITH_PHOTOS, page_title='Sell your produce',
+                                      csrf=get_csrf_token(), values=values, error=error), (400 if error else 200)
+
+    @bp.get('/agriculture/marketplace/photo/<int:photo_id>')
+    def approved_produce_photo(photo_id):
+        from flask import Response
+        from agro_photo_persistence import get_approved_listing_photo
+        with get_db() as conn, conn.cursor() as cur:
+            result = get_approved_listing_photo(cur, photo_id)
+        if not result:
+            abort(404)
+        return Response(bytes(result[0]), mimetype='image/jpeg',
+                        headers={'X-Content-Type-Options':'nosniff',
+                                 'Cache-Control':'public, max-age=300'})
+
+    @bp.get('/admin/agro-marketplace/photo/<int:photo_id>')
+    @admin_required
+    def admin_produce_photo(photo_id):
+        from flask import Response
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute('SELECT photo_bytes FROM agro_produce_photos WHERE id=%s', (photo_id,))
+            row = cur.fetchone()
+        if not row:
+            abort(404)
+        return Response(bytes(row[0]), mimetype='image/jpeg',
+                        headers={'Cache-Control':'private, no-store',
+                                 'X-Content-Type-Options':'nosniff'})
+
     @bp.get('/agriculture/marketplace')
     def catalogue():
         commodity = (request.args.get('commodity') or '').strip()[:80]
         location = (request.args.get('location') or '').strip()[:80]
         with get_db() as conn, conn.cursor() as cur:
             cur.execute('''SELECT id, commodity, variety_grade, quantity, quantity_unit,
-                            price_mwk, price_unit, location, description
+                            price_mwk, price_unit, location, description,
+                            (SELECT MIN(p.id) FROM agro_produce_photos p
+                             WHERE p.listing_id=agro_marketplace_listings.id) AS photo_id
                             FROM agro_marketplace_listings
                             WHERE status='APPROVED' AND quantity>0
                               AND (%s='' OR concat_ws(' ',commodity,variety_grade) ILIKE '%%' || %s || '%%')
@@ -262,7 +356,8 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
                 if not cur.fetchone(): abort(404)
             return redirect(url_for('agro_marketplace.moderation'))
         with get_db() as conn, conn.cursor() as cur:
-            cur.execute('''SELECT id,commodity,quantity,quantity_unit,location,status,created_at,variety_grade,price_mwk,price_unit
+            cur.execute('''SELECT id,commodity,quantity,quantity_unit,location,status,created_at,variety_grade,price_mwk,price_unit,
+                           (SELECT MIN(p.id) FROM agro_produce_photos p WHERE p.listing_id=agro_marketplace_listings.id) AS photo_id
                            FROM agro_marketplace_listings ORDER BY created_at DESC LIMIT 100''')
             rows=cur.fetchall()
         return render_template_string(MODERATION, page_title='Manage produce listings',rows=rows,csrf=get_csrf_token())
@@ -282,6 +377,7 @@ def initialize_marketplace(get_db):
         cur.execute((Path(__file__).parent / 'migrations/agro_marketplace_v1.sql').read_text())
         cur.execute((Path(__file__).parent / 'migrations/agro_marketplace_varieties.sql').read_text())
         cur.execute((Path(__file__).parent / 'migrations/agro_rice_units_20261105.sql').read_text())
+        cur.execute((Path(__file__).parent / 'migrations/proposed_agro_produce_photos.sql').read_text())
         cur.execute("""INSERT INTO agro_marketplace_listings
             (source_request_id,seller_name,seller_phone,commodity,variety_grade,quantity,
              quantity_unit,price_mwk,price_unit,location,status,reviewed_at)
