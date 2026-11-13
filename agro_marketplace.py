@@ -397,6 +397,7 @@ def initialize_marketplace(get_db):
         cur.execute((Path(__file__).parent / 'migrations/agro_rice_units_20261105.sql').read_text())
         cur.execute((Path(__file__).parent / 'migrations/proposed_agro_produce_photos.sql').read_text())
         cur.execute((Path(__file__).parent / 'migrations/agro_groundnuts_packaging_20261113.sql').read_text())
+        cur.execute((Path(__file__).parent / 'migrations/agro_groundnuts_cg9_20261113.sql').read_text())
         cur.execute("""INSERT INTO agro_marketplace_listings
             (source_request_id,seller_name,seller_phone,commodity,variety_grade,quantity,
              quantity_unit,price_mwk,price_unit,location,status,reviewed_at)
