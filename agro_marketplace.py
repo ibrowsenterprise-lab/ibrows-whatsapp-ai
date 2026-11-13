@@ -178,7 +178,9 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
         location = (request.args.get('location') or '').strip()[:80]
         with get_db() as conn, conn.cursor() as cur:
             cur.execute('''SELECT id, commodity, variety_grade, quantity, quantity_unit,
-                            price_mwk, price_unit, location, description
+                            price_mwk, price_unit, location, description,
+                            (SELECT MIN(p.id) FROM agro_produce_photos p
+                             WHERE p.listing_id=agro_marketplace_listings.id) AS photo_id
                             FROM agro_marketplace_listings
                             WHERE status='APPROVED' AND quantity>0
                               AND (%s='' OR concat_ws(' ',commodity,variety_grade) ILIKE '%%' || %s || '%%')
