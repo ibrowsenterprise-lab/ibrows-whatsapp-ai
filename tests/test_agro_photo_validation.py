@@ -20,7 +20,7 @@ class ProducePhotoValidationTests(unittest.TestCase):
         self.assertEqual(len(photos), 1)
         self.assertEqual(photos[0].mime_type, "image/jpeg")
         self.assertEqual(photos[0].filename, "produce-1.jpg")
-        self.assertTrue(photos[0].content.startswith(b"\\xff\\xd8"))
+        self.assertTrue(photos[0].content.startswith(bytes((255, 216))))
 
     def test_rejects_invalid_bytes(self):
         with self.assertRaises(ProducePhotoError):
