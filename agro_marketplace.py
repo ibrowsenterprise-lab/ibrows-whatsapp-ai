@@ -353,14 +353,28 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
                     abort(400, str(exc))
                 price_unit = (request.form.get('price_unit') or '').strip()[:80]
                 if not price_unit: abort(400, 'Price unit required')
+            # Optional complete listing edits, retaining the same listing ID and enquiries.
+            edits = {}
+            for field, maximum in (('commodity',120),('variety_grade',150),
+                                   ('quantity_unit',80),('location',220),('description',1000)):
+                if field in request.form:
+                    value = (request.form.get(field) or '').strip()
+                    if len(value) > maximum or (field in ('commodity','quantity_unit','location') and not value):
+                        abort(400, 'Invalid ' + field.replace('_',' '))
+                    edits[field] = value
             if quantity == 0: status = 'SOLD_OUT'
             with get_db() as conn, conn.cursor() as cur:
-                cur.execute('''UPDATE agro_marketplace_listings SET quantity=COALESCE(%s,quantity),status=%s,price_mwk=COALESCE(%s,price_mwk),price_unit=COALESCE(%s,price_unit),reviewed_at=NOW(),updated_at=NOW()
-                    WHERE id=%s RETURNING id''',(quantity,status,price,price_unit,listing_id))
+                cur.execute('''UPDATE agro_marketplace_listings SET quantity=COALESCE(%s,quantity),status=%s,price_mwk=COALESCE(%s,price_mwk),price_unit=COALESCE(%s,price_unit),
+                    commodity=COALESCE(%s,commodity),variety_grade=COALESCE(%s,variety_grade),quantity_unit=COALESCE(%s,quantity_unit),
+                    location=COALESCE(%s,location),description=COALESCE(%s,description),
+                    reviewed_at=NOW(),updated_at=NOW()
+                    WHERE id=%s RETURNING id''',(quantity,status,price,price_unit,edits.get('commodity'),edits.get('variety_grade'),
+                    edits.get('quantity_unit'),edits.get('location'),edits.get('description'),listing_id))
                 if not cur.fetchone(): abort(404)
             return redirect(url_for('agro_marketplace.moderation'))
         with get_db() as conn, conn.cursor() as cur:
             cur.execute('''SELECT id,commodity,quantity,quantity_unit,location,status,created_at,variety_grade,price_mwk,price_unit,
+                           description,
                            (SELECT MIN(p.id) FROM agro_produce_photos p WHERE p.listing_id=agro_marketplace_listings.id) AS photo_id
                            FROM agro_marketplace_listings ORDER BY created_at DESC LIMIT 100''')
             rows=cur.fetchall()
