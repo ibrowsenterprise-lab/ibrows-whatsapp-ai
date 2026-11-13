@@ -18,6 +18,11 @@ def save_seller_photos(cur, seller_request_id, uploaded_files):
     enclosing transaction and show a safe error instead of saving a partial request.
     """
     photos = validate_produce_photos(uploaded_files)
+    return save_verified_seller_photos(cur, seller_request_id, photos)
+
+
+def save_verified_seller_photos(cur, seller_request_id, photos):
+    """Persist images already validated before the database transaction."""
     for position, photo in enumerate(photos, start=1):
         cur.execute(
             """INSERT INTO agro_produce_photos
