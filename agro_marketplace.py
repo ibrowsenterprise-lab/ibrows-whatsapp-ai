@@ -172,6 +172,19 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
                         headers={'X-Content-Type-Options':'nosniff',
                                  'Cache-Control':'public, max-age=300'})
 
+    @bp.get('/admin/agro-marketplace/photo/<int:photo_id>')
+    @admin_required
+    def admin_produce_photo(photo_id):
+        from flask import Response
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute('SELECT photo_bytes FROM agro_produce_photos WHERE id=%s', (photo_id,))
+            row = cur.fetchone()
+        if not row:
+            abort(404)
+        return Response(bytes(row[0]), mimetype='image/jpeg',
+                        headers={'Cache-Control':'private, no-store',
+                                 'X-Content-Type-Options':'nosniff'})
+
     @bp.get('/agriculture/marketplace')
     def catalogue():
         commodity = (request.args.get('commodity') or '').strip()[:80]
@@ -343,7 +356,8 @@ def create_agro_marketplace_blueprint(get_db, admin_required, get_csrf_token, va
                 if not cur.fetchone(): abort(404)
             return redirect(url_for('agro_marketplace.moderation'))
         with get_db() as conn, conn.cursor() as cur:
-            cur.execute('''SELECT id,commodity,quantity,quantity_unit,location,status,created_at,variety_grade,price_mwk,price_unit
+            cur.execute('''SELECT id,commodity,quantity,quantity_unit,location,status,created_at,variety_grade,price_mwk,price_unit,
+                           (SELECT MIN(p.id) FROM agro_produce_photos p WHERE p.listing_id=agro_marketplace_listings.id) AS photo_id
                            FROM agro_marketplace_listings ORDER BY created_at DESC LIMIT 100''')
             rows=cur.fetchall()
         return render_template_string(MODERATION, page_title='Manage produce listings',rows=rows,csrf=get_csrf_token())
