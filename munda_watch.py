@@ -9,7 +9,13 @@ ACTIONS = {
     "register": "Register a field",
     "report": "Report a field problem",
 }
-CROPS = ("Maize", "Groundnuts", "Soya", "Rice")
+CROPS = (
+    "Maize", "Groundnuts", "Soya", "Rice",
+    "Banana", "Cassava", "Chillies", "Coffee", "Common beans", "Cotton",
+    "Cowpeas", "Irish potato", "Macadamia", "Millet", "Paprika", "Pigeon peas",
+    "Sesame", "Sorghum", "Sugarcane", "Sunflower", "Sweet potato", "Tea",
+    "Tobacco",
+)
 WATER_SOURCES = ("Rain-fed", "Irrigated", "Rain-fed and irrigated", "Other")
 DISTRICTS = (
     "Balaka", "Blantyre", "Chikwawa", "Chiradzulu", "Chitipa", "Dedza", "Dowa",
@@ -83,7 +89,7 @@ def field_payload(action, form):
     district = form.get("district")
     crop = form.get("crop")
     if district not in DISTRICTS or crop not in CROPS:
-        raise ValueError("Choose a district and one of the four pilot crops.")
+        raise ValueError("Choose a district and a crop from the list.")
     payload = {"request_type": ACTIONS[action], "district": district, "crop": crop}
     if action == "check":
         payload["outlook"] = district_outlook(district, date.today())
@@ -113,7 +119,7 @@ PAGE = START + """
 <div class="page-heading">
   <a class="back-link" href="/agriculture">← Agriculture</a>
   <h1>Munda Watch</h1>
-  <p class="intro">Weather information and field reports for maize, groundnuts, soya and rice.</p>
+  <p class="intro">Check your district’s seasonal rainfall outlook, register a field or report a field problem.</p>
 </div>
 <nav class="form-actions" aria-label="Munda Watch">
   {% for key, label in actions.items() %}
@@ -168,7 +174,11 @@ PAGE = START + """
     {% else %}
       <p>No current seasonal rainfall outlook is available here.</p>
     {% endif %}
-    <p><a href="https://www.metmalawi.gov.mw/products/">Browse official forecasts and agricultural bulletins from Malawi DCCMS</a>.</p>
+    <p><a href="https://www.metmalawi.gov.mw/products/10-day-weather-and-agrometeorological-bulletin/">Read the DCCMS 10-day weather and agricultural bulletins</a></p>
+    <div class="form-actions">
+      <a class="button secondary" href="{{ url_for('munda_watch_page', action='register', district=area.district, crop=area.crop) }}">Register this field</a>
+      <a class="button secondary" href="{{ url_for('munda_watch_page', action='report', district=area.district, crop=area.crop) }}">Report a problem for this crop</a>
+    </div>
   {% endif %}
 </section>
 {% endif %}
