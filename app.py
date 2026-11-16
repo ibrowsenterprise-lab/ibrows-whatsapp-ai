@@ -32750,6 +32750,15 @@ def _service_request_payload_rows(service_key, payload):
             ("Packaging", "packaging"),
             ("Notes", "notes"),
         ],
+        "MUNDA_WATCH": [
+            ("Request type", "request_type"),
+            ("District", "district"),
+            ("Crop", "crop"),
+            ("Village or field location", "locality"),
+            ("Planting date", "planting_date"),
+            ("Water source", "water_source"),
+            ("Field problem", "problem"),
+        ],
     }
     rows = list(package_rows)
     for label, key in definitions.get(service_key, []):
