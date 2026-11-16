@@ -19,6 +19,16 @@ DISTRICTS = (
 )
 
 
+LILONGWE_MAIZE_OUTLOOK = {
+    "source_url": (
+        "https://www.metmalawi.gov.mw/products/downscaled-seasonal-climate-outlook/"
+        "lilongwe-district-downscaled-seasonal-forecast-2026-2027/"
+    ),
+    "issued_on": date(2026, 9, 15),
+    "valid_through": date(2027, 2, 28),
+}
+
+
 def whatsapp_reply(base_url):
     return "Munda Watch | IBROWS Agriculture\n\n" + "\n".join(
         f"{label}\n{base_url}{PATH}/{action}" for action, label in ACTIONS.items()
@@ -32,6 +42,12 @@ def field_payload(action, form):
         raise ValueError("Choose a district and one of the four pilot crops.")
     payload = {"request_type": ACTIONS[action], "district": district, "crop": crop}
     if action == "check":
+        outlook = LILONGWE_MAIZE_OUTLOOK
+        if (
+            (district, crop) == ("Lilongwe", "Maize")
+            and outlook["issued_on"] <= date.today() <= outlook["valid_through"]
+        ):
+            payload["outlook"] = outlook
         return payload
     locality = form.get("locality", "").strip()
     if not locality or len(locality) > 160:
@@ -105,7 +121,14 @@ PAGE = START + """
   {% endif %}
   {% if area %}
     <h3>{{ area.district }} · {{ area.crop }}</h3>
-    <p>No district and crop advisory has been published here yet.</p>
+    {% if area.outlook %}
+      <p><strong>Seasonal rainfall outlook</strong> · Issued {{ area.outlook.issued_on.strftime('%d %B %Y') }}</p>
+      <p>Malawi DCCMS expects near-normal rainfall in Lilongwe from October to December 2026. Rainfall may be near or below normal in January and February 2027.</p>
+      <p>For rain-fed maize, check the latest short-term bulletin and ask your local agricultural extension officer about planting conditions in your area.</p>
+      <p><a href="{{ area.outlook.source_url }}">Read the DCCMS Lilongwe district outlook</a></p>
+    {% else %}
+      <p>No district and crop advisory has been published here yet.</p>
+    {% endif %}
     <p><a href="https://www.metmalawi.gov.mw/products/">Browse official forecasts and agricultural bulletins from Malawi DCCMS</a>.</p>
   {% endif %}
 </section>
