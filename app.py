@@ -16690,6 +16690,25 @@ def _append_source_transparency(reply, source_urls, max_chars=4000):
     return trimmed + suffix
 
 
+def _is_agro_trade_reply(reply, service):
+    if canonicalize_service(service) == "Agro Dealing":
+        return True
+    text = " ".join(str(reply or "").lower().split())
+    return bool(
+        re.search(r"\b(maize|groundnuts?|soya|rice|(?:farm )?produce|agro dealing)\b", text)
+        and re.search(r"\b(buy|sell|sale|seller|bags?|per kg|per bag)\b", text)
+        and re.search(r"\b(enquir(?:y|ies)|inquir(?:y|ies)|recorded|submitted|referred)\b", text)
+    )
+
+
+def _agro_trade_reply():
+    return (
+        "For IBROWS to review your produce enquiry, submit the buying or selling details "
+        "through the Agriculture form. The form gives you a reference after submission.\n\n"
+        f"{IBROWS_PUBLIC_BASE_URL}/agriculture"
+    )
+
+
 def fetch_public_web_resource(raw_url):
     current_url = _normalize_candidate_url(raw_url)
     for redirect_count in range(MAX_WEB_REDIRECTS + 1):
@@ -21645,6 +21664,11 @@ Do not claim stock is available unless confirmed.
 
 Do not invent prices.
 
+For produce buying or selling enquiries, use the Agriculture form for formal submission.
+Do not say that reading a message or screenshot recorded an enquiry or that a team
+member will follow up. The website form provides a reference after saving the request.
+Use one Agriculture link and omit unrelated pages.
+
 Large orders and sourcing may require human confirmation.
 
 
@@ -21930,7 +21954,13 @@ Return ONLY the required JSON object.
             reply = _sanitize_active_career_search_reply_urls(reply, career_verified_urls)
             final_result["reply"] = reply
 
-        if web_source_urls:
+        agro_trade = not (active_career_search or active_career_application) and _is_agro_trade_reply(
+            final_result["reply"], final_result["service"]
+        )
+        if agro_trade:
+            reply = _agro_trade_reply()
+            final_result["reply"] = reply
+        elif web_source_urls:
             reply = _append_source_transparency(reply, web_source_urls)
             final_result["reply"] = reply
             unique_source_urls = []
