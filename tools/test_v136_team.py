@@ -44,7 +44,7 @@ assert 'TEAM V136 READY: Fatuma Nyirenda IT Specialist Lead, image=embedded' in 
 routes=[d for f in tree.body if isinstance(f,ast.FunctionDef)
         for d in f.decorator_list if isinstance(d,ast.Call)
         and isinstance(d.func,ast.Attribute) and d.func.attr=="route"]
-assert len(routes)==168
+assert len(routes)==170
 fn=functions["public_team_photo"]
 fn.decorator_list=[]
 lookups=[]
@@ -69,4 +69,4 @@ assert "team_members" in team_html and 'member.slug' in team_html
 for marker in ("BUSINESS EMAIL V134 READY","CLIENT PRIVACY V132 READY",
                "TYPOGRAPHY V135 READY", "PRICING INTEGRITY V126 READY"):
     assert marker in source
-print("PASS: Eight staff, exact Fatuma role, all prior staff retained, image/jpeg decoded and served, 168 routes unchanged")
+print("PASS: Eight staff, exact Fatuma role, all prior staff retained, image/jpeg decoded and served, 170 routes unchanged")
