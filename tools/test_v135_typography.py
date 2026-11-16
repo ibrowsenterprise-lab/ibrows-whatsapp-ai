@@ -31,7 +31,7 @@ for name in ("PUBLIC_WEBSITE_TEMPLATE","PROJECT_DISCOVERY_TEMPLATE","SERVICE_REQ
 routes=[dec for fn in tree.body if isinstance(fn,ast.FunctionDef)
         for dec in fn.decorator_list if isinstance(dec,ast.Call)
         and isinstance(dec.func,ast.Attribute) and dec.func.attr=="route"]
-assert len(routes)==168,len(routes)
+assert len(routes)==170,len(routes)
 for text in ("CLIENT PRIVACY V132 READY","BUSINESS EMAIL V134 READY","PRICING INTEGRITY V126 READY","def validate_csrf()","WEB_GALLERY_ADMIN_PREVIEW_MAX_SIDE = 640","TYPOGRAPHY V135 READY: system_font=on template_styles=41"):
     assert text in source,text
-print(f"PASS: 40 templates, 41 stylesheets, {font_count} unified font declarations, 168 routes, all key safeguards")
+print(f"PASS: 40 templates, 41 stylesheets, {font_count} unified font declarations, 170 routes, all key safeguards")

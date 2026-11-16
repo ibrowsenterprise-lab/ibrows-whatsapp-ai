@@ -11,7 +11,7 @@ functions = {n.name:n for n in tree.body if isinstance(n, ast.FunctionDef)}
 routes = [(f,d) for f in functions.values() for d in f.decorator_list
           if isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
           and d.func.attr == "route"]
-assert len(routes) == 168, len(routes)
+assert len(routes) == 170, len(routes)  # Includes both Munda Watch routes.
 assert 'BUSINESS EMAIL V134 READY' in source
 assert 'CLIENT PRIVACY V132 READY' in source
 assert 'PRICING INTEGRITY V126 READY' in source

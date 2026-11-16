@@ -40,6 +40,8 @@ from flask import (
 )
 from openai import OpenAI
 
+import munda_watch
+
 # Optional web-image optimizer. The application remains fully functional when
 # Pillow is not installed; in that case public galleries fall back to originals.
 try:
@@ -3643,6 +3645,8 @@ def handle_numbered_service_menu(customer_number, customer_name, customer_messag
       JONES -> activate the real human handover workflow
     """
     text = _normalise_menu_text(customer_message)
+    if text in {"munda watch", "mundawatch"}:
+        return {"action": "REPLY", "reply": munda_watch.whatsapp_reply(IBROWS_PUBLIC_BASE_URL)}
     # Standalone 0 is always the human-handover command, even when the AI
     # displayed a menu without setting a deterministic menu state.
     # Never treat quantities like 0kg as the handover command.
@@ -3883,7 +3887,8 @@ def handle_numbered_service_menu(customer_number, customer_name, customer_messag
             "AGRO": (
                 "You selected IBROWS Agro Dealing. There is no service package price here. Choose whether you want to SELL "
                 "farm produce to IBROWS or BUY produce from IBROWS, then give the commodity, quantity, grade and location.\n\n"
-                f"{IBROWS_PUBLIC_BASE_URL}/agriculture"
+                f"{IBROWS_PUBLIC_BASE_URL}/agriculture\n\n"
+                + munda_watch.whatsapp_reply(IBROWS_PUBLIC_BASE_URL)
             ),
         }
         return {"action": "REPLY", "reply": replies[selected]}
@@ -31160,6 +31165,7 @@ SERVICE_REQUEST_KEYS = {
     "CONSTRUCTION_TENDER": "Construction Tender, BOQ & Bid Support",
     "FUMIGATION": "Fumigation",
     "AGRICULTURE": "Agro Dealing",
+    "MUNDA_WATCH": "Munda Watch",
 }
 SERVICE_REQUEST_STATUSES = {
     "NEW": "New",
@@ -32744,6 +32750,15 @@ def _service_request_payload_rows(service_key, payload):
             ("Packaging", "packaging"),
             ("Notes", "notes"),
         ],
+        "MUNDA_WATCH": [
+            ("Request type", "request_type"),
+            ("District", "district"),
+            ("Crop", "crop"),
+            ("Village or field location", "locality"),
+            ("Planting date", "planting_date"),
+            ("Water source", "water_source"),
+            ("Field problem", "problem"),
+        ],
     }
     rows = list(package_rows)
     for label, key in definitions.get(service_key, []):
@@ -34212,6 +34227,44 @@ def fumigation_service():
         return redirect(url_for("fumigation_service", submitted=ref))
     except ValueError as exc:
         return _render_service_request_page(service_key, str(exc), values), 400
+
+
+@app.route(munda_watch.PATH, defaults={"action": None})
+@app.route(munda_watch.PATH + "/<action>", methods=["GET", "POST"])
+def munda_watch_page(action):
+    if action is not None and action not in munda_watch.ACTIONS:
+        abort(404)
+    service_key = "MUNDA_WATCH"
+    values = request.form if request.method == "POST" else request.args
+    context = {
+        "page_title": "Munda Watch",
+        "action": action,
+        "actions": munda_watch.ACTIONS,
+        "districts": munda_watch.DISTRICTS,
+        "crops": munda_watch.CROPS,
+        "water_sources": munda_watch.WATER_SOURCES,
+        "values": values,
+        "csrf": get_public_service_csrf(service_key),
+    }
+    try:
+        if request.method == "POST":
+            if action == "check":
+                abort(405)
+            validate_public_service_csrf(service_key)
+            name, phone, email = _public_service_common_fields()
+            payload = munda_watch.field_payload(action, values)
+            reference = _create_website_service_request(service_key, name, phone, email, payload)
+            session["munda_watch_confirmation"] = [action, reference]
+            return redirect(url_for("munda_watch_page", action=action))
+        if action == "check" and ("district" in values or "crop" in values):
+            context["area"] = munda_watch.field_payload(action, values)
+    except ValueError as exc:
+        return render_template_string(munda_watch.PAGE, error=str(exc), **context), 400
+    if action in {"register", "report"}:
+        confirmation = session.get("munda_watch_confirmation")
+        if confirmation and confirmation[0] == action:
+            context["reference"] = session.pop("munda_watch_confirmation")[1]
+    return render_template_string(munda_watch.PAGE, **context)
 
 
 @app.route("/agriculture", methods=["GET", "POST"])
