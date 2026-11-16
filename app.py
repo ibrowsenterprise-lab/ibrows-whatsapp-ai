@@ -3883,7 +3883,10 @@ def handle_numbered_service_menu(customer_number, customer_name, customer_messag
             "AGRO": (
                 "You selected IBROWS Agro Dealing. There is no service package price here. Choose whether you want to SELL "
                 "farm produce to IBROWS or BUY produce from IBROWS, then give the commodity, quantity, grade and location.\n\n"
-                f"{IBROWS_PUBLIC_BASE_URL}/agriculture"
+                f"{IBROWS_PUBLIC_BASE_URL}/agriculture\n\n"
+                "Munda Watch pilot preview: maize, groundnuts, soya and rice.\n"
+                f"{IBROWS_PUBLIC_BASE_URL}/agriculture/munda-watch\n\n"
+                "Reply 0 to talk to Jones."
             ),
         }
         return {"action": "REPLY", "reply": replies[selected]}
@@ -34212,6 +34215,44 @@ def fumigation_service():
         return redirect(url_for("fumigation_service", submitted=ref))
     except ValueError as exc:
         return _render_service_request_page(service_key, str(exc), values), 400
+
+
+@app.get("/agriculture/munda-watch")
+def munda_watch_preview():
+    from agro_marketplace_ui import START, END
+    from flask import render_template_string
+
+    crops = ("Maize", "Groundnuts", "Soya", "Rice")
+    requested_crop = request.args.get("crop")
+    selected = requested_crop if requested_crop in crops else None
+
+    return render_template_string(START + """
+    <section class="panel">
+      <p class="eyebrow">IBROWS Agriculture · Pilot preview</p>
+      <h1>Munda Watch</h1>
+      <p>See the information Munda Watch will use to tailor dry-spell updates for your fields.</p>
+      <form method="get">
+        <div class="field">
+          <label for="crop">Crop</label>
+          <select id="crop" name="crop">
+            {% for crop in crops %}
+            <option{% if crop == selected %} selected{% endif %}>{{ crop }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <button type="submit">Preview field profile</button>
+      </form>
+      {% if selected %}
+      <h2>{{ selected }} field profile</h2>
+      <p>The pilot will ask for the field's area, planting date, and water source.</p>
+      {% if selected == "Rice" %}
+      <p>For rice, the water source distinguishes rain-fed from irrigated fields.</p>
+      {% endif %}
+      {% endif %}
+      <p>This preview uses sample information. Field registration and live alerts are pending.</p>
+      <a href="https://www.metmalawi.gov.mw/">Visit Malawi's meteorological department for weather updates</a>
+    </section>
+    """ + END, crops=crops, selected=selected, title="Munda Watch")
 
 
 @app.route("/agriculture", methods=["GET", "POST"])
