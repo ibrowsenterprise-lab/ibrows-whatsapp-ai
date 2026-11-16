@@ -19,14 +19,58 @@ DISTRICTS = (
 )
 
 
-LILONGWE_MAIZE_OUTLOOK = {
-    "source_url": (
-        "https://www.metmalawi.gov.mw/products/downscaled-seasonal-climate-outlook/"
-        "lilongwe-district-downscaled-seasonal-forecast-2026-2027/"
-    ),
-    "issued_on": date(2026, 9, 15),
-    "valid_through": date(2027, 2, 28),
+DCCMS_DISTRICT_OUTLOOKS = "https://www.metmalawi.gov.mw/products/downscaled-seasonal-climate-outlook/"
+OUTLOOK_ISSUED_ON = date(2026, 9, 15)
+OUTLOOK_END_OF_SEASON = date(2027, 4, 30)
+OUTLOOK_END_OF_FEBRUARY = date(2027, 2, 28)
+NEAR_OR_ABOVE = "Seasonal rainfall is expected to be near or above normal."
+NEAR_OR_BELOW = "Seasonal rainfall is expected to be near or below normal."
+
+DISTRICT_RAINFALL_SUMMARIES = {
+    "Balaka": "Seasonal rainfall is expected to be near or below normal, with a higher chance of near- or above-normal rainfall in March 2027.",
+    "Blantyre": NEAR_OR_BELOW,
+    "Chikwawa": NEAR_OR_BELOW,
+    "Chiradzulu": NEAR_OR_BELOW,
+    "Chitipa": NEAR_OR_ABOVE,
+    "Dedza": NEAR_OR_ABOVE,
+    "Dowa": NEAR_OR_BELOW,
+    "Karonga": NEAR_OR_ABOVE,
+    "Kasungu": NEAR_OR_BELOW,
+    "Likoma": NEAR_OR_ABOVE,
+    "Lilongwe": "Rainfall is expected to be near normal from October to December 2026, with a chance of near- or below-normal rainfall in January and February 2027.",
+    "Machinga": NEAR_OR_BELOW,
+    "Mangochi": NEAR_OR_BELOW,
+    "Mchinji": NEAR_OR_BELOW,
+    "Mulanje": NEAR_OR_BELOW,
+    "Mwanza": NEAR_OR_BELOW,
+    "Mzimba": NEAR_OR_ABOVE,
+    "Neno": NEAR_OR_BELOW,
+    "Nkhata Bay": "Many areas are expected to receive near- or above-normal rainfall this season.",
+    "Nkhotakota": NEAR_OR_ABOVE,
+    "Nsanje": NEAR_OR_BELOW,
+    "Ntcheu": NEAR_OR_BELOW,
+    "Ntchisi": "Rainfall is expected to be near or above normal from October to December 2026, with a chance of near- or below-normal rainfall in January and February 2027.",
+    "Phalombe": NEAR_OR_BELOW,
+    "Rumphi": NEAR_OR_ABOVE,
+    "Salima": "Rainfall is expected to be near or above normal from October to December 2026, with a higher chance of near- or below-normal rainfall in January and February 2027.",
+    "Thyolo": NEAR_OR_BELOW,
+    "Zomba": NEAR_OR_BELOW,
 }
+FEBRUARY_OUTLOOK_DISTRICTS = {"Lilongwe", "Ntchisi", "Salima"}
+
+
+def district_outlook(district, today):
+    valid_through = (
+        OUTLOOK_END_OF_FEBRUARY if district in FEBRUARY_OUTLOOK_DISTRICTS
+        else OUTLOOK_END_OF_SEASON
+    )
+    if OUTLOOK_ISSUED_ON <= today <= valid_through:
+        slug = district.lower().replace(" ", "-")
+        return {
+            "summary": DISTRICT_RAINFALL_SUMMARIES[district],
+            "issued_on": OUTLOOK_ISSUED_ON,
+            "source_url": f"{DCCMS_DISTRICT_OUTLOOKS}{slug}-district-downscaled-seasonal-forecast-2026-2027/",
+        }
 
 
 def whatsapp_reply(base_url):
@@ -42,12 +86,7 @@ def field_payload(action, form):
         raise ValueError("Choose a district and one of the four pilot crops.")
     payload = {"request_type": ACTIONS[action], "district": district, "crop": crop}
     if action == "check":
-        outlook = LILONGWE_MAIZE_OUTLOOK
-        if (
-            (district, crop) == ("Lilongwe", "Maize")
-            and outlook["issued_on"] <= date.today() <= outlook["valid_through"]
-        ):
-            payload["outlook"] = outlook
+        payload["outlook"] = district_outlook(district, date.today())
         return payload
     locality = form.get("locality", "").strip()
     if not locality or len(locality) > 160:
@@ -123,11 +162,11 @@ PAGE = START + """
     <h3>{{ area.district }} · {{ area.crop }}</h3>
     {% if area.outlook %}
       <p><strong>Seasonal rainfall outlook</strong> · Issued {{ area.outlook.issued_on.strftime('%d %B %Y') }}</p>
-      <p>Malawi DCCMS expects near-normal rainfall in Lilongwe from October to December 2026. Rainfall may be near or below normal in January and February 2027.</p>
-      <p>For rain-fed maize, check the latest short-term bulletin and ask your local agricultural extension officer about planting conditions in your area.</p>
-      <p><a href="{{ area.outlook.source_url }}">Read the DCCMS Lilongwe district outlook</a></p>
+      <p>{{ area.outlook.summary }}</p>
+      <p>This outlook describes district rainfall for the 2026–2027 season. For {{ area.crop|lower }} planting decisions, check the latest short-term bulletin and speak with your local agricultural extension officer.</p>
+      <p><a href="{{ area.outlook.source_url }}">Read the DCCMS {{ area.district }} district outlook</a></p>
     {% else %}
-      <p>No district and crop advisory has been published here yet.</p>
+      <p>No current seasonal rainfall outlook is available here.</p>
     {% endif %}
     <p><a href="https://www.metmalawi.gov.mw/products/">Browse official forecasts and agricultural bulletins from Malawi DCCMS</a>.</p>
   {% endif %}
