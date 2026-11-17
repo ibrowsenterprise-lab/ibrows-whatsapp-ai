@@ -89,7 +89,30 @@ def whatsapp_reply(base_url):
         f"Report a field problem, such as dry conditions or poor emergence\n"
         f"{base_url}{PATH}/report\n\n"
         "Automatic weather alerts are currently unavailable. Use Check my area "
-        "for links to official Malawi DCCMS bulletins."
+        "for links to official Malawi DCCMS bulletins.\n\n"
+        "Pa Chichewa, lembani CHICHEWA."
+    )
+
+
+def chichewa_whatsapp_reply(base_url):
+    return (
+        "Munda Watch | Kukonzekera El Niño ku Malawi\n\n"
+        "Sankhani boma lanu ndi mbewu yanu kuti muone mmene mvula "
+        "ikuyembekezeka kugwa m'nyengo ino.\n\n"
+        f"Onani mmene mvula ikuyembekezeka m'boma lanu\n{base_url}{PATH}/check\n\n"
+        f"Lembetsani munda wanu kuti IBROWS ikutsatireni\n{base_url}{PATH}/register\n\n"
+        f"Fotokozani vuto la m'munda, monga kuuma kwa nthaka kapena kusamera bwino kwa mbewu\n"
+        f"{base_url}{PATH}/report\n\n"
+        "Mauthenga a chenjezo la nyengo sanayambe kutumizidwa pa WhatsApp. "
+        "Pa tsamba la Munda Watch pali maulosi a nyengo ochokera ku DCCMS."
+    )
+
+
+def whatsapp_alert_status(base_url):
+    return (
+        "Munda Watch weather alerts are currently unavailable on WhatsApp. "
+        "Check your district for official DCCMS bulletins:\n"
+        f"{base_url}{PATH}/check"
     )
 
 

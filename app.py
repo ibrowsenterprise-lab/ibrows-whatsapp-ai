@@ -3645,6 +3645,10 @@ def handle_numbered_service_menu(customer_number, customer_name, customer_messag
       JONES -> activate the real human handover workflow
     """
     text = _normalise_menu_text(customer_message)
+    if text in {"in chichewa", "chichewa", "mu chichewa", "munda watch chichewa"}:
+        return {"action": "REPLY", "reply": munda_watch.chichewa_whatsapp_reply(IBROWS_PUBLIC_BASE_URL)}
+    if text in {"alerts on", "munda watch alerts"}:
+        return {"action": "REPLY", "reply": munda_watch.whatsapp_alert_status(IBROWS_PUBLIC_BASE_URL)}
     if text in {"munda watch", "mundawatch"}:
         return {"action": "REPLY", "reply": munda_watch.whatsapp_reply(IBROWS_PUBLIC_BASE_URL)}
     # Standalone 0 is always the human-handover command, even when the AI
