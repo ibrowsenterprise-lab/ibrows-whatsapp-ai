@@ -8,7 +8,7 @@ from datetime import date
 from urllib.parse import urlencode
 
 from munda_watch import DCCMS_DISTRICT_OUTLOOKS, DISTRICTS, PATH as MUNDA_PATH, district_outlook
-from munda_weather import FORECAST_PREVIEWS, whatsapp_weather_reply
+from munda_weather import DCCMS_DAILY_URL, FORECAST_PREVIEWS, LICENSE_URL, daily_forecast, whatsapp_weather_reply
 
 MUNDA_MENU = """*Munda Watch · El Niño farm preparedness*
 Reply with a number.
@@ -18,6 +18,7 @@ Reply with a number.
 3. Register a field
 4. Report a field problem
 5. Forecast languages
+6. My Field
 
 0. Talk to Jones
 Type MENU for all IBROWS services."""
@@ -32,6 +33,50 @@ MUNDA_FIELD_FORMS = {
     "MUNDA_REGISTER": ("register", "Register a field"),
     "MUNDA_REPORT": ("report", "Report a field problem"),
 }
+MY_FIELD_PROMPT = (
+    "Send *MY FIELD* followed by the reference on your registration or report confirmation, "
+    "from the same WhatsApp number you entered on the form."
+)
+
+
+def _my_field_reply(core, customer_number, text):
+    if text == "my field":
+        return MY_FIELD_PROMPT
+    if not text.startswith("my field "):
+        return None
+    reference = core._extract_website_service_reference(text)
+    if not reference:
+        return MY_FIELD_PROMPT
+    item = core._website_request_by_reference_for_whatsapp(customer_number, reference)
+    if not item or item["service_key"] != "MUNDA_WATCH":
+        return "I couldn't find a Munda Watch request for that reference and WhatsApp number. Check the reference or send *0* for help."
+
+    payload = item.get("payload") or {}
+    district = payload.get("district")
+    status = core.SERVICE_REQUEST_STATUSES.get(item.get("status"), "Status unavailable")
+    lines = [f"*My Field · {reference}*", f"Status: {status}"]
+    for key, label in (
+        ("request_type", "Request"), ("district", "District"), ("crop", "Crop"),
+        ("planting_date", "Planting date"), ("water_source", "Water source"),
+    ):
+        if payload.get(key):
+            lines.append(f"{label}: {payload[key]}")
+    if district in DISTRICTS:
+        forecast = daily_forecast(district)
+        if forecast:
+            day = forecast["rows"][0]
+            lines.extend((
+                "",
+                f"*Forecast near {district} · {day['date']:%d %b} from {day['from_time']} CAT*",
+                f"{day['rain_mm']:g} mm rain · {day['temp_low']}–{day['temp_high']}°C · wind up to {day['wind_kmh']} km/h",
+                "Period ends at 02:00 CAT the next morning.",
+                f"MET Norway data, aggregated by IBROWS ({LICENSE_URL}).",
+                f"Send *WEATHER {district.upper()}* for the six-day forecast.",
+            ))
+        else:
+            lines.extend(("", f"District forecast unavailable. Official DCCMS forecast: {DCCMS_DAILY_URL}"))
+    lines.extend(("", "Send *0* to talk to Jones or *MUNDA WATCH* for the farm menu."))
+    return "\n".join(lines)
 
 
 def _numbered_options(labels):
@@ -69,7 +114,9 @@ def _munda_numbered_reply(core, customer_number, text):
             return "*Choose your district*\nReply with its number.\n\n" + _numbered_options(DISTRICTS)
         if number == 5:
             return whatsapp_weather_reply("MUNDA LANGUAGES", base_url)
-        return "Choose a number from 1 to 5, or send 0 to talk to Jones."
+        if number == 6:
+            return MY_FIELD_PROMPT
+        return "Choose a number from 1 to 6, or send 0 to talk to Jones."
     if state in MUNDA_DISTRICT_STEPS:
         if 1 <= number <= len(DISTRICTS):
             district = DISTRICTS[number - 1]
@@ -236,6 +283,9 @@ def install_whatsapp_menu_fix(flask_app):
 
     def menu_handler(customer_number, customer_name, customer_message):
         text = " ".join(str(customer_message or "").strip().casefold().split())
+        field_reply = _my_field_reply(core, customer_number, text)
+        if field_reply is not None:
+            return {"action": "REPLY", "reply": field_reply}
         munda_reply = _munda_numbered_reply(core, customer_number, text)
         if munda_reply is not None:
             return {"action": "REPLY", "reply": munda_reply}
