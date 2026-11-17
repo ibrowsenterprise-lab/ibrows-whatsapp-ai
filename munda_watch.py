@@ -148,25 +148,25 @@ def field_payload(action, form):
 
 PAGE = START + """
 <div class="page-heading">
-  <a class="back-link" href="/agriculture">← Agriculture</a>
+  {% if action %}
+    <a class="back-link" href="{{ url_for('munda_watch_page') }}">← Munda Watch</a>
+  {% else %}
+    <a class="back-link" href="/agriculture">← Agriculture</a>
+  {% endif %}
   <h1>Munda Watch</h1>
-  <h2>El Niño farm preparedness in Malawi</h2>
-  <p class="intro">Start by choosing your district and crop to see the official seasonal rainfall outlook. Register a field for IBROWS follow-up or report a problem you are seeing on the ground.</p>
+  {% if not action %}
+    <h2>El Niño farm preparedness in Malawi</h2>
+    <p class="intro">Start by choosing your district and crop to see the official seasonal rainfall outlook. Register a field for IBROWS follow-up or report a problem you are seeing on the ground.</p>
+  {% endif %}
 </div>
-<nav class="form-actions" aria-label="Munda Watch">
-  {% for key, label in actions.items() %}
-    <a class="button secondary" href="{{ url_for('munda_watch_page', action=key) }}">{{ label }}</a>
-  {% endfor %}
-</nav>
-<p>Automatic weather alerts are currently unavailable. Check your area for official DCCMS bulletins.</p>
 {% if action %}
-<section class="panel" style="margin-top:24px;max-width:760px">
+<section class="panel" style="max-width:760px">
   <h2>{{ actions[action] }}</h2>
   {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
   {% if reference %}
     <p role="status">Received by IBROWS. Your reference is <strong>{{ reference }}</strong>.</p>
   {% else %}
-    <form method="{{ 'get' if action == 'check' else 'post' }}">
+    <form method="{{ 'get' if action == 'check' else 'post' }}"{% if action == 'check' %} action="{{ url_for('munda_watch_page', action=action, _anchor='area-outlook') }}"{% endif %}>
       {% if action != 'check' %}
         <input type="hidden" name="csrf_token" value="{{ csrf }}">
         <input class="honeypot" name="fax_number" tabindex="-1" autocomplete="off" aria-hidden="true">
@@ -198,7 +198,7 @@ PAGE = START + """
     </form>
   {% endif %}
   {% if area %}
-    <h3>{{ area.district }} · {{ area.crop }}</h3>
+    <h3 id="area-outlook" tabindex="-1">{{ area.district }} · {{ area.crop }}</h3>
     {% if area.outlook %}
       <p><strong>Seasonal rainfall outlook</strong> · Issued {{ area.outlook.issued_on.strftime('%d %B %Y') }}</p>
       <p>{{ area.outlook.summary }}</p>
@@ -215,4 +215,10 @@ PAGE = START + """
   {% endif %}
 </section>
 {% endif %}
+<nav class="form-actions" aria-label="Munda Watch">
+  {% for key, label in actions.items() if key != action %}
+    <a class="button{{ '' if key == 'check' else ' secondary' }}" href="{{ url_for('munda_watch_page', action=key) }}">{{ label }}</a>
+  {% endfor %}
+</nav>
+<p>Automatic weather alerts are currently unavailable. Check your area for official DCCMS bulletins.</p>
 """ + END
