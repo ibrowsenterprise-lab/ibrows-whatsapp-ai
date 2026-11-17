@@ -5,6 +5,7 @@ handoff/CRM logic stays responsible for requests for a human.
 """
 
 from datetime import date
+from urllib.parse import urlencode
 
 from munda_watch import DCCMS_DISTRICT_OUTLOOKS, DISTRICTS, PATH as MUNDA_PATH, district_outlook
 from munda_weather import FORECAST_PREVIEWS, whatsapp_weather_reply
@@ -26,6 +27,11 @@ MUNDA_LANGUAGES = (
     ("nyengo", "Chichewa"),
     *((command, details[0]) for command, details in FORECAST_PREVIEWS.items()),
 )
+MUNDA_DISTRICT_STEPS = ("MUNDA_DISTRICT", "MUNDA_SEASONAL", "MUNDA_REGISTER", "MUNDA_REPORT")
+MUNDA_FIELD_FORMS = {
+    "MUNDA_REGISTER": ("register", "Register a field"),
+    "MUNDA_REPORT": ("report", "Report a field problem"),
+}
 
 
 def _numbered_options(labels):
@@ -57,26 +63,29 @@ def _munda_numbered_reply(core, customer_number, text):
     number = int(text)
     base_url = core.IBROWS_PUBLIC_BASE_URL.rstrip("/")
     if state == "MUNDA":
-        if number in {1, 2}:
-            state = "MUNDA_DISTRICT" if number == 1 else "MUNDA_SEASONAL"
+        if 1 <= number <= len(MUNDA_DISTRICT_STEPS):
+            state = MUNDA_DISTRICT_STEPS[number - 1]
             core.set_customer_menu_state(customer_number, state)
             return "*Choose your district*\nReply with its number.\n\n" + _numbered_options(DISTRICTS)
-        if number in {3, 4}:
-            action, label = {
-                3: ("register", "Open the field registration form"),
-                4: ("report", "Open the field problem report form"),
-            }[number]
-            return f"{label}\n{base_url}{MUNDA_PATH}/{action}"
         if number == 5:
             return whatsapp_weather_reply("MUNDA LANGUAGES", base_url)
         return "Choose a number from 1 to 5, or send 0 to talk to Jones."
-    if state in {"MUNDA_DISTRICT", "MUNDA_SEASONAL"}:
+    if state in MUNDA_DISTRICT_STEPS:
         if 1 <= number <= len(DISTRICTS):
             district = DISTRICTS[number - 1]
             if state == "MUNDA_SEASONAL":
                 reply = _seasonal_outlook_reply(district, base_url)
                 core.clear_customer_menu_state(customer_number)
                 return reply
+            if state in MUNDA_FIELD_FORMS:
+                action, label = MUNDA_FIELD_FORMS[state]
+                query = urlencode({"district": district})
+                core.clear_customer_menu_state(customer_number)
+                return (
+                    f"*{district} · {label}*\n\n"
+                    f"{base_url}{MUNDA_PATH}/{action}?{query}\n\n"
+                    "Send *MUNDA WATCH* to choose another service."
+                )
             core.set_customer_menu_state(customer_number, f"MUNDA_LANG:{district}")
             return (
                 f"*{district} · Choose your forecast language*\n\n"
