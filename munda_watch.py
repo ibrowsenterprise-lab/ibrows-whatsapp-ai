@@ -220,6 +220,11 @@ PAGE = START.replace("</head>", PAGE_STYLES + "</head>") + """
   {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
   {% if reference %}
     <p role="status">Received by IBROWS. Your reference is <strong>{{ reference }}</strong>.</p>
+    <p>Keep this reference to check your request and see your district forecast.</p>
+    <div class="form-actions">
+      <a class="button" href="https://wa.me/""" + ACTIVE_PUBLIC_WHATSAPP + """?text=MY%20FIELD%20{{ reference|urlencode }}">Check status on WhatsApp</a>
+    </div>
+    <p class="small-note">Use the same WhatsApp number you entered on this form.</p>
   {% else %}
     <form method="{{ 'get' if action == 'check' else 'post' }}"{% if action == 'check' %} action="{{ url_for('munda_watch_page', action=action, _anchor='area-outlook') }}"{% endif %}>
       {% if action != 'check' %}
