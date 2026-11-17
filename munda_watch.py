@@ -94,6 +94,7 @@ def whatsapp_reply(base_url):
         "For the short-range forecast, type WEATHER followed by your district, "
         "for example WEATHER LILONGWE.\n\n"
         "For all six language commands, type MUNDA LANGUAGES.\n\n"
+        "To use the numbered farm services menu, type MUNDA WATCH.\n\n"
         "Automatic weather alerts are currently unavailable. Use Check my area "
         "for links to official Malawi DCCMS bulletins.\n\n"
         "Pa Chichewa, lembani CHICHEWA."
