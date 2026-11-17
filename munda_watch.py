@@ -136,6 +136,8 @@ def field_payload(action, form):
         payload["dccms_warnings"] = DCCMS_WARNINGS_URL
         command = urlencode({"text": f"WEATHER {district.upper()}"})
         payload["whatsapp_weather"] = f"https://wa.me/{ACTIVE_PUBLIC_WHATSAPP}?{command}"
+        command_chichewa = urlencode({"text": f"NYENGO {district.upper()}"})
+        payload["whatsapp_weather_chichewa"] = f"https://wa.me/{ACTIVE_PUBLIC_WHATSAPP}?{command_chichewa}"
         return payload
     locality = form.get("locality", "").strip()
     if not locality or len(locality) > 160:
@@ -227,7 +229,10 @@ PAGE = START + """
         <p>The short-range forecast is temporarily unavailable.</p>
       {% endif %}
       <p><a href="{{ area.dccms_daily }}">Official DCCMS daily forecast</a> · <a href="{{ area.dccms_warnings }}">DCCMS weather warnings</a></p>
-      <p><a href="{{ area.whatsapp_weather }}">Get {{ area.district }} weather on WhatsApp</a></p>
+      <p>
+        <a href="{{ area.whatsapp_weather }}">Get {{ area.district }} weather on WhatsApp</a><br>
+        <a lang="ny" href="{{ area.whatsapp_weather_chichewa }}">Onani nyengo ya ku {{ area.district }} mu Chichewa pa WhatsApp</a>
+      </p>
     </section>
     {% if area.outlook %}
       <p><strong>Seasonal rainfall outlook</strong> · Issued {{ area.outlook.issued_on.strftime('%d %B %Y') }}</p>
