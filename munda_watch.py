@@ -1,7 +1,9 @@
 """Munda Watch pilot pages and field intake validation."""
 from datetime import date
+from urllib.parse import urlencode
 
 from agro_marketplace_ui import START, END
+from launch_contact_config import ACTIVE_PUBLIC_WHATSAPP
 from munda_weather import DCCMS_DAILY_URL, DCCMS_WARNINGS_URL, daily_forecast
 
 PATH = "/agriculture/munda-watch"
@@ -130,6 +132,8 @@ def field_payload(action, form):
         payload["weather"] = daily_forecast(district)
         payload["dccms_daily"] = DCCMS_DAILY_URL
         payload["dccms_warnings"] = DCCMS_WARNINGS_URL
+        command = urlencode({"text": f"WEATHER {district.upper()}"})
+        payload["whatsapp_weather"] = f"https://wa.me/{ACTIVE_PUBLIC_WHATSAPP}?{command}"
         return payload
     locality = form.get("locality", "").strip()
     if not locality or len(locality) > 160:
@@ -221,6 +225,7 @@ PAGE = START + """
         <p>The short-range forecast is temporarily unavailable.</p>
       {% endif %}
       <p><a href="{{ area.dccms_daily }}">Official DCCMS daily forecast</a> · <a href="{{ area.dccms_warnings }}">DCCMS weather warnings</a></p>
+      <p><a href="{{ area.whatsapp_weather }}">Get {{ area.district }} weather on WhatsApp</a></p>
     </section>
     {% if area.outlook %}
       <p><strong>Seasonal rainfall outlook</strong> · Issued {{ area.outlook.issued_on.strftime('%d %B %Y') }}</p>
