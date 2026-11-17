@@ -80,8 +80,16 @@ def district_outlook(district, today):
 
 
 def whatsapp_reply(base_url):
-    return "Munda Watch | IBROWS Agriculture\n\n" + "\n".join(
-        f"{label}\n{base_url}{PATH}/{action}" for action, label in ACTIONS.items()
+    return (
+        "Munda Watch | El Niño farm preparedness\n\n"
+        "Preparing for El Niño in Malawi? Check what the seasonal rainfall outlook "
+        "means for your district and use the field forms if you need follow-up.\n\n"
+        f"Start here: Check your district and crop\n{base_url}{PATH}/check\n\n"
+        f"Register your field for IBROWS follow-up\n{base_url}{PATH}/register\n\n"
+        f"Report a field problem, such as dry conditions or poor emergence\n"
+        f"{base_url}{PATH}/report\n\n"
+        "Automatic weather alerts are currently unavailable. Use Check my area "
+        "for links to official Malawi DCCMS bulletins."
     )
 
 
@@ -119,13 +127,15 @@ PAGE = START + """
 <div class="page-heading">
   <a class="back-link" href="/agriculture">← Agriculture</a>
   <h1>Munda Watch</h1>
-  <p class="intro">Check your district’s seasonal rainfall outlook, register a field or report a field problem.</p>
+  <h2>El Niño farm preparedness in Malawi</h2>
+  <p class="intro">Start by choosing your district and crop to see the official seasonal rainfall outlook. Register a field for IBROWS follow-up or report a problem you are seeing on the ground.</p>
 </div>
 <nav class="form-actions" aria-label="Munda Watch">
   {% for key, label in actions.items() %}
     <a class="button secondary" href="{{ url_for('munda_watch_page', action=key) }}">{{ label }}</a>
   {% endfor %}
 </nav>
+<p>Automatic weather alerts are currently unavailable. Check your area for official DCCMS bulletins.</p>
 {% if action %}
 <section class="panel" style="margin-top:24px;max-width:760px">
   <h2>{{ actions[action] }}</h2>
