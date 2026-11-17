@@ -108,6 +108,8 @@ def chichewa_whatsapp_reply(base_url):
         f"Lembetsani munda wanu kuti IBROWS ikutsatireni\n{base_url}{PATH}/register\n\n"
         f"Fotokozani vuto la m'munda, monga kuuma kwa nthaka kapena kusamera bwino kwa mbewu\n"
         f"{base_url}{PATH}/report\n\n"
+        "Kuti muone ulosi wa masiku akubwerawa, lembani NYENGO ndi dzina la boma lanu, "
+        "monga NYENGO LILONGWE.\n\n"
         "Mauthenga a chenjezo la nyengo sanayambe kutumizidwa pa WhatsApp. "
         "Pa tsamba la Munda Watch pali maulosi a nyengo ochokera ku DCCMS."
     )
