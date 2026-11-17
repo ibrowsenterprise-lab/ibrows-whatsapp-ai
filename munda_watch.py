@@ -160,7 +160,36 @@ def field_payload(action, form):
     return payload
 
 
-PAGE = START + """
+RESULT_STYLES = """
+<style>
+  .munda-result { margin-top:28px; border-top:1px solid var(--line); padding-top:20px; }
+  #area-outlook { scroll-margin-top:16px; margin:0 0 14px; font-size:clamp(23px, 4vw, 29px); line-height:1.2; }
+  #area-outlook:focus { outline:none; }
+  .munda-result h4 { font-size:16px; margin:0 0 6px; }
+  .munda-result p { margin:8px 0; }
+  .munda-result .small-note { margin-top:10px; }
+  .munda-weather { background:var(--soft); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .munda-weather p, .munda-links { font-size:14px; }
+  .munda-weather table { width:100%; border-collapse:collapse; font-size:14px; line-height:1.35; font-variant-numeric:tabular-nums; }
+  .munda-weather th, .munda-weather td { padding:8px 5px; border-bottom:1px solid #cbdacf; text-align:right; }
+  .munda-weather th:first-child { text-align:left; }
+  .munda-weather thead th { color:var(--muted); font-size:12px; }
+  .munda-weather tbody td { white-space:nowrap; }
+  .munda-weather tbody tr:first-child { background:#fff8; }
+  .munda-weather .munda-window { display:block; font-size:11px; font-weight:400; color:var(--muted); white-space:nowrap; }
+  .munda-season { border-top:1px solid var(--line); padding-top:16px; margin-top:20px; }
+  .munda-links { display:flex; flex-wrap:wrap; gap:10px 16px; margin:12px 0; }
+  @media(max-width:620px) {
+    .munda-weather { padding:12px 8px; }
+    .munda-weather table { font-size:13px; }
+    .munda-weather th, .munda-weather td { padding:7px 4px; }
+    .munda-weather thead th { font-size:11px; }
+    .munda-result .munda-links a { min-height:24px; }
+  }
+</style>
+"""
+
+PAGE = START.replace("</head>", RESULT_STYLES + "</head>") + """
 <div class="page-heading">
   {% if action %}
     <a class="back-link" href="{{ url_for('munda_watch_page') }}">← Munda Watch</a>
@@ -212,41 +241,64 @@ PAGE = START + """
     </form>
   {% endif %}
   {% if area %}
+  <div class="munda-result">
     <h3 id="area-outlook" tabindex="-1">{{ area.district }} · {{ area.crop }}</h3>
-    <section aria-labelledby="short-range-weather">
+    <section class="munda-weather" aria-labelledby="short-range-weather">
       <h4 id="short-range-weather">Today and next 5 days</h4>
       {% if area.weather %}
-        <p>Forecast for a reference point near {{ area.district }}. Conditions can vary across the district.</p>
-        <p>Each period ends at 02:00 CAT the next morning. Today covers the remaining forecast hours.</p>
-        <dl>
+        <p>Forecast near {{ area.district }}. Conditions vary across the district.</p>
+        <table aria-labelledby="short-range-weather">
+          <thead><tr>
+            <th scope="col">Day</th><th scope="col">Rain (mm)</th>
+            <th scope="col">Temp (°C)</th><th scope="col">Wind max<br>(km/h)</th>
+          </tr></thead>
+          <tbody>
           {% for day in area.weather.rows %}
-            <dt><strong>{{ day.date.strftime('%a %d %b') }}</strong> · From {{ day.from_time }} CAT</dt>
-            <dd style="margin:0 0 12px">{{ '%g'|format(day.rain_mm) }} mm rain · {{ day.temp_low }}–{{ day.temp_high }} °C · Wind up to {{ day.wind_kmh }} km/h</dd>
+            <tr>
+              <th scope="row">{{ day.date.strftime('%a %d %b') }}
+                {% if day.from_time != '02:00' %}<span class="munda-window">From {{ day.from_time }}</span>{% endif %}
+              </th>
+              <td>{{ '%g'|format(day.rain_mm) }}</td>
+              <td>{{ day.temp_low }}–{{ day.temp_high }}</td>
+              <td>{{ day.wind_kmh }}</td>
+            </tr>
           {% endfor %}
-        </dl>
+          </tbody>
+        </table>
+        <p class="small-note">Full periods run from 02:00 to 02:00 the next morning, Malawi time.</p>
         <p class="small-note">Updated {{ area.weather.updated }}. Based on <a href="{{ area.weather.source }}">MET Norway data</a> (<a href="{{ area.weather.licence }}">CC BY 4.0</a>), aggregated by IBROWS. Reference coordinates from <a href="https://www.geonames.org/">GeoNames</a>.</p>
       {% else %}
         <p>The short-range forecast is temporarily unavailable.</p>
       {% endif %}
-      <p><a href="{{ area.dccms_daily }}">Official DCCMS daily forecast</a> · <a href="{{ area.dccms_warnings }}">DCCMS weather warnings</a></p>
-      <p>
-        <a href="{{ area.whatsapp_weather }}">Get {{ area.district }} weather on WhatsApp</a><br>
-        <a lang="ny" href="{{ area.whatsapp_weather_chichewa }}">Onani nyengo ya ku {{ area.district }} mu Chichewa pa WhatsApp</a>
-      </p>
     </section>
-    {% if area.outlook %}
-      <p><strong>Seasonal rainfall outlook</strong> · Issued {{ area.outlook.issued_on.strftime('%d %B %Y') }}</p>
-      <p>{{ area.outlook.summary }}</p>
-      <p>This outlook describes district rainfall for the 2026–2027 season. For {{ area.crop|lower }} planting decisions, check the latest short-term bulletin and speak with your local agricultural extension officer.</p>
-      <p><a href="{{ area.outlook.source_url }}">Read the DCCMS {{ area.district }} district outlook</a></p>
-    {% else %}
-      <p>No current seasonal rainfall outlook is available here.</p>
-    {% endif %}
-    <p><a href="https://www.metmalawi.gov.mw/products/10-day-weather-and-agrometeorological-bulletin/">Read the DCCMS 10-day weather and agricultural bulletins</a></p>
+    <div class="munda-links">
+      <a href="{{ area.dccms_daily }}">DCCMS daily forecast</a>
+      <a href="{{ area.dccms_warnings }}">DCCMS weather warnings</a>
+    </div>
+    <section aria-labelledby="munda-whatsapp">
+      <h4 id="munda-whatsapp">Get this forecast on WhatsApp</h4>
+      <div class="munda-links">
+        <a href="{{ area.whatsapp_weather }}">English</a>
+        <a lang="ny" href="{{ area.whatsapp_weather_chichewa }}">Mu Chichewa</a>
+      </div>
+    </section>
+    <section class="munda-season" aria-labelledby="munda-seasonal">
+      <h4 id="munda-seasonal">Seasonal rainfall outlook</h4>
+      {% if area.outlook %}
+        <p class="small-note">Issued {{ area.outlook.issued_on.strftime('%d %B %Y') }}</p>
+        <p>{{ area.outlook.summary }}</p>
+        <p>This outlook describes district rainfall for the 2026–2027 season. For {{ area.crop|lower }} planting decisions, check the latest short-term bulletin and speak with your local agricultural extension officer.</p>
+        <p><a href="{{ area.outlook.source_url }}">Read the DCCMS {{ area.district }} district outlook</a></p>
+      {% else %}
+        <p>No current seasonal rainfall outlook is available here.</p>
+      {% endif %}
+      <p><a href="https://www.metmalawi.gov.mw/products/10-day-weather-and-agrometeorological-bulletin/">Read the DCCMS 10-day weather and agricultural bulletins</a></p>
+    </section>
     <div class="form-actions">
       <a class="button secondary" href="{{ url_for('munda_watch_page', action='register', district=area.district, crop=area.crop) }}">Register this field</a>
       <a class="button secondary" href="{{ url_for('munda_watch_page', action='report', district=area.district, crop=area.crop) }}">Report a problem for this crop</a>
     </div>
+  </div>
   {% endif %}
 </section>
 {% endif %}
