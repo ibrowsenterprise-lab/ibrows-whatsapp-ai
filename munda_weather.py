@@ -182,14 +182,19 @@ def whatsapp_weather_reply(message, base_url):
             f"The short-range forecast for the {district} reference location is temporarily unavailable.\n"
             f"Official Malawi daily forecast: {DCCMS_DAILY_URL}"
         )
-    days = "\n".join(
-        f"{row['date']:%a %d %b} from {row['from_time']}: {row['rain_mm']:g} mm rain, "
-        f"{row['temp_low']}–{row['temp_high']}°C, wind up to {row['wind_kmh']} km/h"
-        for row in forecast["rows"]
-    )
+    days = []
+    for row in forecast["rows"]:
+        day = f"*{row['date']:%a %d %b}*"
+        if row["from_time"] != "02:00":
+            day += f" from {row['from_time']}"
+        days.append(
+            f"{day}: {row['rain_mm']:g} mm rain · "
+            f"{row['temp_low']}–{row['temp_high']}°C · wind up to {row['wind_kmh']} km/h"
+        )
+    daily_lines = "\n".join(days)
     return (
-        f"Munda Watch weather · {district} reference location\n"
-        f"Periods end at 02:00 CAT the next morning.\n\n{days}\n\n"
+        f"*Munda Watch weather · {district}*\n\n{daily_lines}\n\n"
+        "District reference location. All times CAT. Full days run from 02:00 to 02:00 the next morning.\n"
         f"Updated {forecast['updated']}. Based on MET Norway data, aggregated by IBROWS "
         f"({LICENSE_URL}).\nOfficial DCCMS forecast: {DCCMS_DAILY_URL}\n"
         f"{base_url}/agriculture/munda-watch"
