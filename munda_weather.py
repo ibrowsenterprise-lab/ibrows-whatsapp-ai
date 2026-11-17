@@ -210,6 +210,21 @@ def _chichewa_weather_reply(district, forecast, base_url):
 
 def whatsapp_weather_reply(message, base_url):
     text = " ".join(str(message or "").casefold().strip(" ?.").split())
+    if text in {"munda languages", "weather languages"}:
+        previews = "\n".join(
+            f"• {name}: *{command.upper()} LILONGWE*"
+            for command, (name, _, _, _) in FORECAST_PREVIEWS.items()
+        )
+        return (
+            "*Munda Watch forecast languages*\n\n"
+            "• English: *WEATHER LILONGWE*\n"
+            "• Chichewa: *NYENGO LILONGWE*\n"
+            f"{previews}\n\n"
+            "Replace LILONGWE with your district.\n\n"
+            "Chitumbuka, Chisena, Chiyao and Chilomwe are bilingual previews. "
+            "To suggest a wording correction, send *0* to reach IBROWS. "
+            "Tell us the language, the word you saw and how you would say it."
+        )
     text = text.removeprefix("munda ")
     command, _, district_input = text.partition(" ")
     district = DISTRICT_NAMES.get(district_input)
