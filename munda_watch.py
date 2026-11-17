@@ -4,7 +4,7 @@ from urllib.parse import urlencode
 
 from agro_marketplace_ui import START, END
 from launch_contact_config import ACTIVE_PUBLIC_WHATSAPP
-from munda_weather import DCCMS_DAILY_URL, DCCMS_WARNINGS_URL, daily_forecast
+from munda_weather import DCCMS_DAILY_URL, DCCMS_WARNINGS_URL, FORECAST_PREVIEWS, daily_forecast
 
 PATH = "/agriculture/munda-watch"
 ACTIONS = {
@@ -93,6 +93,8 @@ def whatsapp_reply(base_url):
         f"{base_url}{PATH}/report\n\n"
         "For the short-range forecast, type WEATHER followed by your district, "
         "for example WEATHER LILONGWE.\n\n"
+        "Bilingual previews: type CHITUMBUKA, CHISENA, CHIYAO or CHILOMWE, "
+        "followed by your district.\n\n"
         "Automatic weather alerts are currently unavailable. Use Check my area "
         "for links to official Malawi DCCMS bulletins.\n\n"
         "Pa Chichewa, lembani CHICHEWA."
@@ -134,10 +136,12 @@ def field_payload(action, form):
         payload["weather"] = daily_forecast(district)
         payload["dccms_daily"] = DCCMS_DAILY_URL
         payload["dccms_warnings"] = DCCMS_WARNINGS_URL
-        command = urlencode({"text": f"WEATHER {district.upper()}"})
-        payload["whatsapp_weather"] = f"https://wa.me/{ACTIVE_PUBLIC_WHATSAPP}?{command}"
-        command_chichewa = urlencode({"text": f"NYENGO {district.upper()}"})
-        payload["whatsapp_weather_chichewa"] = f"https://wa.me/{ACTIVE_PUBLIC_WHATSAPP}?{command_chichewa}"
+        languages = [("weather", "English", "en"), ("nyengo", "Mu Chichewa", "ny")]
+        languages.extend((command, name, lang) for command, (name, lang, _, _) in FORECAST_PREVIEWS.items())
+        payload["weather_links"] = [
+            (name, lang, f"https://wa.me/{ACTIVE_PUBLIC_WHATSAPP}?" + urlencode({"text": f"{command.upper()} {district.upper()}"}))
+            for command, name, lang in languages
+        ]
         return payload
     locality = form.get("locality", "").strip()
     if not locality or len(locality) > 160:
@@ -287,9 +291,11 @@ PAGE = START.replace("</head>", PAGE_STYLES + "</head>") + """
     <section aria-labelledby="munda-whatsapp">
       <h4 id="munda-whatsapp">Get this forecast on WhatsApp</h4>
       <div class="munda-links">
-        <a href="{{ area.whatsapp_weather }}">English</a>
-        <a lang="ny" href="{{ area.whatsapp_weather_chichewa }}">Mu Chichewa</a>
+        {% for name, lang, link in area.weather_links %}
+          <a lang="{{ lang }}" href="{{ link }}">{{ name }}</a>
+        {% endfor %}
       </div>
+      <p class="small-note">Chitumbuka, Chisena, Chiyao and Chilomwe are bilingual previews.</p>
     </section>
     <section class="munda-season" aria-labelledby="munda-seasonal">
       <h4 id="munda-seasonal">Seasonal rainfall outlook</h4>

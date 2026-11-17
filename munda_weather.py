@@ -52,6 +52,14 @@ LOCATIONS = {
 }
 DISTRICT_NAMES = {district.casefold(): district for district in LOCATIONS}
 CHICHEWA_WEEKDAYS = ("Lolemba", "Lachiwiri", "Lachitatu", "Lachinayi", "Lachisanu", "Loweruka", "Lamlungu")
+# Local weather vocabulary for the bilingual forecast previews. Keep timing
+# and attribution in English until the longer wording has fluent review.
+FORECAST_PREVIEWS = {
+    "chitumbuka": ("Chitumbuka", "tum", "vula", "mphepo"),
+    "chisena": ("Chisena", "seh", "bvula", "mphepo"),
+    "chiyao": ("Chiyao", "yao", "ula", "mbungo"),
+    "chilomwe": ("Chilomwe", "ngl", "epula", "echeku"),
+}
 _locks = {district: Lock() for district in LOCATIONS}
 _cache = {}
 
@@ -205,7 +213,8 @@ def whatsapp_weather_reply(message, base_url):
     text = text.removeprefix("munda ")
     command, _, district_input = text.partition(" ")
     district = DISTRICT_NAMES.get(district_input)
-    if not district or command not in {"weather", "nyengo"}:
+    preview = FORECAST_PREVIEWS.get(command)
+    if not district or (not preview and command not in {"weather", "nyengo"}):
         return None
     forecast = daily_forecast(district)
     if command == "nyengo":
@@ -214,6 +223,27 @@ def whatsapp_weather_reply(message, base_url):
         return (
             f"The short-range forecast for the {district} reference location is temporarily unavailable.\n"
             f"Official Malawi daily forecast: {DCCMS_DAILY_URL}"
+        )
+    if preview:
+        name, _, rain, wind = preview
+        days = []
+        for row in forecast["rows"]:
+            day = f"*{row['date']:%d/%m}*"
+            if row["from_time"] != "02:00":
+                day += f" ({row['from_time']} CAT)"
+            days.append(
+                f"{day}: {rain} {row['rain_mm']:g} mm · "
+                f"{row['temp_low']}–{row['temp_high']}°C · "
+                f"{wind} (max) {row['wind_kmh']} km/h"
+            )
+        daily_lines = "\n".join(days)
+        return (
+            f"*Munda Watch · {district} · {name}*\n"
+            f"Bilingual preview · {rain} = rain · {wind} = wind\n\n{daily_lines}\n\n"
+            "District reference location. Full periods run 02:00 to 02:00 the next morning, Malawi time.\n"
+            f"Updated {forecast['updated']}. MET Norway data, aggregated by IBROWS ({LICENSE_URL}).\n"
+            f"Official DCCMS forecast: {DCCMS_DAILY_URL}\n"
+            f"{base_url}/agriculture/munda-watch"
         )
     days = []
     for row in forecast["rows"]:
