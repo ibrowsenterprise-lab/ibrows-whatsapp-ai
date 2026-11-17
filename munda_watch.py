@@ -2,6 +2,7 @@
 from datetime import date
 
 from agro_marketplace_ui import START, END
+from munda_weather import DCCMS_DAILY_URL, DCCMS_WARNINGS_URL, daily_forecast
 
 PATH = "/agriculture/munda-watch"
 ACTIONS = {
@@ -88,6 +89,8 @@ def whatsapp_reply(base_url):
         f"Register your field for IBROWS follow-up\n{base_url}{PATH}/register\n\n"
         f"Report a field problem, such as dry conditions or poor emergence\n"
         f"{base_url}{PATH}/report\n\n"
+        "For the short-range forecast, type WEATHER followed by your district, "
+        "for example WEATHER LILONGWE.\n\n"
         "Automatic weather alerts are currently unavailable. Use Check my area "
         "for links to official Malawi DCCMS bulletins.\n\n"
         "Pa Chichewa, lembani CHICHEWA."
@@ -124,6 +127,9 @@ def field_payload(action, form):
     payload = {"request_type": ACTIONS[action], "district": district, "crop": crop}
     if action == "check":
         payload["outlook"] = district_outlook(district, date.today())
+        payload["weather"] = daily_forecast(district)
+        payload["dccms_daily"] = DCCMS_DAILY_URL
+        payload["dccms_warnings"] = DCCMS_WARNINGS_URL
         return payload
     locality = form.get("locality", "").strip()
     if not locality or len(locality) > 160:
@@ -199,6 +205,23 @@ PAGE = START + """
   {% endif %}
   {% if area %}
     <h3 id="area-outlook" tabindex="-1">{{ area.district }} · {{ area.crop }}</h3>
+    <section aria-labelledby="short-range-weather">
+      <h4 id="short-range-weather">Today and next 5 days</h4>
+      {% if area.weather %}
+        <p>Forecast for a reference point near {{ area.district }}. Conditions can vary across the district.</p>
+        <p>Each period ends at 02:00 CAT the next morning. Today covers the remaining forecast hours.</p>
+        <dl>
+          {% for day in area.weather.rows %}
+            <dt><strong>{{ day.date.strftime('%a %d %b') }}</strong> · From {{ day.from_time }} CAT</dt>
+            <dd style="margin:0 0 12px">{{ '%g'|format(day.rain_mm) }} mm rain · {{ day.temp_low }}–{{ day.temp_high }} °C · Wind up to {{ day.wind_kmh }} km/h</dd>
+          {% endfor %}
+        </dl>
+        <p class="small-note">Updated {{ area.weather.updated }}. Based on <a href="{{ area.weather.source }}">MET Norway data</a> (<a href="{{ area.weather.licence }}">CC BY 4.0</a>), aggregated by IBROWS. Reference coordinates from <a href="https://www.geonames.org/">GeoNames</a>.</p>
+      {% else %}
+        <p>The short-range forecast is temporarily unavailable.</p>
+      {% endif %}
+      <p><a href="{{ area.dccms_daily }}">Official DCCMS daily forecast</a> · <a href="{{ area.dccms_warnings }}">DCCMS weather warnings</a></p>
+    </section>
     {% if area.outlook %}
       <p><strong>Seasonal rainfall outlook</strong> · Issued {{ area.outlook.issued_on.strftime('%d %B %Y') }}</p>
       <p>{{ area.outlook.summary }}</p>
