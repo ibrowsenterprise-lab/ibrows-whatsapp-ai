@@ -215,10 +215,12 @@ PAGE = START + """
   {% endif %}
 </section>
 {% endif %}
+{% if not area %}
 <nav class="form-actions" aria-label="Munda Watch">
   {% for key, label in actions.items() if key != action %}
     <a class="button{{ '' if key == 'check' else ' secondary' }}" href="{{ url_for('munda_watch_page', action=key) }}">{{ label }}</a>
   {% endfor %}
 </nav>
-<p>Automatic weather alerts are currently unavailable. Check your area for official DCCMS bulletins.</p>
+{% endif %}
+<p>Automatic weather alerts are currently unavailable.{% if not area %} Check your area for official DCCMS bulletins.{% endif %}</p>
 """ + END
