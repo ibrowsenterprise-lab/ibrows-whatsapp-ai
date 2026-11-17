@@ -4,6 +4,8 @@ Installed through the existing Gunicorn post_worker_init hook. The original
 handoff/CRM logic stays responsible for requests for a human.
 """
 
+from munda_weather import whatsapp_weather_reply
+
 ENGLISH_MENU = """Welcome to IBROWS Enterprise 👋
 What can we help you with? Reply with a number.
 
@@ -136,6 +138,10 @@ def install_whatsapp_menu_fix(flask_app):
         return original_number_route(text)
 
     def menu_handler(customer_number, customer_name, customer_message):
+        weather_reply = whatsapp_weather_reply(customer_message, core.IBROWS_PUBLIC_BASE_URL)
+        if weather_reply is not None:
+            return {"action": "REPLY", "reply": weather_reply}
+
         if _local_menu_request(customer_message):
             core.set_customer_menu_state(customer_number, "MAIN")
             return {"action": "REPLY", "reply": _menu_language(customer_message)}
