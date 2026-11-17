@@ -4,7 +4,9 @@ Installed through the existing Gunicorn post_worker_init hook. The original
 handoff/CRM logic stays responsible for requests for a human.
 """
 
-from munda_watch import DISTRICTS, PATH as MUNDA_PATH
+from datetime import date
+
+from munda_watch import DCCMS_DISTRICT_OUTLOOKS, DISTRICTS, PATH as MUNDA_PATH, district_outlook
 from munda_weather import FORECAST_PREVIEWS, whatsapp_weather_reply
 
 MUNDA_MENU = """*Munda Watch · El Niño farm preparedness*
@@ -30,6 +32,20 @@ def _numbered_options(labels):
     return "\n".join(f"{number}. {label}" for number, label in enumerate(labels, 1))
 
 
+def _seasonal_outlook_reply(district, base_url):
+    outlook = district_outlook(district, date.today())
+    if outlook:
+        issued = outlook["issued_on"].strftime("%d %B %Y")
+        body = f"Issued by DCCMS on {issued}.\n\n{outlook['summary']}\n\nOfficial district bulletin:\n{outlook['source_url']}"
+    else:
+        body = f"No current seasonal outlook is available here.\n\nOfficial DCCMS seasonal bulletins:\n{DCCMS_DISTRICT_OUTLOOKS}"
+    return (
+        f"*{district} · Seasonal rainfall outlook*\n\n{body}\n\n"
+        f"Daily weather and field services:\n{base_url}{MUNDA_PATH}\n\n"
+        "Send *MUNDA WATCH* to choose another service."
+    )
+
+
 def _munda_numbered_reply(core, customer_number, text):
     if text in {"munda watch", "mundawatch"}:
         core.set_customer_menu_state(customer_number, "MUNDA")
@@ -41,12 +57,12 @@ def _munda_numbered_reply(core, customer_number, text):
     number = int(text)
     base_url = core.IBROWS_PUBLIC_BASE_URL.rstrip("/")
     if state == "MUNDA":
-        if number == 1:
-            core.set_customer_menu_state(customer_number, "MUNDA_DISTRICT")
+        if number in {1, 2}:
+            state = "MUNDA_DISTRICT" if number == 1 else "MUNDA_SEASONAL"
+            core.set_customer_menu_state(customer_number, state)
             return "*Choose your district*\nReply with its number.\n\n" + _numbered_options(DISTRICTS)
-        if number in {2, 3, 4}:
+        if number in {3, 4}:
             action, label = {
-                2: ("check", "Check your district and crop for the seasonal outlook"),
                 3: ("register", "Open the field registration form"),
                 4: ("report", "Open the field problem report form"),
             }[number]
@@ -54,9 +70,13 @@ def _munda_numbered_reply(core, customer_number, text):
         if number == 5:
             return whatsapp_weather_reply("MUNDA LANGUAGES", base_url)
         return "Choose a number from 1 to 5, or send 0 to talk to Jones."
-    if state == "MUNDA_DISTRICT":
+    if state in {"MUNDA_DISTRICT", "MUNDA_SEASONAL"}:
         if 1 <= number <= len(DISTRICTS):
             district = DISTRICTS[number - 1]
+            if state == "MUNDA_SEASONAL":
+                reply = _seasonal_outlook_reply(district, base_url)
+                core.clear_customer_menu_state(customer_number)
+                return reply
             core.set_customer_menu_state(customer_number, f"MUNDA_LANG:{district}")
             return (
                 f"*{district} · Choose your forecast language*\n\n"
