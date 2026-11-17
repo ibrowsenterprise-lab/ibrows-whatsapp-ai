@@ -51,6 +51,7 @@ LOCATIONS = {
     "Zomba": (-15.3859, 35.3188),
 }
 DISTRICT_NAMES = {district.casefold(): district for district in LOCATIONS}
+CHICHEWA_WEEKDAYS = ("Lolemba", "Lachiwiri", "Lachitatu", "Lachinayi", "Lachisanu", "Loweruka", "Lamlungu")
 _locks = {district: Lock() for district in LOCATIONS}
 _cache = {}
 
@@ -171,12 +172,44 @@ def daily_forecast(district):
         }
 
 
+def _chichewa_weather_reply(district, forecast, base_url):
+    if not forecast:
+        return (
+            f"Ulosi wanyengo wa ku {district} sukupezeka pakadali pano.\n"
+            f"Ulosi wovomerezeka wa DCCMS: {DCCMS_DAILY_URL}"
+        )
+    days = []
+    for row in forecast["rows"]:
+        day = row["date"]
+        label = f"*{CHICHEWA_WEEKDAYS[day.weekday()]} {day:%d/%m}*"
+        if row["from_time"] != "02:00":
+            label += f" kuyambira {row['from_time']}"
+        days.append(
+            f"{label}: mvula {row['rain_mm']:g} mm · "
+            f"{row['temp_low']}–{row['temp_high']}°C · mphepo mpaka {row['wind_kmh']} km/h"
+        )
+    daily_lines = "\n".join(days)
+    return (
+        f"*Munda Watch · Nyengo ya ku {district}*\n\n{daily_lines}\n\n"
+        "Ulosiwu ndi wa malo amodzi m'bomali. Nthawi ndi ya ku Malawi (CAT). "
+        "Tsiku lonse limayambira 02:00 mpaka 02:00 m'mawa mwake.\n"
+        f"Zasinthidwa {forecast['updated']}. Deta yochokera ku MET Norway, "
+        f"yaphatikizidwa ndi IBROWS ({LICENSE_URL}).\n"
+        f"Ulosi wovomerezeka wa DCCMS: {DCCMS_DAILY_URL}\n"
+        f"{base_url}/agriculture/munda-watch"
+    )
+
+
 def whatsapp_weather_reply(message, base_url):
     text = " ".join(str(message or "").casefold().strip(" ?.").split())
-    district = DISTRICT_NAMES.get(text.removeprefix("weather ").removeprefix("munda weather "))
-    if not district or not text.startswith(("weather ", "munda weather ")):
+    text = text.removeprefix("munda ")
+    command, _, district_input = text.partition(" ")
+    district = DISTRICT_NAMES.get(district_input)
+    if not district or command not in {"weather", "nyengo"}:
         return None
     forecast = daily_forecast(district)
+    if command == "nyengo":
+        return _chichewa_weather_reply(district, forecast, base_url)
     if not forecast:
         return (
             f"The short-range forecast for the {district} reference location is temporarily unavailable.\n"
@@ -197,5 +230,6 @@ def whatsapp_weather_reply(message, base_url):
         "District reference location. All times CAT. Full days run from 02:00 to 02:00 the next morning.\n"
         f"Updated {forecast['updated']}. Based on MET Norway data, aggregated by IBROWS "
         f"({LICENSE_URL}).\nOfficial DCCMS forecast: {DCCMS_DAILY_URL}\n"
-        f"{base_url}/agriculture/munda-watch"
+        f"{base_url}/agriculture/munda-watch\n"
+        f"Pa Chichewa: *NYENGO {district.upper()}*"
     )
