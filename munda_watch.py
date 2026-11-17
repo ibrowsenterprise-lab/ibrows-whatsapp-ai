@@ -160,11 +160,17 @@ def field_payload(action, form):
     return payload
 
 
-RESULT_STYLES = """
+PAGE_STYLES = """
 <style>
+  .munda-heading h1 { margin-bottom:8px; }
+  .munda-heading .back-link { margin-bottom:16px; }
+  .munda-heading h2 { font-size:clamp(18px, 3vw, 23px); line-height:1.3; margin:0 0 8px; }
+  .munda-home-actions { margin-top:0; }
+  #area-check-form { scroll-margin-top:16px; }
   .munda-result { margin-top:28px; border-top:1px solid var(--line); padding-top:20px; }
-  #area-outlook { scroll-margin-top:16px; margin:0 0 14px; font-size:clamp(23px, 4vw, 29px); line-height:1.2; }
-  #area-outlook:focus { outline:none; }
+  #area-outlook { scroll-margin-top:16px; margin:0; font-size:clamp(23px, 4vw, 29px); line-height:1.2; }
+  #area-outlook:focus, #area-check-form:focus { outline:none; }
+  .munda-change-area { display:inline-flex; align-items:center; min-height:44px; font-size:14px; }
   .munda-result h4 { font-size:16px; margin:0 0 6px; }
   .munda-result p { margin:8px 0; }
   .munda-result .small-note { margin-top:10px; }
@@ -180,6 +186,8 @@ RESULT_STYLES = """
   .munda-season { border-top:1px solid var(--line); padding-top:16px; margin-top:20px; }
   .munda-links { display:flex; flex-wrap:wrap; gap:10px 16px; margin:12px 0; }
   @media(max-width:620px) {
+    .munda-heading { padding-block:20px 16px; }
+    .munda-home-actions { gap:8px; }
     .munda-weather { padding:12px 8px; }
     .munda-weather table { font-size:13px; }
     .munda-weather th, .munda-weather td { padding:7px 4px; }
@@ -189,8 +197,8 @@ RESULT_STYLES = """
 </style>
 """
 
-PAGE = START.replace("</head>", RESULT_STYLES + "</head>") + """
-<div class="page-heading">
+PAGE = START.replace("</head>", PAGE_STYLES + "</head>") + """
+<div class="page-heading munda-heading">
   {% if action %}
     <a class="back-link" href="{{ url_for('munda_watch_page') }}">← Munda Watch</a>
   {% else %}
@@ -199,12 +207,12 @@ PAGE = START.replace("</head>", RESULT_STYLES + "</head>") + """
   <h1>Munda Watch</h1>
   {% if not action %}
     <h2>El Niño farm preparedness in Malawi</h2>
-    <p class="intro">Start by choosing your district and crop to see the official seasonal rainfall outlook. Register a field for IBROWS follow-up or report a problem you are seeing on the ground.</p>
+    <p class="intro">Check daily weather and the seasonal rainfall outlook for your district. Register your field or report a problem to IBROWS.</p>
   {% endif %}
 </div>
 {% if action %}
 <section class="panel" style="max-width:760px">
-  <h2>{{ actions[action] }}</h2>
+  <h2{% if action == 'check' %} id="area-check-form" tabindex="-1"{% endif %}>{{ actions[action] }}</h2>
   {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
   {% if reference %}
     <p role="status">Received by IBROWS. Your reference is <strong>{{ reference }}</strong>.</p>
@@ -243,6 +251,7 @@ PAGE = START.replace("</head>", RESULT_STYLES + "</head>") + """
   {% if area %}
   <div class="munda-result">
     <h3 id="area-outlook" tabindex="-1">{{ area.district }} · {{ area.crop }}</h3>
+    <a class="munda-change-area" href="#area-check-form">Change district or crop</a>
     <section class="munda-weather" aria-labelledby="short-range-weather">
       <h4 id="short-range-weather">Today and next 5 days</h4>
       {% if area.weather %}
@@ -303,7 +312,7 @@ PAGE = START.replace("</head>", RESULT_STYLES + "</head>") + """
 </section>
 {% endif %}
 {% if not area %}
-<nav class="form-actions" aria-label="Munda Watch">
+<nav class="form-actions{% if not action %} munda-home-actions{% endif %}" aria-label="Munda Watch">
   {% for key, label in actions.items() if key != action %}
     <a class="button{{ '' if key == 'check' else ' secondary' }}" href="{{ url_for('munda_watch_page', action=key) }}">{{ label }}</a>
   {% endfor %}
