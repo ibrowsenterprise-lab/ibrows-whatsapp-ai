@@ -170,6 +170,10 @@ PAGE_STYLES = """
   .munda-heading .back-link { margin-bottom:16px; }
   .munda-heading h2 { font-size:clamp(18px, 3vw, 23px); line-height:1.3; margin:0 0 8px; }
   .munda-home-actions { margin-top:0; }
+  .munda-language-switch { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0 16px; }
+  .munda-language-switch a { min-height:44px; display:inline-flex; align-items:center; padding:0 14px; border:1px solid var(--line); border-radius:8px; text-decoration:none; }
+  .munda-language-switch a[aria-current="page"] { background:var(--green); border-color:var(--green); color:white; font-weight:700; }
+  .munda-home-languages { margin:16px 0; }
   #area-check-form { scroll-margin-top:16px; }
   .munda-result { margin-top:28px; border-top:1px solid var(--line); padding-top:20px; }
   #area-outlook { scroll-margin-top:16px; margin:0; font-size:clamp(23px, 4vw, 29px); line-height:1.2; }
@@ -202,6 +206,7 @@ PAGE_STYLES = """
 """
 
 PAGE = START.replace("</head>", PAGE_STYLES + "</head>") + """
+{% set home_chichewa = not action and request.args.get('lang') == 'ny' %}
 <div class="page-heading munda-heading">
   {% if action %}
     <a class="back-link" href="{{ url_for('munda_watch_page') }}">← Munda Watch</a>
@@ -210,8 +215,17 @@ PAGE = START.replace("</head>", PAGE_STYLES + "</head>") + """
   {% endif %}
   <h1>Munda Watch</h1>
   {% if not action %}
-    <h2>El Niño farm preparedness in Malawi</h2>
-    <p class="intro">Check daily weather and the seasonal rainfall outlook for your district. Register your field or report a problem to IBROWS.</p>
+    <nav class="munda-language-switch" aria-label="Page language">
+      <a lang="en" href="{{ url_for('munda_watch_page') }}"{% if not home_chichewa %} aria-current="page"{% endif %}>English</a>
+      <a lang="ny" href="{{ url_for('munda_watch_page', lang='ny') }}"{% if home_chichewa %} aria-current="page"{% endif %}>Mu Chichewa</a>
+    </nav>
+    {% if home_chichewa %}
+      <h2 lang="ny">Kukonzekera El Niño ku Malawi</h2>
+      <p class="intro" lang="ny">Onani ulosi wa nyengo wa tsiku lililonse ndi mmene mvula ikuyembekezeka kugwa m'boma lanu m'nyengo ino. Lembetsani munda wanu kapena auzeni IBROWS za vuto la m'munda.</p>
+    {% else %}
+      <h2>El Niño farm preparedness in Malawi</h2>
+      <p class="intro">Check daily weather and the seasonal rainfall outlook for your district. Register your field or report a problem to IBROWS.</p>
+    {% endif %}
   {% endif %}
 </div>
 {% if action %}
@@ -323,11 +337,19 @@ PAGE = START.replace("</head>", PAGE_STYLES + "</head>") + """
 </section>
 {% endif %}
 {% if not area %}
+{% set chichewa_actions = {'check': 'Onani nyengo m’boma lanu', 'register': 'Lembetsani munda', 'report': 'Fotokozani vuto la m’munda'} %}
 <nav class="form-actions{% if not action %} munda-home-actions{% endif %}" aria-label="Munda Watch">
   {% for key, label in actions.items() if key != action %}
-    <a class="button{{ '' if key == 'check' else ' secondary' }}" href="{{ url_for('munda_watch_page', action=key) }}">{{ label }}</a>
+    <a{% if home_chichewa %} lang="ny"{% endif %} class="button{{ '' if key == 'check' else ' secondary' }}" href="{{ url_for('munda_watch_page', action=key) }}">{{ chichewa_actions[key] if home_chichewa else label }}</a>
   {% endfor %}
 </nav>
 {% endif %}
-<p>Automatic weather alerts are currently unavailable.{% if not area %} Check your area for official DCCMS bulletins.{% endif %}</p>
+{% if not action %}
+  <p class="munda-home-languages"><a{% if home_chichewa %} lang="ny"{% endif %} href="https://wa.me/""" + ACTIVE_PUBLIC_WHATSAPP + """?text=MUNDA%20LANGUAGES">{{ 'Zinenero za ulosi wa nyengo pa WhatsApp' if home_chichewa else 'Forecast languages on WhatsApp' }}</a></p>
+{% endif %}
+{% if home_chichewa %}
+  <p lang="ny">Mauthenga a chenjezo la nyengo sanayambe kutumizidwa. Onani maulosi ovomerezeka a DCCMS pa tsamba la nyengo la boma lanu.</p>
+{% else %}
+  <p>Automatic weather alerts are currently unavailable.{% if not area %} Check your area for official DCCMS bulletins.{% endif %}</p>
+{% endif %}
 """ + END
